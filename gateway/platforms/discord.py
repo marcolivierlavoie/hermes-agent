@@ -50,6 +50,10 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 import re
 
+from gateway.discord_operator_checklist import (
+    DiscordChecklistItem,
+    format_discord_operator_checklist,
+)
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
 from utils import atomic_json_write
 from gateway.platforms.base import (
@@ -2849,6 +2853,32 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         # Discord markdown is fairly standard, no special escaping needed
         return content
+
+    def format_operator_checklist(
+        self,
+        *,
+        title: str,
+        items: List[DiscordChecklistItem | tuple],
+        issue_id: str | None = None,
+        summary: str | None = None,
+        footer: str | None = None,
+        max_items: int = 6,
+    ) -> str:
+        """Format a compact operator checklist without sending it.
+
+        This is a lightweight formatting hook for Discord-facing operator
+        updates.  It deliberately does not post or edit messages; callers must
+        still decide whether the update is a meaningful milestone to avoid
+        gateway/chat spam.
+        """
+        return format_discord_operator_checklist(
+            title=title,
+            items=items,
+            issue_id=issue_id,
+            summary=summary,
+            footer=footer,
+            max_items=max_items,
+        )
 
     async def _run_simple_slash(
         self,

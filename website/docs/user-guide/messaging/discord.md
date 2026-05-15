@@ -66,6 +66,38 @@ Shared sessions can be useful for a collaborative room, but they also mean:
 - one person's long tool-heavy task can bloat everyone else's context
 - one person's in-flight run can interrupt another person's follow-up in the same room
 
+### Operator Checklist Progress Pattern
+
+For non-trivial operator tasks, Discord-facing agents can use the compact checklist pattern instead of pasting raw tool logs or posting a message for every tool call. The reusable formatter lives at `gateway.discord_operator_checklist.format_discord_operator_checklist()` and Discord adapters expose it as `format_operator_checklist()`.
+
+Use it when:
+
+- the task will take multiple visible steps or several minutes
+- the operator benefits from knowing the current milestone
+- a blocker or decision point appears
+- the final result should show what was changed and verified
+
+Stay silent when:
+
+- the next update would only repeat that work is still running
+- a typing indicator or reaction already conveys activity
+- the content is raw command/tool output, stack traces, or logs
+- the run is short enough that a final answer is clearer
+
+Template:
+
+```text
+**OPS-123 — Discord compact operator checklist progress pattern**
+2/4 complete · active
+✅ inspect current gateway/display helpers
+🔄 define reusable Discord checklist format
+☐ document when to post vs stay silent
+☐ run focused tests/checks
+_quiet between milestones; no raw tool logs_
+```
+
+Keep checklist updates sparse: post at start for long work, edit or replace only at meaningful milestones, and prefer one final concise handoff over a stream of incremental messages.
+
 ### Interrupts and Concurrency
 
 Hermes tracks running agents by session key.
