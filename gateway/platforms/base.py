@@ -1044,6 +1044,15 @@ class SendResult:
     continuation_message_ids: tuple = ()
 
 
+class GatewayResponse(str):
+    """Text response carrying adapter metadata for the final platform send."""
+
+    def __new__(cls, content: str, *, metadata: Optional[Dict[str, Any]] = None):
+        obj = str.__new__(cls, content)
+        obj.metadata = dict(metadata or {})
+        return obj
+
+
 class EphemeralReply(str):
     """System-notice reply that auto-deletes after a TTL.
 
@@ -3049,6 +3058,7 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            _response_metadata = dict(getattr(response, "metadata", {}) or {})
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -3160,10 +3170,11 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata["notify"] = True
                     else:
                         _thread_metadata = {"notify": True}
-                    # Discord uses this positive gate to attach the compact
-                    # New session button only to normal final bot replies, not
-                    # operational notices or arbitrary adapter.send() calls.
-                    _thread_metadata["discord_new_session_button"] = True
+                    # Handler-returned GatewayResponse metadata is the explicit
+                    # path for quota-only controls such as Discord's New session
+                    # button. Do not infer controls from response text; normal
+                    # replies may legitimately discuss quota wording.
+                    _thread_metadata.update(_response_metadata)
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,

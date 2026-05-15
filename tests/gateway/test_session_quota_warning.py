@@ -1,4 +1,11 @@
-from gateway.run import _apply_final_turn_trailing_lines
+import asyncio
+
+import pytest
+
+from gateway.run import _apply_final_turn_trailing_lines, _final_turn_trailing_metadata
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, GatewayResponse, MessageEvent, SendResult
+from gateway.session import SessionSource, build_session_key
 from gateway.session_hygiene import (
     build_session_quota_recommendation,
     session_quota_threshold_for_tokens,
@@ -75,7 +82,7 @@ def test_quota_note_appends_only_to_non_streaming_final_response():
     assert quota_delivered is True
 
 
-def test_streaming_quota_only_turn_has_no_trailing_send_or_persistence_marker():
+def test_streaming_quota_turn_returns_trailing_send_and_persistence_marker():
     response, trailing_lines, quota_delivered = _apply_final_turn_trailing_lines(
         "streamed body already delivered",
         quota_line="⚠️ quota note",
@@ -84,33 +91,137 @@ def test_streaming_quota_only_turn_has_no_trailing_send_or_persistence_marker():
     )
 
     assert response == "streamed body already delivered"
-    # Gateway sends only returned trailing_lines via adapter.send; quota-only
-    # streaming turns must not produce a separate platform message.
-    assert trailing_lines == []
-    # The threshold must not be persisted as warned because the note was not
-    # delivered; a later normal final-response turn can still warn.
-    assert quota_delivered is False
+    # Streaming final answers already sent the body; quota warnings are emitted
+    # as a separate trailing platform message so Discord can attach the
+    # quota-specific New session button only to the warning.
+    assert trailing_lines == ["⚠️ quota note"]
+    assert quota_delivered is True
 
 
-def test_streaming_quota_not_marked_warned_allows_future_normal_warning():
+def test_streaming_quota_marked_warned_after_trailing_warning_delivery():
     rec = build_session_quota_recommendation(
         session_id="s1",
         prompt_tokens=40_000,
         warned_thresholds=[],
     )
     assert rec is not None
-    response, _, delivered = _apply_final_turn_trailing_lines(
+    response, trailing_lines, delivered = _apply_final_turn_trailing_lines(
         "streamed",
         quota_line=f"⚠️ {rec.text}",
         already_sent=True,
     )
     assert response == "streamed"
-    assert delivered is False
+    assert trailing_lines == [f"⚠️ {rec.text}"]
+    assert delivered is True
 
-    future = build_session_quota_recommendation(
-        session_id="s1",
-        prompt_tokens=41_000,
-        warned_thresholds=[],
+
+def test_discord_new_session_button_metadata_is_quota_warning_only():
+    base = {"thread_id": "t1"}
+
+    assert _final_turn_trailing_metadata(
+        base,
+        platform=Platform.DISCORD,
+        quota_threshold_to_persist=None,
+    ) == {"thread_id": "t1"}
+
+    assert _final_turn_trailing_metadata(
+        base,
+        platform=Platform.DISCORD,
+        quota_threshold_to_persist=40_000,
+    ) == {"thread_id": "t1", "discord_new_session_button": True}
+
+    assert _final_turn_trailing_metadata(
+        base,
+        platform=Platform.TELEGRAM,
+        quota_threshold_to_persist=40_000,
+    ) == {"thread_id": "t1"}
+
+
+class _QuotaMetadataAdapter(BasePlatformAdapter):
+    platform = Platform.DISCORD
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
+        self.sent = []
+
+    async def connect(self):
+        return None
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, chat_id, content, **kwargs):
+        return SendResult(success=True, message_id="send-1")
+
+    async def get_chat_info(self, chat_id):
+        return {}
+
+    async def send_typing(self, chat_id, **kwargs):
+        return None
+
+    async def _keep_typing(self, chat_id, *args, **kwargs):
+        await asyncio.sleep(999)
+
+    async def _send_with_retry(self, **kwargs):
+        self.sent.append(kwargs)
+        return SendResult(success=True, message_id="msg-1")
+
+
+def _quota_metadata_event() -> MessageEvent:
+    return MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            user_id="u1",
+            chat_id="c1",
+            user_name="tester",
+            chat_type="dm",
+        ),
+        message_id="m1",
     )
-    assert future is not None
-    assert future.threshold == 40_000
+
+
+async def _run_base_final_send(response: str | GatewayResponse) -> dict:
+    adapter = _QuotaMetadataAdapter()
+
+    async def handler(_event):
+        return response
+
+    adapter.set_message_handler(handler)
+    event = _quota_metadata_event()
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    await adapter._process_message_background(event, session_key)
+    assert adapter.sent
+    return adapter.sent[-1].get("metadata") or {}
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_normal_final_reply_has_no_new_session_button_metadata():
+    metadata = await _run_base_final_send("normal final answer")
+
+    assert metadata.get("notify") is True
+    assert "discord_new_session_button" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_normal_final_reply_mentioning_session_quota_has_no_button():
+    metadata = await _run_base_final_send(
+        "Normal answer discussing the words Session quota in documentation, not a warning."
+    )
+
+    assert metadata.get("notify") is True
+    assert "discord_new_session_button" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_quota_warning_final_reply_has_new_session_button_metadata():
+    metadata = await _run_base_final_send(
+        GatewayResponse(
+            "normal final answer\n\n⚠️ Session quota heads up (40,000 prompt tokens): reset soon",
+            metadata={"discord_new_session_button": True},
+        )
+    )
+
+    assert metadata.get("notify") is True
+    assert metadata.get("discord_new_session_button") is True

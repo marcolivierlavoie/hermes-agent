@@ -641,6 +641,7 @@ from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    GatewayResponse,
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
@@ -1135,14 +1136,7 @@ def _apply_final_turn_trailing_lines(
     footer_line: str = "",
     already_sent: bool = False,
 ) -> tuple[str, list[str], bool]:
-    """Apply final-turn quota/footer lines without double-sending quota notes.
-
-    Quota warnings are only user-visible when appended to the normal final
-    response. For streaming turns (``already_sent=True``), the body has already
-    been delivered and a quota-only trailing platform message is too noisy; do
-    not return the quota line for a separate send, and do not report it as
-    delivered for persistence/dedupe.
-    """
+    """Apply final-turn quota/footer lines without double-sending quota notes."""
 
     quota = quota_line or ""
     footer = footer_line or ""
@@ -1152,9 +1146,29 @@ def _apply_final_turn_trailing_lines(
             return f"{response}\n\n" + "\n".join(trailing), [], bool(quota)
         return response, [], False
 
-    # Streaming already delivered body text. Runtime footer remains eligible
-    # for the existing separate metadata send; quota warnings do not.
-    return response, [footer] if footer else [], False
+    # Streaming already delivered body text. Send final-turn quota/footer lines
+    # separately so quota-specific Discord controls can attach to that warning
+    # instead of to every normal streamed reply.
+    trailing = [line for line in (quota, footer) if line]
+    return response, trailing, bool(quota)
+
+
+def _final_turn_trailing_metadata(
+    base_metadata: dict | None,
+    *,
+    platform: Platform,
+    quota_threshold_to_persist: int | None = None,
+) -> dict:
+    """Return metadata for final-turn trailing platform sends.
+
+    The Discord ``New session`` control is intentionally quota-warning-only:
+    normal assistant replies must not receive it just because they streamed.
+    """
+
+    metadata = dict(base_metadata or {})
+    if platform == Platform.DISCORD and quota_threshold_to_persist is not None:
+        metadata["discord_new_session_button"] = True
+    return metadata
 
 
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
@@ -8091,15 +8105,29 @@ class GatewayRunner:
                     try:
                         _foot_adapter = self.adapters.get(source.platform)
                         if _foot_adapter:
+                            _trailing_metadata = _final_turn_trailing_metadata(
+                                self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                platform=source.platform,
+                                quota_threshold_to_persist=_quota_threshold_to_persist,
+                            )
                             await _foot_adapter.send(
                                 source.chat_id,
                                 "\n".join(_trailing_lines),
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                metadata=_trailing_metadata,
                             )
                     except Exception as _e:
                         logger.debug("trailing recommendation/footer send failed: %s", _e)
                 return None
 
+            if (
+                response
+                and source.platform == Platform.DISCORD
+                and _quota_threshold_to_persist is not None
+            ):
+                return GatewayResponse(
+                    response,
+                    metadata={"discord_new_session_button": True},
+                )
             return response
             
         except Exception as e:
@@ -14320,7 +14348,6 @@ class GatewayRunner:
                         chat_type=getattr(source, "chat_type", "") or "",
                     )
                     _stream_metadata = dict(_thread_metadata) if _thread_metadata else {}
-                    _stream_metadata["discord_new_session_button"] = True
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=source.chat_id,
@@ -15171,7 +15198,6 @@ class GatewayRunner:
                             chat_type=getattr(source, "chat_type", "") or "",
                         )
                         _stream_metadata = dict(_status_thread_metadata) if _status_thread_metadata else {}
-                        _stream_metadata["discord_new_session_button"] = True
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
                             chat_id=source.chat_id,
