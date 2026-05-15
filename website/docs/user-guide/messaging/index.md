@@ -281,7 +281,7 @@ Control how much tool activity is displayed in `~/.hermes/config.yaml`:
 
 ```yaml
 display:
-  tool_progress: all    # off | new | all | verbose
+  tool_progress: all    # off | status | new | all | verbose
   tool_progress_command: false  # set to true to enable /verbose in messaging
 ```
 

@@ -82,7 +82,10 @@ _TIER_MINIMAL = {
 _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Tier 1 — full edit support, personal/team use
     "telegram":    {**_TIER_HIGH, "tool_progress": "new"},
-    "discord":     _TIER_HIGH,
+    # Discord supports message editing, but raw per-tool progress streams make
+    # operator command rooms noisy. Prefer typing/final answers by default and
+    # sparse checklist milestone updates for longer work.
+    "discord":     {**_TIER_HIGH, "tool_progress": "off"},
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;
@@ -154,6 +157,15 @@ def resolve_display_setting(
             val = legacy.get(platform_key)
             if val is not None:
                 return _normalise(setting, val)
+
+    # Discord deliberately stays quiet unless it has a Discord-specific
+    # override. A global ``display.tool_progress: all`` is common in existing
+    # CLI/Telegram configs and should not re-enable raw per-tool streams in
+    # Discord command rooms by accident.
+    if setting == "tool_progress" and platform_key == "discord":
+        plat_defaults = _PLATFORM_DEFAULTS.get(platform_key)
+        if plat_defaults and plat_defaults.get(setting) is not None:
+            return plat_defaults[setting]
 
     # 2. Global user setting (display.<key>).  Skip display.streaming because
     # that key controls only CLI terminal streaming; gateway token streaming is

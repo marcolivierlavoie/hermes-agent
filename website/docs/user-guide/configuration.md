@@ -1187,7 +1187,7 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 
 ```yaml
 display:
-  tool_progress: all      # off | new | all | verbose
+  tool_progress: all      # off | status | new | all | verbose
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
   platforms: {}           # Per-platform display overrides (see below)
   tool_progress_overrides: {}  # DEPRECATED — use display.platforms instead

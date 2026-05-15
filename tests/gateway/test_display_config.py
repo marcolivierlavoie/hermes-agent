@@ -44,6 +44,10 @@ class TestResolveDisplaySetting:
         # Telegram tier_high override: "new" (not "all") to reduce edit
         # pressure during streaming on Telegram's ~1 edit/s flood envelope.
         assert resolve_display_setting(config, "telegram", "tool_progress") == "new"
+        # Discord has edit support, but raw per-tool progress is intentionally
+        # quiet by default; longer operator work should use sparse checklist
+        # milestone updates instead of tool-call streams.
+        assert resolve_display_setting(config, "discord", "tool_progress") == "off"
         # Email defaults to tier_minimal → "off"
         assert resolve_display_setting(config, "email", "tool_progress") == "off"
 
@@ -180,14 +184,28 @@ class TestPlatformDefaults:
     """Built-in defaults reflect platform capability tiers."""
 
     def test_high_tier_platforms(self):
-        """Discord defaults to 'all' tool progress; Telegram is in tier_high
-        but overrides tool_progress to 'new' (less edit pressure)."""
+        """Telegram reduces raw progress; Discord defaults raw progress off."""
         from gateway.display_config import resolve_display_setting
 
         # Telegram: tier_high member with tool_progress="new" override.
         assert resolve_display_setting({}, "telegram", "tool_progress") == "new"
-        # Discord: pure tier_high.
-        assert resolve_display_setting({}, "discord", "tool_progress") == "all"
+        # Discord: supports edits, but raw tool streams are too noisy for
+        # operator-facing command rooms by default.
+        assert resolve_display_setting({}, "discord", "tool_progress") == "off"
+
+    def test_discord_explicit_tool_progress_override_still_wins(self):
+        """Discord can still opt into raw tool progress explicitly."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"platforms": {"discord": {"tool_progress": "new"}}}}
+        assert resolve_display_setting(config, "discord", "tool_progress") == "new"
+
+    def test_discord_ignores_global_tool_progress_default(self):
+        """Global raw progress does not re-enable Discord tool streams."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"tool_progress": "all"}}
+        assert resolve_display_setting(config, "discord", "tool_progress") == "off"
 
     def test_medium_tier_platforms(self):
         """Mattermost, Matrix, Feishu, WhatsApp default to 'new' tool progress."""

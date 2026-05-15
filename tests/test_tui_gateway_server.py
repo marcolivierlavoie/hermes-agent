@@ -1613,6 +1613,77 @@ def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch
     assert agent.verbose_logging is True
 
 
+def test_config_set_verbose_cycle_includes_status_from_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    agent = types.SimpleNamespace(verbose_logging=False)
+    server._sessions["sid"] = _session(agent=agent, tool_progress_mode="off")
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {"session_id": "sid", "key": "verbose", "value": "cycle"},
+        }
+    )
+
+    assert resp["result"]["value"] == "status"
+    assert server._sessions["sid"]["tool_progress_mode"] == "status"
+    assert agent.verbose_logging is False
+
+
+def test_tui_load_tool_progress_accepts_status_config_and_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text("display:\n  tool_progress: status\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_TUI_TOOL_PROGRESS", raising=False)
+    assert server._load_tool_progress_mode() == "status"
+
+    monkeypatch.setenv("HERMES_TUI_TOOL_PROGRESS", "status")
+    (tmp_path / "config.yaml").write_text("display:\n  tool_progress: all\n", encoding="utf-8")
+    assert server._load_tool_progress_mode() == "status"
+
+
+def test_tui_status_progress_emits_generic_event_without_tool_details(monkeypatch):
+    emits = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+    server._sessions["sid"] = _session(tool_progress_mode="status")
+    try:
+        server._on_tool_start("sid", "tc-1", "terminal", {"command": "git status"})
+        server._on_tool_progress("sid", "tool.started", "read_file", "secret.txt", {"path": "secret.txt"})
+        server._on_tool_complete("sid", "tc-1", "terminal", {"command": "git status"}, "done")
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert emits == [
+        (
+            "tool.progress",
+            "sid",
+            {"name": "status", "preview": "Working…", "status": "working"},
+        )
+    ]
+
+
+def test_tui_status_inline_diff_completion_uses_generic_tool_name(monkeypatch):
+    emits = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+    monkeypatch.setattr(
+        "agent.display.render_edit_diff_with_delta",
+        lambda name, result, function_args=None, snapshot=None, print_fn=None: (print_fn("diff preview") or True),
+    )
+    server._sessions["sid"] = _session(tool_progress_mode="status")
+    try:
+        server._on_tool_complete("sid", "tc-1", "patch", {"path": "secret.txt"}, "ok")
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert emits == [
+        (
+            "tool.complete",
+            "sid",
+            {"tool_id": "tc-1", "name": "status", "inline_diff": "diff preview"},
+        )
+    ]
+
+
 def test_config_set_model_uses_live_switch_path(monkeypatch):
     server._sessions["sid"] = _session()
     seen = {}

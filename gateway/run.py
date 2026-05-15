@@ -10881,8 +10881,8 @@ class GatewayRunner:
         """Handle /verbose command — cycle tool progress display mode.
 
         Gated by ``display.tool_progress_command`` in config.yaml (default off).
-        When enabled, cycles the tool progress mode through off → new → all →
-        verbose → off for the *current platform*.  The setting is saved to
+        When enabled, cycles the tool progress mode through off → status → new
+        → all → verbose → off for the *current platform*.  The setting is saved to
         ``display.platforms.<platform>.tool_progress`` so each channel can
         have its own verbosity level independently.
         """
@@ -10904,9 +10904,10 @@ class GatewayRunner:
             return t("gateway.verbose.not_enabled")
 
         # --- cycle mode (per-platform) ----------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "status", "new", "all", "verbose"]
         descriptions = {
             "off": t("gateway.verbose.mode_off"),
+            "status": "⚙️ Tool progress: **STATUS** — show one generic working indicator, no tool names or args.",
             "new": t("gateway.verbose.mode_new"),
             "all": t("gateway.verbose.mode_all"),
             "verbose": t("gateway.verbose.mode_verbose"),
@@ -14591,6 +14592,7 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        status_progress_sent = [False]  # ``status`` mode emits one generic bubble
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -14668,6 +14670,17 @@ class GatewayRunner:
                     return
             except Exception:
                 pass
+
+            # "status" mode is a low-noise reassurance bubble for chat
+            # platforms. It must never expose tool names, previews, or args;
+            # those details belong in logs/role channels, not user-facing
+            # Discord command rooms.
+            if progress_mode == "status":
+                if status_progress_sent[0]:
+                    return
+                status_progress_sent[0] = True
+                progress_queue.put("Working…")
+                return
 
             # "new" mode: only report when tool changes
             if progress_mode == "new" and tool_name == last_tool[0]:

@@ -294,6 +294,38 @@ async def test_cleanup_skipped_on_failed_run(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_discord_status_progress_sends_generic_bubble_not_raw_tool_stream(monkeypatch, tmp_path):
+    """Discord ``tool_progress: status`` must not expose tool names/previews."""
+    adapter = CleanupCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=False)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"platforms": {"discord": {"tool_progress": "status"}}}},
+    )
+
+    source = SessionSource(platform=Platform.DISCORD, chat_id="1503821368045863027")
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-discord-status",
+        session_key="agent:main:discord:channel:1503821368045863027",
+    )
+
+    assert result["final_response"] == "done"
+    progress_text = "\n".join(entry["content"] for entry in adapter.sent + adapter.edits)
+    assert "Working…" in progress_text
+    assert "terminal" not in progress_text
+    assert "pwd" not in progress_text
+    assert "ls" not in progress_text
+
+
+@pytest.mark.asyncio
 async def test_cleanup_noop_on_adapter_without_delete_support(monkeypatch, tmp_path):
     """Adapters that inherit the base-class delete_message no-op are
     detected up front — the cleanup path never registers its callback so

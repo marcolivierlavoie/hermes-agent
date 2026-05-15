@@ -884,7 +884,7 @@ def _load_show_reasoning() -> bool:
 
 def _load_tool_progress_mode() -> str:
     env = os.environ.get("HERMES_TUI_TOOL_PROGRESS", "").strip().lower()
-    if env in {"off", "new", "all", "verbose"}:
+    if env in {"off", "status", "new", "all", "verbose"}:
         return env
     raw = (_load_cfg().get("display") or {}).get("tool_progress", "all")
     if raw is False:
@@ -892,7 +892,7 @@ def _load_tool_progress_mode() -> str:
     if raw is True:
         return "all"
     mode = str(raw or "all").strip().lower()
-    return mode if mode in {"off", "new", "all", "verbose"} else "all"
+    return mode if mode in {"off", "status", "new", "all", "verbose"} else "all"
 
 
 def _load_enabled_toolsets() -> list[str] | None:
@@ -1028,6 +1028,10 @@ def _session_tool_progress_mode(sid: str) -> str:
 
 def _tool_progress_enabled(sid: str) -> bool:
     return _session_tool_progress_mode(sid) != "off"
+
+
+def _tool_progress_status_mode(sid: str) -> bool:
+    return _session_tool_progress_mode(sid) == "status"
 
 
 def _restart_slash_worker(session: dict):
@@ -1499,6 +1503,15 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
             pass
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
     if _tool_progress_enabled(sid):
+        if _tool_progress_status_mode(sid):
+            if session is not None and not session.get("tool_status_sent"):
+                session["tool_status_sent"] = True
+                _emit(
+                    "tool.progress",
+                    sid,
+                    {"name": "status", "preview": "Working…", "status": "working"},
+                )
+            return
         # tool.complete is the source of truth for todos (full list from the
         # tool result). args.todos here may be a partial merge update.
         _emit(
@@ -1543,6 +1556,16 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             payload["inline_diff"] = "\n".join(rendered)
     except Exception:
         pass
+    if _tool_progress_status_mode(sid):
+        if not payload.get("inline_diff"):
+            return
+        # Preserve inline diff content while keeping status mode non-disclosing:
+        # do not surface the real tool name/args/preview in the TUI event stream.
+        payload = {
+            "tool_id": tool_call_id,
+            "name": "status",
+            "inline_diff": payload["inline_diff"],
+        }
     if _tool_progress_enabled(sid) or payload.get("inline_diff"):
         _emit("tool.complete", sid, payload)
 
@@ -1558,6 +1581,12 @@ def _on_tool_progress(
     if not _tool_progress_enabled(sid):
         return
     if event_type == "tool.started" and name:
+        if _tool_progress_status_mode(sid):
+            session = _sessions.get(sid)
+            if session is not None and not session.get("tool_status_sent"):
+                session["tool_status_sent"] = True
+                _emit("tool.progress", sid, {"name": "status", "preview": "Working…", "status": "working"})
+            return
         _emit("tool.progress", sid, {"name": name, "preview": preview or ""})
         return
     if event_type == "reasoning.available" and preview:
@@ -3724,7 +3753,7 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"key": key, "value": raw})
 
     if key == "verbose":
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "status", "new", "all", "verbose"]
         cur = (
             session.get("tool_progress_mode", _load_tool_progress_mode())
             if session

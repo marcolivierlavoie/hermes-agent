@@ -59,7 +59,7 @@ Press **Ctrl+V** to paste an image from your clipboard directly into the chat. T
 Type `/` and press **Tab** to see all available commands. This includes built-in commands (`/compress`, `/model`, `/title`) and every installed skill. You don't need to memorize anything — Tab completion has you covered.
 
 :::tip
-Use `/verbose` to cycle through tool output display modes: **off → new → all → verbose**. The "all" mode is great for watching what the agent does; "off" is cleanest for simple Q&A.
+Use `/verbose` to cycle through tool output display modes: **off → status → new → all → verbose**. The "status" mode gives a generic working indicator without raw tool names; "all" is useful for watching what the agent does; "off" is cleanest for simple Q&A.
 :::
 
 ## Context Files

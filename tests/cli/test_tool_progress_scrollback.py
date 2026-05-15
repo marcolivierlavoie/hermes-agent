@@ -121,6 +121,19 @@ class TestToolProgressScrollback:
 
         mock_print.assert_not_called()
 
+    def test_status_mode_spinner_is_generic_and_non_disclosing(self):
+        """In 'status' mode, the live spinner hides tool names/previews/args."""
+        cli = _make_cli(tool_progress="status")
+        with patch.object(_cli_mod, "_cprint") as mock_print:
+            cli._on_tool_progress("tool.started", "terminal", "git status", {"command": "git status"})
+            cli._on_tool_progress("tool.completed", "terminal", None, None, duration=0.5, is_error=False)
+
+        assert cli._spinner_text == "Working…"
+        assert "terminal" not in cli._spinner_text
+        assert "git status" not in cli._spinner_text
+        assert cli._pending_tool_info == {}
+        mock_print.assert_not_called()
+
     def test_error_suffix_on_failed_tool(self):
         """When is_error=True, the stacked line includes [error]."""
         cli = _make_cli(tool_progress="all")

@@ -278,7 +278,7 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 /model [name]        Show or change model
 /personality [name]  Set personality
 /reasoning [level]   Set reasoning (none|minimal|low|medium|high|xhigh|show|hide)
-/verbose             Cycle: off → new → all → verbose
+/verbose             Cycle: off → status → new → all → verbose
 /voice [on|off|tts]  Voice mode
 /yolo                Toggle approval bypass
 /busy [sub]          Control what Enter does while Hermes is working (CLI)

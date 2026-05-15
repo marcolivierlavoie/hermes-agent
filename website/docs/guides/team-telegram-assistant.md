@@ -275,7 +275,7 @@ Control how much detail the bot shows when using tools. In `~/.hermes/config.yam
 
 ```yaml
 display:
-  tool_progress: new    # off | new | all | verbose
+  tool_progress: new    # off | status | new | all | verbose
 ```
 
 | Mode | What You See |

@@ -300,7 +300,7 @@ The CLI shows animated feedback as the agent works:
   ┊ 📄 web_extract (2.1s)
 ```
 
-Cycle through display modes with `/verbose`: `off → new → all → verbose`. This command can also be enabled for messaging platforms — see [configuration](/docs/user-guide/configuration#display-settings).
+Cycle through display modes with `/verbose`: `off → status → new → all → verbose`. `status` shows a generic working indicator without raw tool names. This command can also be enabled for messaging platforms — see [configuration](/docs/user-guide/configuration#display-settings).
 
 ### Tool Preview Length
 

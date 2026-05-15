@@ -207,7 +207,7 @@ display:
     dingtalk:
       show_reasoning: false   # Show model reasoning/thinking in replies
       streaming: true         # Enable streaming responses (works with AI Cards)
-      tool_progress: all      # Show tool execution progress (all/new/off)
+      tool_progress: all      # Show tool execution progress (off/status/new/all/verbose)
       interim_assistant_messages: true  # Show intermediate commentary messages
 ```
 

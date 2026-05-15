@@ -693,7 +693,7 @@ See [Profiles](../user-guide/profiles.md) and [WhatsApp setup](../user-guide/mes
 
 ```yaml
 display:
-  tool_progress: "off"   # options: off, new, all, verbose
+  tool_progress: "off"   # options: off, status, new, all, verbose
 ```
 
 - **`off`** — Only the final response. No tool calls, no reasoning, no logs.

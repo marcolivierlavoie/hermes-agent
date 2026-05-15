@@ -21,7 +21,7 @@ TIPS = [
     "/queue <prompt> queues a message for the next turn without interrupting the current one.",
     "/undo removes the last user/assistant exchange from the conversation.",
     "/retry resends your last message — useful when the agent's response wasn't quite right.",
-    "/verbose cycles tool progress display: off → new → all → verbose.",
+    "/verbose cycles tool progress display: off → status → new → all → verbose.",
     "/reasoning high increases the model's thinking depth. /reasoning show displays the reasoning.",
     "/fast toggles priority processing for faster API responses (provider-dependent).",
     "/yolo skips all dangerous command approval prompts for the rest of the session.",
