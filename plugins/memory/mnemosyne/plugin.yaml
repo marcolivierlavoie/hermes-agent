@@ -1,0 +1,3 @@
+name: mnemosyne
+description: Local-only isolated-pilot memory provider with auditable add/suppress/unsuppress controls.
+version: 0.1.0
