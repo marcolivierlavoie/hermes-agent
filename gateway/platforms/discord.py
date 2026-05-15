@@ -554,6 +554,7 @@ class DiscordAdapter(BasePlatformAdapter):
     # Keep reply-attached controls useful without retaining one persistent
     # discord.py View forever for every bot message.
     NEW_SESSION_BUTTON_TIMEOUT_SECONDS = 24 * 60 * 60
+    SUPPORTS_DISCORD_NEW_SESSION_BUTTON = True
 
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
@@ -1658,6 +1659,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Discord message."""
         if not self._client:
@@ -1670,7 +1672,11 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
-            await msg.edit(content=formatted)
+            edit_kwargs = {"content": formatted}
+            new_session_view = self._build_new_session_view(metadata) if finalize else None
+            if new_session_view is not None:
+                edit_kwargs["view"] = new_session_view
+            await msg.edit(**edit_kwargs)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)

@@ -202,6 +202,61 @@ async def test_send_respects_new_session_button_suppress_metadata(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_edit_message_attaches_new_session_button_on_final_edit(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sentinel_view = object()
+
+    def fake_new_session_view(_adapter, timeout=None):
+        assert timeout == _adapter.NEW_SESSION_BUTTON_TIMEOUT_SECONDS
+        return sentinel_view
+
+    monkeypatch.setattr(discord_platform, "NewSessionView", fake_new_session_view, raising=False)
+
+    msg = SimpleNamespace(edit=AsyncMock())
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=msg))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.edit_message(
+        "555",
+        "1234",
+        "final answer",
+        finalize=True,
+        metadata={"discord_new_session_button": True},
+    )
+
+    assert result.success is True
+    msg.edit.assert_awaited_once_with(content="final answer", view=sentinel_view)
+
+
+@pytest.mark.asyncio
+async def test_edit_message_does_not_attach_new_session_button_before_final(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sentinel_view = object()
+    monkeypatch.setattr(discord_platform, "NewSessionView", lambda _adapter, timeout=None: sentinel_view, raising=False)
+
+    msg = SimpleNamespace(edit=AsyncMock())
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=msg))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.edit_message(
+        "555",
+        "1234",
+        "preview",
+        finalize=False,
+        metadata={"discord_new_session_button": True},
+    )
+
+    assert result.success is True
+    msg.edit.assert_awaited_once_with(content="preview")
+
+
+@pytest.mark.asyncio
 async def test_forum_parent_attaches_new_session_button_to_starter_only(monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     adapter.MAX_MESSAGE_LENGTH = 20
