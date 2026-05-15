@@ -162,6 +162,11 @@ class GatewayStreamConsumer:
         self._adapter_requires_finalize: bool = (
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
+        # Per-response one-shot gate for Discord's New session button.  Streaming
+        # can fan one assistant reply out into several adapter.send() calls
+        # (overflow chunks, fallback continuations, commentary).  Preserve the
+        # button on the first eligible final/content bubble only.
+        self._discord_new_session_button_consumed = False
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -215,6 +220,23 @@ class GatewayStreamConsumer:
             cb()
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
+
+    def _send_metadata(self, *, allow_new_session_button: bool = True) -> dict:
+        """Return per-send metadata with Discord button gating normalized.
+
+        ``GatewayStreamConsumer`` may call ``adapter.send`` multiple times for
+        one assistant response.  The Discord adapter intentionally attaches the
+        New session button per adapter send, so streaming must forward the
+        positive metadata gate at most once and never for interim commentary.
+        """
+        meta = dict(self.metadata) if self.metadata else {}
+        if not meta.get("discord_new_session_button"):
+            return meta
+        if allow_new_session_button and not self._discord_new_session_button_consumed:
+            self._discord_new_session_button_consumed = True
+            return meta
+        meta.pop("discord_new_session_button", None)
+        return meta
 
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
@@ -643,12 +665,11 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
-            meta = dict(self.metadata) if self.metadata else {}
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
-                metadata=meta,
+                metadata=self._send_metadata(),
             )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
@@ -766,7 +787,7 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self.metadata,
+                    metadata=self._send_metadata(),
                 )
                 if result.success:
                     break
@@ -940,7 +961,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=self._send_metadata(),
             )
             if result.success:
                 self._already_sent = True
@@ -977,7 +998,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._send_metadata(allow_new_session_button=False),
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1029,7 +1050,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._send_metadata(),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -1251,7 +1272,7 @@ class GatewayStreamConsumer:
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,
-                    metadata=self.metadata,
+                    metadata=self._send_metadata(),
                 )
                 if result.success:
                     if result.message_id:

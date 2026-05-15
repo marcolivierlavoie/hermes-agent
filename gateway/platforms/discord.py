@@ -551,6 +551,10 @@ class DiscordAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
 
+    # Keep reply-attached controls useful without retaining one persistent
+    # discord.py View forever for every bot message.
+    NEW_SESSION_BUTTON_TIMEOUT_SECONDS = 24 * 60 * 60
+
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
 
@@ -1410,7 +1414,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                return await self._send_to_forum(channel, content)
+                return await self._send_to_forum(channel, content, metadata=metadata)
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -1418,6 +1422,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             message_ids = []
             reference = None
+            new_session_view = self._build_new_session_view(metadata)
 
             if reply_to and self._reply_to_mode != "off":
                 try:
@@ -1434,11 +1439,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                chunk_view = new_session_view if i == 0 else None
+                send_kwargs = {
+                    "content": chunk,
+                    "reference": chunk_reference,
+                }
+                if chunk_view is not None:
+                    send_kwargs["view"] = chunk_view
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -1457,10 +1466,10 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs = {"content": chunk, "reference": None}
+                        if chunk_view is not None:
+                            retry_kwargs["view"] = chunk_view
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -1475,7 +1484,59 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    def _build_new_session_view(self, metadata: Optional[Dict[str, Any]] = None):
+        """Build the low-noise New session button view for normal replies.
+
+        The view is attached by ``send()`` once per logical adapter send (the
+        first Discord chunk only).  Callers may opt out with
+        ``metadata={"suppress_new_session_button": True}`` for operational
+        notices or other non-conversation deliveries.
+        """
+        if not metadata or not metadata.get("discord_new_session_button"):
+            return None
+        if metadata.get("suppress_new_session_button"):
+            return None
+        if not DISCORD_AVAILABLE:
+            return None
+        view_cls = globals().get("NewSessionView")
+        if view_cls is None:
+            return None
+        try:
+            return view_cls(self, timeout=self.NEW_SESSION_BUTTON_TIMEOUT_SECONDS)
+        except Exception as e:
+            logger.debug("[%s] Could not build Discord New session button view: %s", self.name, e)
+            return None
+
+    async def _handle_new_session_button(self, interaction: "discord.Interaction") -> None:
+        """Dispatch the New session button with the same semantics as /new.
+
+        Authorization is evaluated via the same slash-command gates, then the
+        interaction is turned into the same ``/reset`` MessageEvent used by the
+        existing ``/new`` slash command for the current channel/thread context.
+        """
+        command_text = "/reset"
+        if not await self._check_slash_authorization(interaction, command_text):
+            return
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception as e:
+            logger.debug("Discord New session button defer failed: %s", e)
+
+        event = self._build_slash_event(interaction, command_text)
+        await self.handle_message(event)
+
+        try:
+            await interaction.edit_original_response(content="New conversation started~")
+        except Exception as e:
+            logger.debug("Discord New session button success response failed: %s", e)
+
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -1488,16 +1549,17 @@ class DiscordAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        new_session_view = self._build_new_session_view(metadata)
 
         thread_name = _derive_forum_thread_name(content)
 
         starter_content = chunks[0] if chunks else thread_name
 
         try:
-            thread = await forum_channel.create_thread(
-                name=thread_name,
-                content=starter_content,
-            )
+            thread_kwargs = {"name": thread_name, "content": starter_content}
+            if new_session_view is not None:
+                thread_kwargs["view"] = new_session_view
+            thread = await forum_channel.create_thread(**thread_kwargs)
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
             return SendResult(success=False, error=f"Forum thread creation failed: {e}")
@@ -4734,6 +4796,23 @@ def _component_check_auth(
 
 
 if DISCORD_AVAILABLE:
+
+    class NewSessionView(discord.ui.View):
+        """Compact view attached to normal Discord replies for session reset."""
+
+        def __init__(self, adapter: DiscordAdapter, timeout: float | None = None):
+            super().__init__(timeout=timeout)
+            self.adapter = adapter
+
+        @discord.ui.button(
+            label="New session",
+            style=discord.ButtonStyle.secondary,
+            custom_id="hermes:new_session",
+        )
+        async def new_session(
+            self, interaction: discord.Interaction, button: discord.ui.Button,
+        ):
+            await self.adapter._handle_new_session_button(interaction)
 
     class ExecApprovalView(discord.ui.View):
         """

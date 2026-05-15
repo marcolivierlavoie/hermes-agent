@@ -3160,6 +3160,10 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata["notify"] = True
                     else:
                         _thread_metadata = {"notify": True}
+                    # Discord uses this positive gate to attach the compact
+                    # New session button only to normal final bot replies, not
+                    # operational notices or arbitrary adapter.send() calls.
+                    _thread_metadata["discord_new_session_button"] = True
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,

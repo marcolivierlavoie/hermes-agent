@@ -14319,11 +14319,13 @@ class GatewayRunner:
                         transport=_scfg.transport or "auto",
                         chat_type=getattr(source, "chat_type", "") or "",
                     )
+                    _stream_metadata = dict(_thread_metadata) if _thread_metadata else {}
+                    _stream_metadata["discord_new_session_button"] = True
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=source.chat_id,
                         config=_consumer_cfg,
-                        metadata=_thread_metadata,
+                        metadata=_stream_metadata,
                         initial_reply_to_id=event_message_id,
                     )
             except Exception as _sc_err:
@@ -15168,11 +15170,13 @@ class GatewayRunner:
                             transport=_scfg.transport or "auto",
                             chat_type=getattr(source, "chat_type", "") or "",
                         )
+                        _stream_metadata = dict(_status_thread_metadata) if _status_thread_metadata else {}
+                        _stream_metadata["discord_new_session_button"] = True
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
+                            metadata=_stream_metadata,
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
                                 if progress_queue is not None
