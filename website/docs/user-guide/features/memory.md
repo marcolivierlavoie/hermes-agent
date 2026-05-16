@@ -172,6 +172,30 @@ The memory system automatically rejects exact duplicate entries. If you try to a
 
 Memory entries are scanned for injection and exfiltration patterns before being accepted, since they're injected into the system prompt. Content matching threat patterns (prompt injection, credential exfiltration, SSH backdoors) or containing invisible Unicode characters is blocked.
 
+## Trusted Explicit Recall with Mnemosyne
+
+Mnemosyne is a local memory provider for auditable, explicitly approved facts. It is useful when a memory needs provenance and reversible hygiene controls instead of always-on prompt injection.
+
+Use this boundary:
+
+| Store | Use for | How it influences turns |
+|---|---|---|
+| **Built-in MEMORY.md / USER.md** | Compact facts that should always be available | Injected once at session start |
+| **Mnemosyne** | Approved memories with `source`, `context`, and `rationale`; facts that may need suppression/rollback | Explicit `mnemosyne_memory` recall/list/inspect/hygiene by default; no broad automatic prefetch |
+| **Obsidian / SecondBrain** | Durable notes, runbooks, decisions, research context | Read/search when the task needs source documents |
+| **Linear** | Issue status, priorities, acceptance criteria, execution evidence | Queried as the project-management source of truth |
+| **Session search** | Past conversation recall | On-demand transcript search/summarization |
+
+Mnemosyne's `hygiene_report` action is non-mutating. It can flag duplicate-like entries, stale/deprecated markers, and possible stale/current conflicts, but suppression still requires an explicit `suppress` action with rationale.
+
+### Mnemosyne regression gate and follow-up
+
+Trusted explicit recall is gated by a 10-check provider-level regression matrix covering source-of-truth boundaries, user preferences, environment facts, autonomy policy, and stale/conflict exclusion. Passing that gate approves explicit Mnemosyne recall and hygiene workflows only.
+
+Selective high-confidence context prefetch is a separate follow-up step, not part of the trusted explicit-recall baseline. For Biff OS, that follow-up is tracked as BIF-570 and should remain gated until the explicit recall/hygiene workflow passes verification.
+
+When enabled, selective prefetch is controlled by `$HERMES_HOME/mnemosyne/config.json` with `selective_prefetch_enabled: true`. It still fails closed by default, excludes suppressed/stale/sensitive memories, requires score/token-overlap confidence, and formats traceable memory IDs/sources so the agent can explain what influenced a response.
+
 ## Session Search
 
 Beyond MEMORY.md and USER.md, the agent can search its past conversations using the `session_search` tool:
@@ -209,7 +233,7 @@ memory:
 
 ## External Memory Providers
 
-For deeper, persistent memory that goes beyond MEMORY.md and USER.md, Hermes ships with 8 external memory provider plugins — including Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, and Supermemory.
+For deeper, persistent memory that goes beyond MEMORY.md and USER.md, Hermes ships with 9 memory provider plugins — including Mnemosyne, Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, and Supermemory.
 
 External providers run **alongside** built-in memory (never replacing it) and add capabilities like knowledge graphs, semantic search, automatic fact extraction, and cross-session user modeling.
 

@@ -63,6 +63,7 @@ class MnemosyneProvider(MemoryProvider):
     def __init__(self) -> None:
         self._session_id = ""
         self._root = get_hermes_home() / "mnemosyne" / "isolated-pilot"
+        self._config_path = get_hermes_home() / "mnemosyne" / "config.json"
         self._memories_path = self._root / "memories.jsonl"
         self._suppressions_path = self._root / "suppressions.jsonl"
 
@@ -78,7 +79,9 @@ class MnemosyneProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         hermes_home = kwargs.get("hermes_home")
         if hermes_home:
-            self._root = Path(str(hermes_home)) / "mnemosyne" / "isolated-pilot"
+            mnemosyne_root = Path(str(hermes_home)) / "mnemosyne"
+            self._root = mnemosyne_root / "isolated-pilot"
+            self._config_path = mnemosyne_root / "config.json"
             self._memories_path = self._root / "memories.jsonl"
             self._suppressions_path = self._root / "suppressions.jsonl"
         self._session_id = session_id
@@ -88,16 +91,46 @@ class MnemosyneProvider(MemoryProvider):
 
     def system_prompt_block(self) -> str:
         return (
-            "Mnemosyne isolated-pilot memory is enabled. Use mnemosyne_memory "
-            "for auditable add/recall/suppress/unsuppress operations. Suppression "
-            "is non-destructive by default and can be rolled back."
+            "Mnemosyne trusted explicit memory is enabled. Use mnemosyne_memory "
+            "for auditable add/recall/inspect/list/hygiene_report/suppress/unsuppress "
+            "operations. Suppression is non-destructive by default and can be rolled "
+            "back. Automatic broad recall/prefetch is disabled; recall Mnemosyne "
+            "explicitly when the user asks about memory/history or when a memory "
+            "check is required."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        # BIF-565 narrow production enablement: do not inject remembered content
-        # automatically. Memories are only user-visible through explicit
-        # mnemosyne_memory actions (recall/list/inspect).
-        return ""
+        config = self._load_config()
+        if config.get("selective_prefetch_enabled") is not True:
+            # Default trust boundary: no broad automatic memory injection.
+            return ""
+
+        limit = self._config_int(config, "max_prefetch_results", default=3, minimum=1, maximum=5)
+        min_score = self._config_int(config, "min_prefetch_score", default=2, minimum=1, maximum=100)
+        if limit is None or min_score is None:
+            return ""
+        candidates = []
+        for item in self.recall(query, limit=20):
+            if int(item.get("score") or 0) < min_score:
+                continue
+            if self._is_prefetch_eligible(item["memory"], query=query, config=config):
+                candidates.append(item)
+            if len(candidates) >= limit:
+                break
+        if not candidates:
+            return ""
+
+        lines = [
+            "Mnemosyne selective prefetch context (gated, unsuppressed, high-confidence):",
+        ]
+        for item in candidates:
+            memory = item["memory"]
+            lines.append(
+                f"- [{memory.get('id')}; source={memory.get('source')}; "
+                f"created_at={memory.get('created_at')}] {memory.get('content')}"
+            )
+        lines.append("If asked, explain these Mnemosyne memory IDs/sources influenced the response; current user instructions still take precedence.")
+        return "\n".join(lines)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
@@ -114,7 +147,7 @@ class MnemosyneProvider(MemoryProvider):
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["add", "recall", "suppress", "unsuppress", "inspect", "list"],
+                            "enum": ["add", "recall", "suppress", "unsuppress", "inspect", "list", "hygiene_report"],
                         },
                         "content": {"type": "string"},
                         "query": {"type": "string"},
@@ -166,6 +199,8 @@ class MnemosyneProvider(MemoryProvider):
                 return _json_result(self.inspect(str(args.get("memory_id") or "")))
             if action == "list":
                 return _json_result({"success": True, "memories": self.list_memories(include_suppressed=bool(args.get("include_suppressed") or False))})
+            if action == "hygiene_report":
+                return _json_result(self.hygiene_report(include_suppressed=bool(args.get("include_suppressed") or False)))
             return tool_error(f"Unsupported Mnemosyne action: {action}")
         except Exception as exc:  # defensive tool boundary
             return tool_error(f"Mnemosyne {action or 'operation'} failed: {exc}")
@@ -242,7 +277,7 @@ class MnemosyneProvider(MemoryProvider):
             suppressed = memory.get("id") in active
             if suppressed and not include_suppressed:
                 continue
-            rows.append({"memory": memory, "suppressed": suppressed})
+            rows.append(self._memory_result(memory, score=None, suppressed=suppressed))
         return rows
 
     def recall(self, query: str, *, limit: int = 5, include_suppressed: bool = False) -> List[Dict[str, Any]]:
@@ -261,9 +296,98 @@ class MnemosyneProvider(MemoryProvider):
                 score += 5
             if score <= 0:
                 continue
-            scored.append((score, {"memory": memory, "score": score, "suppressed": suppressed}))
+            scored.append((score, self._memory_result(memory, score=score, suppressed=suppressed)))
         scored.sort(key=lambda item: (-item[0], item[1]["memory"].get("created_at", "")))
         return [item for _, item in scored[: max(1, min(int(limit or 5), 20))]]
+
+    def hygiene_report(self, *, include_suppressed: bool = False) -> Dict[str, Any]:
+        """Return non-mutating hygiene recommendations for local Mnemosyne state."""
+        active = self._active_suppressed_ids()
+        memories = []
+        for memory in self._read_jsonl(self._memories_path):
+            memory_id = str(memory.get("id") or "")
+            suppressed = memory_id in active
+            if suppressed and not include_suppressed:
+                continue
+            memories.append((memory, suppressed))
+
+        recommendations: List[Dict[str, Any]] = []
+        stale_markers = {"stale", "deprecated", "outdated", "legacy", "old", "replaced", "superseded", "obsolete"}
+        current_markers = {"current", "approved", "active", "canonical", "verified", "production", "live"}
+
+        def text_for(memory: Dict[str, Any]) -> str:
+            return " ".join(str(memory.get(k) or "") for k in ("content", "source", "context", "rationale"))
+
+        token_cache = {str(m.get("id") or ""): _tokens(text_for(m)) for m, _ in memories}
+        for memory, suppressed in memories:
+            memory_id = str(memory.get("id") or "")
+            text = text_for(memory).lower()
+            markers = sorted(marker for marker in stale_markers if marker in text)
+            if markers and not suppressed:
+                recommendations.append({
+                    "candidate_memory_ids": [memory_id],
+                    "reason": f"stale/deprecation marker(s): {', '.join(markers)}",
+                    "suggested_action": "inspect",
+                })
+
+        for index, (left, left_suppressed) in enumerate(memories):
+            left_id = str(left.get("id") or "")
+            left_tokens = token_cache[left_id]
+            if not left_tokens:
+                continue
+            for right, right_suppressed in memories[index + 1:]:
+                right_id = str(right.get("id") or "")
+                right_tokens = token_cache[right_id]
+                if not right_tokens:
+                    continue
+                overlap = len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
+                if overlap >= 0.85:
+                    recommendations.append({
+                        "candidate_memory_ids": [left_id, right_id],
+                        "reason": f"duplicate-like token overlap {overlap:.2f}",
+                        "suggested_action": "inspect",
+                    })
+                    continue
+                left_text = text_for(left).lower()
+                right_text = text_for(right).lower()
+                left_stale = bool(stale_markers & _tokens(left_text))
+                right_stale = bool(stale_markers & _tokens(right_text))
+                left_current = bool(current_markers & _tokens(left_text))
+                right_current = bool(current_markers & _tokens(right_text))
+                if overlap >= 0.35 and ((left_stale and right_current) or (right_stale and left_current)):
+                    stale_id = left_id if left_stale and not left_suppressed else right_id
+                    if right_stale and right_suppressed:
+                        stale_id = right_id
+                    recommendations.append({
+                        "candidate_memory_ids": [left_id, right_id],
+                        "reason": f"possible stale/current conflict, token overlap {overlap:.2f}",
+                        "suggested_action": f"inspect; consider suppressing {stale_id}",
+                    })
+
+        return {
+            "success": True,
+            "generated_at": _now_iso(),
+            "memory_count": len(memories),
+            "suppressed_count": sum(1 for _, suppressed in memories if suppressed),
+            "include_suppressed": include_suppressed,
+            "recommendations": recommendations,
+            "mutated": False,
+        }
+
+    @staticmethod
+    def _memory_result(memory: Dict[str, Any], *, score: int | None, suppressed: bool) -> Dict[str, Any]:
+        result = {
+            "memory": memory,
+            "suppressed": suppressed,
+            "trusted": True,
+            "source": memory.get("source"),
+            "context": memory.get("context"),
+            "rationale": memory.get("rationale"),
+            "created_at": memory.get("created_at"),
+        }
+        if score is not None:
+            result["score"] = score
+        return result
 
     def _memory_by_id(self, memory_id: str) -> Dict[str, Any] | None:
         for row in self._read_jsonl(self._memories_path):
@@ -279,6 +403,69 @@ class MnemosyneProvider(MemoryProvider):
 
     def _active_suppressed_ids(self) -> set[str]:
         return {str(row.get("memory_id")) for row in self._read_jsonl(self._suppressions_path) if row.get("active", True)}
+
+    def _load_config(self) -> Dict[str, Any]:
+        defaults: Dict[str, Any] = {
+            "selective_prefetch_enabled": False,
+            "max_prefetch_results": 3,
+            "min_prefetch_score": 2,
+            "min_prefetch_token_overlap": 2,
+            "blocked_terms": [
+                "api key",
+                "apikey",
+                "password",
+                "private key",
+                "secret",
+                "token",
+                "credential",
+            ],
+            "stale_terms": [
+                "stale",
+                "deprecated",
+                "outdated",
+                "legacy",
+                "obsolete",
+                "replaced",
+                "superseded",
+            ],
+        }
+        if not self._config_path.exists():
+            return defaults
+        try:
+            loaded = json.loads(self._config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return defaults
+        if not isinstance(loaded, dict):
+            return defaults
+        merged = dict(defaults)
+        merged.update(loaded)
+        return merged
+
+    def _is_prefetch_eligible(self, memory: Dict[str, Any], *, query: str, config: Dict[str, Any]) -> bool:
+        haystack = " ".join(str(memory.get(k) or "") for k in ("content", "source", "context", "rationale"))
+        haystack_lower = haystack.lower()
+        if any(str(term).lower() in haystack_lower for term in config.get("blocked_terms", [])):
+            return False
+        if any(str(term).lower() in haystack_lower for term in config.get("stale_terms", [])):
+            return False
+        query_tokens = _tokens(query)
+        memory_tokens = _tokens(haystack)
+        overlap = len(query_tokens & memory_tokens)
+        min_overlap_value = self._config_int(config, "min_prefetch_token_overlap", default=2, minimum=1, maximum=100)
+        if min_overlap_value is None:
+            return False
+        return overlap >= min_overlap_value
+
+    @staticmethod
+    def _config_int(config: Dict[str, Any], key: str, *, default: int, minimum: int, maximum: int) -> int | None:
+        raw = config.get(key, default)
+        if isinstance(raw, bool):
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return max(minimum, min(value, maximum))
 
     @staticmethod
     def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
