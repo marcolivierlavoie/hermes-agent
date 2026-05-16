@@ -167,6 +167,99 @@ def test_supersession_and_conflict_metadata_are_exposed_and_reported(tmp_path):
     assert report["mutated"] is False
 
 
+def test_prefetch_conflict_detection_skips_unannotated_conflicting_memories(tmp_path):
+    provider = _provider(tmp_path)
+    provider.add_memory(
+        content="Biff command surface is Discord.",
+        source="BIF-575 conflict fixture",
+        context="unannotated conflict candidate",
+        rationale="current candidate without explicit conflict metadata",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )
+    provider.add_memory(
+        content="Biff command surface is Cockpit.",
+        source="BIF-575 conflict fixture",
+        context="unannotated conflict candidate",
+        rationale="conflicting candidate without explicit conflict metadata",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )
+    _enable_selective_prefetch(tmp_path, max_prefetch_results=5, min_prefetch_token_overlap=2)
+
+    trace = provider.prefetch_trace("What is the Biff command surface?")
+    explicit = provider.recall("Biff command surface", limit=5)
+
+    assert trace["injected"] is False
+    assert trace["skip_reason"] == "conflict_detected"
+    assert len(trace["memory_ids"]) == 2
+    assert {item["memory"]["content"] for item in explicit} == {"Biff command surface is Discord.", "Biff command surface is Cockpit."}
+
+
+def test_stale_current_pair_prefetches_clear_current_winner(tmp_path):
+    provider = _provider(tmp_path)
+    stale = provider.add_memory(
+        content="Stale command surface was Cockpit-first for Biff.",
+        source="BIF-575 stale fixture",
+        context="stale/current pair",
+        rationale="legacy stale fact",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stale",
+        current_request_safe=True,
+    )["memory"]
+    current = provider.add_memory(
+        content="Current command surface is Discord-first for Biff.",
+        source="BIF-575 current fixture",
+        context="current pair fixture",
+        rationale="current fact replaces earlier fact",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="current",
+        current_request_safe=True,
+        supersedes=[stale["id"]],
+    )["memory"]
+    _enable_selective_prefetch(tmp_path, max_prefetch_results=5, min_prefetch_token_overlap=2)
+
+    trace = provider.prefetch_trace("What is the Biff command surface?")
+
+    assert trace["injected"] is True
+    assert trace["memory_ids"] == [current["id"]]
+    assert any(item["id"] == stale["id"] and item["skip_reason"] in {"superseded", "stability_not_stable_or_current"} for item in trace["candidate_traces"])
+
+
+def test_hygiene_reports_duplicate_like_memories_and_suppression_rollback(tmp_path):
+    provider = _provider(tmp_path)
+    first = provider.add_memory(
+        content="Linear remains the Biff OS source of truth for issue status.",
+        source="BIF-575 duplicate fixture",
+        context="duplicate-like fixture",
+        rationale="first duplicate-like memory",
+    )["memory"]
+    second = provider.add_memory(
+        content="Linear remains the Biff OS source of truth for issue statuses.",
+        source="BIF-575 duplicate fixture",
+        context="duplicate-like fixture",
+        rationale="second duplicate-like memory",
+    )["memory"]
+
+    report_before = provider.hygiene_report(include_suppressed=True)
+    suppressed = provider.suppress_memory(memory_id=second["id"], rationale="mistaken duplicate suppression test", source="BIF-575 test")
+    hidden = provider.recall("issue statuses", include_suppressed=False)
+    restored = provider.unsuppress_memory(memory_id=second["id"], rationale="rollback mistaken suppression test")
+    visible = provider.recall("issue statuses", include_suppressed=False)
+
+    assert any(set(item["candidate_memory_ids"]) == {first["id"], second["id"]} for item in report_before["recommendations"])
+    assert suppressed["success"] is True
+    assert all(item["memory"]["id"] != second["id"] for item in hidden)
+    assert restored["success"] is True
+    assert any(item["memory"]["id"] == second["id"] for item in visible)
+
+
 def test_prefetch_trace_has_budgets_skip_reasons_and_optional_event_log(tmp_path):
     provider = _provider(tmp_path)
     good = provider.add_memory(
