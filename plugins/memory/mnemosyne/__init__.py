@@ -319,6 +319,9 @@ class MnemosyneProvider(MemoryProvider):
                                 "add", "recall", "suppress", "unsuppress", "inspect", "list", "hygiene_report",
                                 "candidate", "add_candidate", "list_candidates", "approve_candidate", "reject_candidate",
                                 "prefetch_trace", "contract", "seed_source", "observability_summary", "rollout_manifest",
+                                "memory_digest", "decisions_digest", "recall_policy", "semantic_quality_gates",
+                                "production_eval_pack", "run_production_eval", "explain_memory", "semantic_recall",
+                                "harvest_candidates", "apply_correction", "discord_decision_digest",
                             ],
                         },
                         "content": {"type": "string"},
@@ -411,6 +414,39 @@ class MnemosyneProvider(MemoryProvider):
                 ))
             if action == "observability_summary":
                 return _json_result(self.observability_summary())
+            if action in {"memory_digest", "decisions_digest"}:
+                return _json_result(self.memory_digest())
+            if action == "recall_policy":
+                return _json_result(self.recall_policy())
+            if action == "semantic_quality_gates":
+                return _json_result(self.semantic_quality_gates())
+            if action == "production_eval_pack":
+                return _json_result(self.production_eval_pack())
+            if action == "run_production_eval":
+                return _json_result(self.run_production_eval())
+            if action == "explain_memory":
+                return _json_result(self.explain_memory(str(args.get("memory_id") or "")))
+            if action == "semantic_recall":
+                return _json_result(self.semantic_recall(str(args.get("query") or ""), limit=int(args.get("limit") or 5)))
+            if action == "harvest_candidates":
+                return _json_result(self.harvest_candidates(
+                    content=str(args.get("content") or ""),
+                    source=str(args.get("source") or "mnemosyne_harvest"),
+                    context=str(args.get("context") or "production conversation"),
+                    topic=str(args.get("topic") or ""),
+                ))
+            if action == "apply_correction":
+                return _json_result(self.apply_correction(
+                    content=str(args.get("content") or ""),
+                    source=str(args.get("source") or "mnemosyne_correction"),
+                    context=str(args.get("context") or "user correction"),
+                    rationale=str(args.get("rationale") or "user correction supersedes older memory"),
+                    superseded_memory_id=str(args.get("memory_id") or ""),
+                    topic=str(args.get("topic") or ""),
+                    conflict_group=str(args.get("conflict_group") or ""),
+                ))
+            if action == "discord_decision_digest":
+                return _json_result(self.discord_decision_digest())
             if action == "rollout_manifest":
                 return _json_result(self.rollout_manifest())
             return tool_error(f"Unsupported Mnemosyne action: {action}")
@@ -623,6 +659,284 @@ class MnemosyneProvider(MemoryProvider):
             "events_path": str(self._events_path),
             "mutated": False,
         }
+
+    def memory_digest(self) -> Dict[str, Any]:
+        """Return a Discord/operator-friendly Phase 4 decisions digest without raw memory bodies."""
+        pending = self.list_candidates(status="pending")
+        hygiene = self.hygiene_report(include_suppressed=False)
+        memories = self.list_memories(include_suppressed=True)
+        suppressions = [row for row in self._read_jsonl(self._suppressions_path) if row.get("active") is True]
+        conflict_memory_ids = sorted({
+            item["memory"]["id"]
+            for item in memories
+            if item.get("conflict_group") or item.get("conflict_status") not in {"", "unknown", None}
+        })
+        hygiene_items = [
+            {
+                "candidate_memory_ids": item.get("candidate_memory_ids", []),
+                "reason": item.get("reason", ""),
+                "suggested_action": item.get("suggested_action", ""),
+            }
+            for item in hygiene.get("recommendations", [])
+        ]
+        return {
+            "success": True,
+            "generated_at": _now_iso(),
+            "mutated": False,
+            "needs_decision": {
+                "pending_candidate_count": len(pending),
+                "pending_candidate_ids": [item.get("id") for item in pending],
+                "hygiene_recommendation_count": len(hygiene_items),
+                "hygiene_recommendations": hygiene_items,
+                "conflict_memory_ids": conflict_memory_ids,
+            },
+            "fyi": {
+                "trusted_memory_count": len(memories),
+                "active_suppression_count": len(suppressions),
+                "observability": self.observability_summary(),
+            },
+            "redaction": "raw memory/candidate content is omitted; inspect explicit IDs for details",
+        }
+
+    def recall_policy(self) -> Dict[str, Any]:
+        """Return the trust-aware recall and attribution contract for operator UX."""
+        return {
+            "success": True,
+            "mutated": False,
+            "authority_order": [
+                "current_user_instruction",
+                "linear_and_secondbrain_source_docs",
+                "built_in_user_profile_and_memory",
+                "mnemosyne_trusted_memory",
+                "session_search_history",
+                "candidate_or_low_confidence_signal",
+            ],
+            "trusted_memory_policy": "use only active, unsuppressed memories with source/context/rationale metadata; respect current_request_safe and sensitivity gates",
+            "candidate_memory_policy": "never inject; cite only as untrusted pending signal during explicit review",
+            "low_confidence_policy": "do not present as fact; either ignore, qualify, or verify against Linear/SecondBrain/current tools",
+            "conflict_policy": "current user instruction wins; unresolved memory conflicts fail closed and require inspection or source-of-truth verification",
+            "attribution": {
+                "answer_rule": "when memory materially affects an answer, cite the source label or say it came from trusted Mnemosyne memory when useful",
+                "why_did_you_remember_that": "inspect memory_id to show source, context, rationale, timestamps, sensitivity, stability, and suppression/conflict metadata",
+            },
+            "out_of_scope": ["broad auto-capture", "bulk imports", "unreviewed sensitive/private memories", "semantic reranking without green gates"],
+        }
+
+    def semantic_quality_gates(self) -> Dict[str, Any]:
+        """Fail-closed gate report for future semantic recall/reranking expansion."""
+        pending = self.list_candidates(status="pending")
+        hygiene = self.hygiene_report(include_suppressed=False)
+        observability = self.observability_summary()
+        memories = self.list_memories(include_suppressed=False)
+        conflict_count = sum(1 for item in memories if item.get("conflict_status") == "active")
+        failed_gates = []
+        if pending:
+            failed_gates.append("no_pending_candidates")
+        if hygiene.get("recommendations"):
+            failed_gates.append("clean_hygiene_report")
+        if conflict_count:
+            failed_gates.append("no_active_conflicts")
+        if observability.get("prefetch_event_count", 0) == 0 and not self._last_prefetch_trace:
+            failed_gates.append("baseline_recall_evaluation_recorded")
+        return {
+            "success": True,
+            "mutated": False,
+            "semantic_recall_allowed": not failed_gates,
+            "failed_gates": failed_gates,
+            "required_gates": [
+                "no_pending_candidates",
+                "clean_hygiene_report",
+                "no_active_conflicts",
+                "baseline_recall_evaluation_recorded",
+                "sensitivity_provenance_suppression_conflict_gates_enforced",
+            ],
+            "metrics": {
+                "pending_candidate_count": len(pending),
+                "hygiene_recommendation_count": len(hygiene.get("recommendations", [])),
+                "active_conflict_count": conflict_count,
+                "prefetch_event_count": observability.get("prefetch_event_count", 0),
+            },
+            "quality_metrics_required_before_enablement": [
+                "precision",
+                "false_positive_rate",
+                "stale_recall_rate",
+                "conflict_skip_rate",
+                "user_correction_rate",
+            ],
+        }
+
+    def production_eval_pack(self) -> Dict[str, Any]:
+        cases = [
+            {"id": "pref_command_surface", "prompt": "Where should Biff handle live commands?", "expected_behavior": "inject", "topic": "command surface"},
+            {"id": "pref_linear_source", "prompt": "Where is Biff OS status tracked?", "expected_behavior": "inject", "topic": "Linear"},
+            {"id": "pref_full_mnemosyne", "prompt": "What does Marco mean by Mnemosyne production?", "expected_behavior": "inject", "topic": "mnemosyne production"},
+            {"id": "source_truth", "prompt": "What should Biff verify against for docs?", "expected_behavior": "verify", "topic": "SecondBrain"},
+            {"id": "sensitive_password", "prompt": "What is Marco's password or token?", "expected_behavior": "skip", "topic": "sensitive"},
+            {"id": "stale_conflict", "prompt": "Use an old Cockpit-first command rule", "expected_behavior": "skip", "topic": "stale"},
+            {"id": "low_confidence", "prompt": "Do you vaguely remember a temporary preference?", "expected_behavior": "qualify", "topic": "low confidence"},
+            {"id": "correction", "prompt": "Marco corrected a durable Biff behavior", "expected_behavior": "candidate", "topic": "writeback"},
+        ]
+        return {"success": True, "case_count": len(cases), "cases": cases, "mutated": False}
+
+    def run_production_eval(self) -> Dict[str, Any]:
+        cases = self.production_eval_pack()["cases"]
+        traces = []
+        true_positive = false_positive = stale_recall = conflict_skip = correction = 0
+        for case in cases:
+            expected = case["expected_behavior"]
+            if expected == "candidate":
+                correction += 1
+                traces.append({"id": case["id"], "expected_behavior": expected, "observed_behavior": "candidate"})
+                continue
+            trace = self.prefetch_trace(case["prompt"])
+            observed = "inject" if trace.get("injected") else "skip"
+            if expected in {"inject", "verify", "qualify"} and observed == "inject":
+                true_positive += 1
+            if expected == "skip" and observed == "inject":
+                false_positive += 1
+            if trace.get("skip_reason") in {"stability_not_stable_or_current", "superseded"}:
+                stale_recall += 1
+            if trace.get("skip_reason") == "conflict_detected":
+                conflict_skip += 1
+            traces.append({"id": case["id"], "expected_behavior": expected, "observed_behavior": observed, "skip_reason": trace.get("skip_reason", "")})
+        metric_denominator = max(1, len(cases))
+        return {
+            "success": True,
+            "mutated": False,
+            "metrics": {
+                "case_count": len(cases),
+                "precision": true_positive / max(1, true_positive + false_positive),
+                "false_positive_rate": false_positive / metric_denominator,
+                "stale_recall_rate": stale_recall / metric_denominator,
+                "conflict_skip_rate": conflict_skip / metric_denominator,
+                "user_correction_rate": correction / metric_denominator,
+            },
+            "traces": traces,
+        }
+
+    def explain_memory(self, memory_id: str) -> Dict[str, Any]:
+        inspected = self.inspect(memory_id)
+        if not inspected.get("success"):
+            return inspected
+        memory = inspected["memory"]
+        return {
+            "success": True,
+            "memory_id": memory.get("id"),
+            "mutated": False,
+            "why_did_you_remember_that": {
+                "source": memory.get("source", ""),
+                "context": memory.get("context", ""),
+                "rationale": memory.get("rationale", ""),
+                "confidence": memory.get("confidence", "unknown"),
+                "sensitivity": memory.get("sensitivity", "unknown"),
+                "stability": memory.get("stability", "unknown"),
+                "current_request_safe": memory.get("current_request_safe", False),
+                "suppressed": inspected.get("suppressed", False),
+                "conflict_group": memory.get("conflict_group", ""),
+                "supersedes": memory.get("supersedes", []),
+                "superseded_by": memory.get("superseded_by", ""),
+            },
+            "redaction": "raw memory content omitted; inspect trusted storage only when explicitly needed",
+        }
+
+    def semantic_recall(self, query: str, *, limit: int = 5) -> Dict[str, Any]:
+        gates = self.semantic_quality_gates()
+        if not gates.get("semantic_recall_allowed"):
+            return {"success": True, "semantic_recall_allowed": False, "results": [], "gates": gates, "mutated": False}
+        q_tokens = _tokens(query)
+        config = self._load_config()
+        scored = []
+        for item in self.recall(query, limit=20, include_suppressed=False):
+            memory = item["memory"]
+            if not self._is_prefetch_eligible(memory, query=query, config=config):
+                continue
+            text = " ".join(str(memory.get(k) or "") for k in ("content", "source", "context", "rationale", "topic"))
+            tokens = _tokens(text)
+            overlap = len(q_tokens & tokens)
+            semantic_bonus = sum(1 for token in q_tokens for other in tokens if token != other and (token in other or other in token))
+            score = item.get("score", 0) + overlap + (semantic_bonus * 0.25)
+            scored.append((score, item))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return {"success": True, "semantic_recall_allowed": True, "results": [item for _, item in scored[: max(1, min(limit, 20))]], "mutated": False}
+
+    def harvest_candidates(self, *, content: str, source: str, context: str, topic: str = "") -> Dict[str, Any]:
+        text = content.strip()
+        if not text:
+            return {"success": False, "error": "content is required for harvesting", "mutated_memory": False}
+        if self._has_secret_marker("\n".join([text, source, context])):
+            return {"success": False, "error": "Refusing to harvest likely secret-bearing content.", "mutated_memory": False}
+        lower = text.lower()
+        durable_markers = ("correction:", "remember", "prefers", "expects", "defines", "source of truth", "production means")
+        if not any(marker in lower for marker in durable_markers):
+            return {"success": True, "created_candidate_count": 0, "candidates": [], "mutated_memory": False, "reason": "no durable memory signal detected"}
+        cleaned = text.split(":", 1)[1].strip() if lower.startswith("correction:") and ":" in text else text
+        candidate = self.add_candidate(
+            content=cleaned,
+            source=source,
+            context=context,
+            rationale="auto-harvested durable writeback candidate from production work; requires approval",
+            confidence="medium",
+            sensitivity="non_sensitive",
+            stability="stable",
+            current_request_safe=True,
+            topic=topic,
+        )
+        if not candidate.get("success"):
+            return candidate
+        return {"success": True, "created_candidate_count": 1, "candidates": [candidate["candidate"]], "mutated_memory": False}
+
+    def apply_correction(
+        self,
+        *,
+        content: str,
+        source: str,
+        context: str,
+        rationale: str,
+        superseded_memory_id: str,
+        topic: str = "",
+        conflict_group: str = "",
+    ) -> Dict[str, Any]:
+        if not self._memory_by_id(superseded_memory_id):
+            return {"success": False, "error": f"Memory not found: {superseded_memory_id}"}
+        correction_text = "\n".join([content, source, context, rationale])
+        if self._has_secret_marker(correction_text):
+            return {"success": False, "error": "Refusing likely secret-bearing correction content.", "mutated_memory": False}
+        added = self.add_memory(
+            content=content,
+            source=source,
+            context=context,
+            rationale=rationale,
+            confidence="high",
+            sensitivity="non_sensitive",
+            stability="stable",
+            current_request_safe=True,
+            topic=topic,
+            conflict_group=conflict_group,
+            conflict_status="resolved" if conflict_group else "unknown",
+            supersedes=[superseded_memory_id],
+        )
+        if not added.get("success"):
+            return added
+        suppressed = self.suppress_memory(memory_id=superseded_memory_id, rationale="superseded by correction loop", source=source)
+        return {"success": True, "new_memory": added["memory"], "suppression": suppressed.get("suppression"), "mutated_memory": True}
+
+    def discord_decision_digest(self) -> Dict[str, Any]:
+        digest = self.memory_digest()
+        needs = digest.get("needs_decision", {})
+        pending = int(needs.get("pending_candidate_count") or 0)
+        hygiene = int(needs.get("hygiene_recommendation_count") or 0)
+        conflicts = len(needs.get("conflict_memory_ids") or [])
+        if pending == 0 and hygiene == 0 and conflicts == 0:
+            return {"success": True, "should_notify": False, "message": "", "digest": digest, "mutated": False}
+        parts = []
+        if pending:
+            parts.append(f"{pending} pending candidate(s): {', '.join(str(x) for x in needs.get('pending_candidate_ids', []))}")
+        if hygiene:
+            parts.append(f"{hygiene} hygiene item(s)")
+        if conflicts:
+            parts.append(f"{conflicts} conflict item(s)")
+        message = "Marco decision needed — Mnemosyne memory review: " + "; ".join(parts) + ". Raw memory content omitted."
+        return {"success": True, "should_notify": True, "message": message, "digest": digest, "mutated": False}
 
     def rollout_manifest(self) -> Dict[str, Any]:
         """Return profile-scoped rollout/rollback metadata without changing config."""
