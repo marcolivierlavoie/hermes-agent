@@ -735,6 +735,13 @@ class MnemosyneProvider(MemoryProvider):
             markers = sorted(marker for marker in stale_markers if marker in text_for(memory).lower())
             if markers and not suppressed:
                 recommendations.append({"candidate_memory_ids": [memory_id], "reason": f"stale/deprecation marker(s): {', '.join(markers)}", "suggested_action": "inspect"})
+            sensitivity = str(memory.get("sensitivity") or "unknown").lower()
+            if sensitivity in {"sensitive", "secret"} or self._has_secret_marker(text_for(memory)):
+                recommendations.append({
+                    "candidate_memory_ids": [memory_id],
+                    "reason": "possible sensitive/secret content or sensitive classification",
+                    "suggested_action": "inspect; confirm explicit-recall-only status or suppress if stale",
+                })
             missing_metadata = [
                 name for name in ("confidence", "sensitivity", "stability")
                 if str(memory.get(name) or "unknown") == "unknown"

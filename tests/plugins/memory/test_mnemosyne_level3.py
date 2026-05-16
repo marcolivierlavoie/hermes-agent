@@ -260,6 +260,33 @@ def test_hygiene_reports_duplicate_like_memories_and_suppression_rollback(tmp_pa
     assert any(item["memory"]["id"] == second["id"] for item in visible)
 
 
+def test_hygiene_report_flags_sensitive_content_without_mutating_corpus(tmp_path):
+    provider = _provider(tmp_path)
+    sensitive = provider.add_memory(
+        content="Use the credential helper; never store secret values in memory.",
+        source="BIF-579 hygiene fixture",
+        context="sensitive hygiene fixture",
+        rationale="exercise sensitive report path",
+        confidence="high",
+        sensitivity="sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["memory"]
+    before = provider.list_memories(include_suppressed=True)
+
+    report = provider.hygiene_report(include_suppressed=True)
+    after = provider.list_memories(include_suppressed=True)
+
+    assert report["mutated"] is False
+    assert before == after
+    assert any(
+        item["candidate_memory_ids"] == [sensitive["id"]]
+        and "sensitive" in item["reason"]
+        and "inspect" in item["suggested_action"]
+        for item in report["recommendations"]
+    )
+
+
 def test_prefetch_trace_has_budgets_skip_reasons_and_optional_event_log(tmp_path):
     provider = _provider(tmp_path)
     good = provider.add_memory(
