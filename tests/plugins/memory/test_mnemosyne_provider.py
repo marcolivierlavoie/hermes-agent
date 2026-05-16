@@ -594,3 +594,136 @@ def test_bif_570_selective_prefetch_eval_matrix(tmp_path):
     assert provider.prefetch("Tell me the token or password Marco uses for Biff OS") == ""
     assert provider.prefetch("Cockpit-first Biff priority") == ""
     assert "Cockpit-first" not in useful + second_useful
+
+
+
+def test_l3_candidate_queue_requires_review_and_filters_secrets(tmp_path):
+    provider = _provider(tmp_path)
+
+    secret = provider.add_candidate(
+        content="Marco API key sk-secret-marker should not enter memory.",
+        source="BIF-574 fixture",
+        context="candidate safety",
+        rationale="secret filter regression",
+    )
+    assert secret["success"] is False
+
+    candidate = provider.add_candidate(
+        content="Marco prefers concise Biff execution updates for Discord.",
+        source="BIF-574 fixture",
+        context="candidate queue",
+        rationale="safe preference candidate",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+        topic="discord response style",
+    )["candidate"]
+    assert candidate["status"] == "pending"
+    assert provider.recall("concise execution updates") == []
+
+    approved = provider.approve_candidate(candidate_id=candidate["id"], rationale="Marco-approved low-risk preference")
+    assert approved["success"] is True
+    assert approved["memory"]["id"].startswith("mn_")
+    assert provider.list_candidates(status="approved")[0]["approved_memory_id"] == approved["memory"]["id"]
+    assert provider.recall("concise execution updates")[0]["memory"]["id"] == approved["memory"]["id"]
+
+
+def test_l3_candidate_rejection_is_auditable_and_not_recalled(tmp_path):
+    provider = _provider(tmp_path)
+    candidate = provider.add_candidate(
+        content="Temporary test preference should not become memory.",
+        source="BIF-574 fixture",
+        context="candidate queue",
+        rationale="rejection regression",
+    )["candidate"]
+
+    rejected = provider.reject_candidate(candidate_id=candidate["id"], rationale="not a durable preference")
+
+    assert rejected["success"] is True
+    assert rejected["candidate"]["status"] == "rejected"
+    assert rejected["candidate"]["decision_rationale"] == "not a durable preference"
+    assert provider.recall("Temporary test preference") == []
+
+
+def test_l3_supersession_excludes_old_memory_from_prefetch_and_hygiene_flags_it(tmp_path):
+    provider = _provider(tmp_path)
+    old = provider.add_memory(
+        content="Current Biff OS command surface is Slack-first.",
+        source="BIF-575 fixture",
+        context="conflict subject: biff command surface",
+        rationale="old command surface",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="current",
+        current_request_safe=True,
+        topic="biff command surface",
+        conflict_group="biff-command-surface",
+    )["memory"]
+    new = provider.add_memory(
+        content="Current Biff OS command surface is Discord-first.",
+        source="BIF-575 fixture",
+        context="conflict subject: biff command surface",
+        rationale="current command surface",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="current",
+        current_request_safe=True,
+        topic="biff command surface",
+        conflict_group="biff-command-surface",
+        supersedes=[old["id"]],
+    )["memory"]
+    _enable_selective_prefetch(tmp_path)
+
+    prefetched = provider.prefetch("What is the current Biff OS command surface?")
+
+    assert new["id"] in prefetched
+    assert old["id"] not in prefetched
+    inspected_old = provider.inspect(old["id"])["memory"]
+    assert inspected_old["superseded_by"] == new["id"]
+    report = provider.hygiene_report(include_suppressed=True)
+    assert any("superseded" in item["reason"] for item in report["recommendations"])
+
+
+def test_l3_prefetch_trace_records_hit_and_skip_reasons(tmp_path):
+    provider = _provider(tmp_path)
+    memory = provider.add_memory(
+        content="Linear is the canonical source of truth for Biff OS issues.",
+        source="BIF-578 fixture",
+        context="observability",
+        rationale="trace hit regression",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+        topic="source of truth",
+    )["memory"]
+    _enable_selective_prefetch(tmp_path, observability_enabled=True)
+
+    useful = provider.prefetch("What is the Biff OS issue source of truth?")
+    assert memory["id"] in useful
+    trace = json.loads(provider.handle_tool_call("mnemosyne_memory", {"action": "prefetch_trace"}))["trace"]
+    assert trace["memory_ids"] == [memory["id"]]
+    assert trace["injected_token_estimate"] > 0
+    assert trace["skip_reason"] == ""
+
+    assert provider.prefetch("weather bananas unrelated") == ""
+    trace = json.loads(provider.handle_tool_call("mnemosyne_memory", {"action": "prefetch_trace"}))["trace"]
+    assert trace["skip_reason"] == "no_eligible_memories"
+
+
+def test_l3_hygiene_flags_missing_metadata_without_mutation(tmp_path):
+    provider = _provider(tmp_path)
+    memory = provider.add_memory(
+        content="Biff missing metadata hygiene marker.",
+        source="BIF-579 fixture",
+        context="hygiene",
+        rationale="missing metadata check",
+    )["memory"]
+    before = provider.list_memories(include_suppressed=True)
+    report = provider.hygiene_report(include_suppressed=True)
+    after = provider.list_memories(include_suppressed=True)
+
+    assert before == after
+    assert report["mutated"] is False
+    assert any(memory["id"] in item["candidate_memory_ids"] and "metadata" in item["reason"] for item in report["recommendations"])
