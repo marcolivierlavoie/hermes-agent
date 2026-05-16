@@ -388,7 +388,7 @@ def test_source_aware_seeding_rejects_secret_content_before_queueing(tmp_path):
 
     seeded = provider.seed_source_candidates(
         source="BIF-577 seed fixture",
-        records=[{"content": "password: hunter2", "context": "seed secret test"}],
+        records=[{"content": "password: fixture-secret-value", "context": "seed secret test"}],
         dry_run=False,
     )
 
@@ -548,7 +548,7 @@ def test_phase5_harvest_candidates_and_correction_supersession_loop(tmp_path):
     }))
     rejected = json.loads(provider.handle_tool_call("mnemosyne_memory", {
         "action": "harvest_candidates",
-        "content": "password: hunter2",
+        "content": "password: fixture-secret-value",
         "source": "bad fixture",
         "context": "secret rejection",
     }))
@@ -569,8 +569,10 @@ def test_phase5_harvest_candidates_and_correction_supersession_loop(tmp_path):
     assert rejected["success"] is False
     assert "secret" in rejected["error"].lower()
     assert correction["success"] is True
-    assert correction["new_memory"]["supersedes"] == [old["id"]]
-    assert provider.inspect(old["id"])["memory"]["superseded_by"] == correction["new_memory"]["id"]
+    assert correction["candidate"]["supersedes"] == [old["id"]]
+    assert correction["mutated_memory"] is False
+    assert provider.inspect(old["id"])["memory"].get("superseded_by", "") == ""
+    assert provider.inspect(old["id"])["suppressed"] is False
 
 
 def test_phase5_decision_digest_is_silent_when_no_action_needed_and_actionable_when_pending(tmp_path):
@@ -587,6 +589,28 @@ def test_phase5_decision_digest_is_silent_when_no_action_needed_and_actionable_w
         stability="stable",
         current_request_safe=True,
     )
+    sensitive = provider.add_memory(
+        content="Sensitive operational rule body must not appear in digest.",
+        source="BIF-598 sensitive fixture",
+        context="digest hygiene",
+        rationale="exercise hygiene ID-only rendering",
+        confidence="high",
+        sensitivity="sensitive",
+        stability="stable",
+        current_request_safe=False,
+    )["memory"]
+    conflict = provider.add_memory(
+        content="Conflicting operational rule body must not appear in digest.",
+        source="BIF-598 conflict fixture",
+        context="digest conflict",
+        rationale="exercise conflict ID-only rendering",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+        conflict_group="digest conflict fixture",
+        conflict_status="active",
+    )["memory"]
     actionable = json.loads(provider.handle_tool_call("mnemosyne_memory", {"action": "discord_decision_digest"}))
 
     assert quiet["success"] is True
@@ -596,7 +620,11 @@ def test_phase5_decision_digest_is_silent_when_no_action_needed_and_actionable_w
     assert actionable["should_notify"] is True
     assert "Marco decision needed" in actionable["message"]
     assert "candidate" in actionable["message"].lower()
+    assert sensitive["id"] in actionable["message"]
+    assert conflict["id"] in actionable["message"]
     assert "full-feature Mnemosyne production" not in actionable["message"]
+    assert "Sensitive operational rule body" not in actionable["message"]
+    assert "Conflicting operational rule body" not in actionable["message"]
 
 
 def test_phase5_apply_correction_rejects_secrets_before_trusted_write(tmp_path):
@@ -610,7 +638,7 @@ def test_phase5_apply_correction_rejects_secrets_before_trusted_write(tmp_path):
 
     rejected = json.loads(provider.handle_tool_call("mnemosyne_memory", {
         "action": "apply_correction",
-        "content": "password: hunter2",
+        "content": "password: fixture-secret-value",
         "source": "BIF-592 security fixture",
         "context": "secret correction rejection",
         "rationale": "should fail closed",

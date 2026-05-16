@@ -320,13 +320,15 @@ class MnemosyneProvider(MemoryProvider):
                                 "candidate", "add_candidate", "list_candidates", "approve_candidate", "reject_candidate",
                                 "prefetch_trace", "contract", "seed_source", "observability_summary", "rollout_manifest",
                                 "memory_digest", "decisions_digest", "recall_policy", "semantic_quality_gates",
-                                "production_eval_pack", "run_production_eval", "explain_memory", "semantic_recall",
+                                "production_eval_pack", "run_production_eval", "explain_memory", "answer_attribution", "semantic_recall",
                                 "harvest_candidates", "apply_correction", "discord_decision_digest",
                             ],
                         },
                         "content": {"type": "string"},
                         "query": {"type": "string"},
                         "memory_id": {"type": "string"},
+                        "memory_ids": {"type": "array", "items": {"type": "string"}},
+                        "answer_summary": {"type": "string"},
                         "source": {"type": "string"},
                         "context": {"type": "string"},
                         "rationale": {"type": "string"},
@@ -426,6 +428,12 @@ class MnemosyneProvider(MemoryProvider):
                 return _json_result(self.run_production_eval())
             if action == "explain_memory":
                 return _json_result(self.explain_memory(str(args.get("memory_id") or "")))
+            if action == "answer_attribution":
+                raw_ids = args.get("memory_ids") if isinstance(args.get("memory_ids"), list) else []
+                memory_ids = [str(item) for item in raw_ids]
+                if not memory_ids and args.get("memory_id"):
+                    memory_ids = [str(args.get("memory_id") or "")]
+                return _json_result(self.answer_attribution(memory_ids, answer_summary=str(args.get("answer_summary") or "")))
             if action == "semantic_recall":
                 return _json_result(self.semantic_recall(str(args.get("query") or ""), limit=int(args.get("limit") or 5)))
             if action == "harvest_candidates":
@@ -590,18 +598,28 @@ class MnemosyneProvider(MemoryProvider):
         return {"success": False, "error": f"Candidate not found: {candidate_id}"}
 
     def seed_source_candidates(self, *, source: str, records: List[Dict[str, Any]], dry_run: bool = True) -> Dict[str, Any]:
+        """Stage allowlisted SecondBrain/Linear operating-corpus snippets as candidates only.
+
+        This is intentionally stricter than general candidate writeback: every
+        record must come from an approved/allowlisted SecondBrain or Linear source,
+        risky rejected snippets are reported without raw content, and accepted
+        snippets are queued for approval rather than written to trusted memory.
+        """
         source = source.strip()
         max_records = self._config_int(self._load_config(), "max_seed_records", default=10, minimum=1, maximum=25)
         if max_records is None:
-            return {"success": False, "error": "Invalid max_seed_records config.", "mutated_memory": False}
+            return {"success": False, "error": "Invalid max_seed_records config.", "candidate_count": 0, "rejected_count": 0, "rejections": [], "mutated_memory": False}
         if not source:
-            return {"success": False, "error": "source is required for source-aware seeding.", "mutated_memory": False}
+            return {"success": False, "error": "source is required for source-aware seeding.", "candidate_count": 0, "rejected_count": 0, "rejections": [], "mutated_memory": False}
         if len(records) > max_records:
-            return {"success": False, "error": f"Refusing bulk seed: {len(records)} records exceeds max_seed_records={max_records}.", "mutated_memory": False}
-        prepared = []
+            return {"success": False, "error": f"Refusing bulk seed: {len(records)} records exceeds max_seed_records={max_records}.", "candidate_count": 0, "rejected_count": 0, "rejections": [], "mutated_memory": False}
+
+        prepared: List[Dict[str, Any]] = []
+        rejections: List[Dict[str, Any]] = []
         for index, record in enumerate(records):
             if not isinstance(record, dict):
-                return {"success": False, "error": f"Record {index} is not an object.", "mutated_memory": False}
+                rejections.append(self._seed_rejection(index, "invalid_record", "record_not_object"))
+                continue
             item = {
                 "content": str(record.get("content") or ""),
                 "source": str(record.get("source") or source),
@@ -615,26 +633,80 @@ class MnemosyneProvider(MemoryProvider):
                 "conflict_group": str(record.get("conflict_group") or ""),
                 "conflict_status": str(record.get("conflict_status") or "unknown"),
                 "supersedes": record.get("supersedes") if isinstance(record.get("supersedes"), list) else None,
+                "valid_from": str(record.get("valid_from") or ""),
+                "valid_until": str(record.get("valid_until") or ""),
             }
+            if not self._is_operating_corpus_source_allowlisted(source) or not self._is_operating_corpus_source_allowlisted(item["source"]):
+                rejections.append(self._seed_rejection(index, "source_not_allowlisted", "source_not_secondbrain_or_linear"))
+                continue
             validation = self._validate_writeback_fields(content=item["content"], source=item["source"], context=item["context"], rationale=item["rationale"])
             if validation:
-                return {"success": False, "error": f"Record {index}: {validation['error']}", "mutated_memory": False}
+                rejections.append(self._seed_rejection(index, "invalid_metadata", str(validation.get("error") or "invalid_metadata")))
+                continue
             candidate_text = "\n".join(str(item.get(key) or "") for key in ("content", "source", "context", "rationale"))
             if self._has_secret_marker(candidate_text):
-                return {"success": False, "error": f"Record {index}: refusing likely secret-bearing seed content.", "mutated_memory": False}
-            prepared.append(item)
+                rejections.append(self._seed_rejection(index, "secret", "secret_or_credential_signal"))
+                continue
+            if self._is_private_raw_detail(item["content"]):
+                rejections.append(self._seed_rejection(index, "private_sensitive", "private_or_family_sensitive_raw_detail"))
+                continue
+            if self._is_temporary_or_status_artifact(item["content"]):
+                rejections.append(self._seed_rejection(index, "temporary", "temporary_task_progress_or_status_artifact"))
+                continue
+            preview_item = dict(item)
+            preview_item["approval_status"] = "preview_pending_approval" if dry_run else "pending"
+            prepared.append(preview_item)
+
         manifest = self._seed_rollback_manifest(source=source, dry_run=dry_run, candidates=[])
         if dry_run:
             manifest["candidate_preview_count"] = len(prepared)
-            return {"success": True, "dry_run": True, "candidate_count": len(prepared), "candidates": prepared, "rollback_manifest": manifest, "mutated_memory": False}
+            success = bool(prepared) or not rejections
+            result = {
+                "success": success,
+                "dry_run": True,
+                "candidate_count": len(prepared),
+                "rejected_count": len(rejections),
+                "candidates": prepared,
+                "rejections": rejections,
+                "rollback_manifest": manifest,
+                "mutated_memory": False,
+            }
+            if not success:
+                result["error"] = self._seed_rejections_error(rejections)
+            return result
         created = []
         for item in prepared:
-            result = self.add_candidate(**item)
+            candidate_args = dict(item)
+            candidate_args.pop("approval_status", None)
+            result = self.add_candidate(**candidate_args)
             if not result.get("success"):
-                return result
+                return {
+                    "success": False,
+                    "error": result.get("error", "candidate_queue_rejected"),
+                    "dry_run": False,
+                    "candidate_count": len(created),
+                    "rejected_count": len(rejections),
+                    "candidates": created,
+                    "rejections": rejections,
+                    "rollback_manifest": self._seed_rollback_manifest(source=source, dry_run=False, candidates=created),
+                    "mutated_memory": False,
+                }
             created.append(result["candidate"])
         manifest = self._seed_rollback_manifest(source=source, dry_run=False, candidates=created)
-        return {"success": True, "dry_run": False, "candidate_count": len(created), "candidates": created, "rollback_manifest": manifest, "mutated_memory": False}
+        success = bool(created) or not rejections
+        result = {
+            "success": success,
+            "dry_run": False,
+            "candidate_count": len(created),
+            "rejected_count": len(rejections),
+            "candidates": created,
+            "rejections": rejections,
+            "rollback_manifest": manifest,
+            "mutated_memory": False,
+        }
+        if not success:
+            result["error"] = self._seed_rejections_error(rejections)
+        return result
 
     def observability_summary(self) -> Dict[str, Any]:
         """Return non-mutating counters for locally recorded Mnemosyne events."""
@@ -814,30 +886,143 @@ class MnemosyneProvider(MemoryProvider):
             "traces": traces,
         }
 
-    def explain_memory(self, memory_id: str) -> Dict[str, Any]:
+    def explain_memory(
+        self,
+        memory_id: str,
+        *,
+        used_in_answer: bool = False,
+        current_request: str = "",
+    ) -> Dict[str, Any]:
+        """Explain why a trusted memory could influence an answer without leaking raw sensitive content."""
         inspected = self.inspect(memory_id)
         if not inspected.get("success"):
             return inspected
         memory = inspected["memory"]
+        influence = self._memory_influence_shape(
+            memory,
+            inspected=inspected,
+            used_in_answer=used_in_answer,
+            current_request=current_request,
+        )
         return {
             "success": True,
             "memory_id": memory.get("id"),
             "mutated": False,
-            "why_did_you_remember_that": {
-                "source": memory.get("source", ""),
-                "context": memory.get("context", ""),
-                "rationale": memory.get("rationale", ""),
-                "confidence": memory.get("confidence", "unknown"),
-                "sensitivity": memory.get("sensitivity", "unknown"),
-                "stability": memory.get("stability", "unknown"),
-                "current_request_safe": memory.get("current_request_safe", False),
-                "suppressed": inspected.get("suppressed", False),
-                "conflict_group": memory.get("conflict_group", ""),
-                "supersedes": memory.get("supersedes", []),
-                "superseded_by": memory.get("superseded_by", ""),
-            },
-            "redaction": "raw memory content omitted; inspect trusted storage only when explicitly needed",
+            "memory_influence": influence,
+            "why_did_you_remember_that": influence,
+            "answer_attribution": self.answer_attribution([str(memory.get("id") or "")]) if used_in_answer else self.answer_attribution([]),
+            "redaction": "safe summaries are redacted for sensitive/local-only memories; raw memory content is not returned",
         }
+
+    def answer_attribution(self, memory_ids: List[str], *, answer_summary: str = "") -> Dict[str, Any]:
+        """Return the concise attribution shape for memories actually used in an answer."""
+        cleaned_ids = []
+        seen = set()
+        for memory_id in memory_ids:
+            memory_id = str(memory_id or "").strip()
+            if memory_id and memory_id not in seen:
+                cleaned_ids.append(memory_id)
+                seen.add(memory_id)
+        if not cleaned_ids:
+            return {"success": True, "used_memory": False, "memory_ids": [], "attributions": [], "mutated": False}
+
+        attributions: List[Dict[str, Any]] = []
+        missing_ids: List[str] = []
+        for memory_id in cleaned_ids:
+            inspected = self.inspect(memory_id)
+            if not inspected.get("success"):
+                missing_ids.append(memory_id)
+                continue
+            memory = inspected["memory"]
+            influence = self._memory_influence_shape(memory, inspected=inspected, used_in_answer=True)
+            attributions.append({
+                "memory_id": influence["memory_id"],
+                "source": influence["source"],
+                "summary": influence["safe_summary"],
+                "confidence": influence["confidence"],
+                "sensitivity": influence["sensitivity"],
+                "stability": influence["stability"],
+                "current_request_safe": influence["current_request_safe"],
+                "redacted": influence["redacted"],
+                "suppressed": influence["suppression"]["suppressed"],
+                "conflict_status": influence["conflict"]["conflict_status"],
+            })
+        return {
+            "success": not missing_ids,
+            "used_memory": bool(attributions),
+            "memory_ids": [item["memory_id"] for item in attributions],
+            "attributions": attributions,
+            "answer_summary": self._redact_text(answer_summary) if answer_summary else "",
+            "missing_memory_ids": missing_ids,
+            "mutated": False,
+        }
+
+    def _memory_influence_shape(
+        self,
+        memory: Dict[str, Any],
+        *,
+        inspected: Dict[str, Any],
+        used_in_answer: bool,
+        current_request: str = "",
+    ) -> Dict[str, Any]:
+        sensitivity = str(memory.get("sensitivity") or "unknown")
+        redacted = self._memory_requires_redaction(memory)
+        suppressions = inspected.get("suppressions") if isinstance(inspected.get("suppressions"), list) else []
+        active_suppressions = [item for item in suppressions if item.get("active", True)]
+        return {
+            "memory_id": memory.get("id", ""),
+            "used_in_answer": bool(used_in_answer),
+            "source": self._redact_text(str(memory.get("source") or "")),
+            "context": self._redact_text(str(memory.get("context") or "")),
+            "rationale": self._redact_text(str(memory.get("rationale") or "")),
+            "confidence": str(memory.get("confidence") or "unknown"),
+            "sensitivity": sensitivity,
+            "stability": str(memory.get("stability") or "unknown"),
+            "current_request_safe": bool(memory.get("current_request_safe") or False),
+            "safe_summary": self._safe_memory_summary(memory) if used_in_answer else self._safe_memory_topic_summary(memory),
+            "redacted": redacted,
+            "current_request": self._redact_text(current_request) if current_request else "",
+            "suppression": {
+                "suppressed": bool(inspected.get("suppressed", False)),
+                "active_suppression_count": len(active_suppressions),
+                "suppression_ids": [item.get("id", "") for item in active_suppressions],
+                "suppression_rationales": [self._redact_text(str(item.get("rationale") or "")) for item in active_suppressions],
+            },
+            "conflict": {
+                "conflict_group": str(memory.get("conflict_group") or ""),
+                "conflict_status": str(memory.get("conflict_status") or "unknown"),
+                "supersedes": self._normalize_ids(memory.get("supersedes") if isinstance(memory.get("supersedes"), list) else None),
+                "superseded_by": str(memory.get("superseded_by") or ""),
+            },
+        }
+
+    def _memory_requires_redaction(self, memory: Dict[str, Any]) -> bool:
+        sensitivity = str(memory.get("sensitivity") or "unknown").lower()
+        text = "\n".join(str(memory.get(key) or "") for key in ("content", "source", "context", "rationale"))
+        return sensitivity in {"sensitive", "secret"} or self._has_secret_marker(text)
+
+    def _safe_memory_summary(self, memory: Dict[str, Any], *, max_chars: int = 220) -> str:
+        if self._memory_requires_redaction(memory):
+            return "[redacted: sensitive/local-only memory]"
+        summary = self._redact_text(str(memory.get("content") or "")).strip()
+        if len(summary) > max_chars:
+            return summary[: max_chars - 1].rstrip() + "…"
+        return summary
+
+    def _safe_memory_topic_summary(self, memory: Dict[str, Any]) -> str:
+        if self._memory_requires_redaction(memory):
+            return "[redacted: sensitive/local-only memory]"
+        topic = str(memory.get("topic") or "").strip()
+        source = str(memory.get("source") or "").strip()
+        parts = []
+        if topic:
+            parts.append(f"topic={self._redact_text(topic)}")
+        if source:
+            parts.append(f"source={self._redact_text(source)}")
+        return "non-sensitive trusted memory metadata" + (" (" + "; ".join(parts) + ")" if parts else "")
+
+    def _redact_text(self, text: str) -> str:
+        return _SECRET_RE.sub(lambda match: f"{match.group(1)}=[redacted]", text or "")
 
     def semantic_recall(self, query: str, *, limit: int = 5) -> Dict[str, Any]:
         gates = self.semantic_quality_gates()
@@ -860,30 +1045,173 @@ class MnemosyneProvider(MemoryProvider):
         return {"success": True, "semantic_recall_allowed": True, "results": [item for _, item in scored[: max(1, min(limit, 20))]], "mutated": False}
 
     def harvest_candidates(self, *, content: str, source: str, context: str, topic: str = "") -> Dict[str, Any]:
+        """Conservatively queue durable memory candidates discovered in normal work.
+
+        This is intentionally candidate-only: accepted items go through
+        add_candidate(), never add_memory(). Rejected/deferred items return audit
+        reasons without persisting raw rejected content.
+        """
         text = content.strip()
         if not text:
             return {"success": False, "error": "content is required for harvesting", "mutated_memory": False}
-        if self._has_secret_marker("\n".join([text, source, context])):
-            return {"success": False, "error": "Refusing to harvest likely secret-bearing content.", "mutated_memory": False}
-        lower = text.lower()
-        durable_markers = ("correction:", "remember", "prefers", "expects", "defines", "source of truth", "production means")
-        if not any(marker in lower for marker in durable_markers):
-            return {"success": True, "created_candidate_count": 0, "candidates": [], "mutated_memory": False, "reason": "no durable memory signal detected"}
-        cleaned = text.split(":", 1)[1].strip() if lower.startswith("correction:") and ":" in text else text
-        candidate = self.add_candidate(
-            content=cleaned,
-            source=source,
-            context=context,
-            rationale="auto-harvested durable writeback candidate from production work; requires approval",
-            confidence="medium",
-            sensitivity="non_sensitive",
-            stability="stable",
-            current_request_safe=True,
-            topic=topic,
+        candidates: List[Dict[str, Any]] = []
+        rejections: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for segment in self._harvest_segments(text):
+            decision = self._classify_harvest_segment(segment, source=source, context=context, topic=topic)
+            if not decision.get("accepted"):
+                rejections.append({"reason": decision.get("reason", "rejected"), "category": decision.get("category", "unknown")})
+                continue
+            candidate_content = str(decision.get("content") or "").strip()
+            dedupe_key = candidate_content.lower()
+            if not candidate_content or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            queued = self.add_candidate(
+                content=candidate_content,
+                source=source,
+                context=context,
+                rationale=str(decision.get("rationale") or "auto-harvested durable writeback candidate from production work; requires approval"),
+                confidence=str(decision.get("confidence") or "medium"),
+                sensitivity=str(decision.get("sensitivity") or "non_sensitive"),
+                stability=str(decision.get("stability") or "stable"),
+                current_request_safe=bool(decision.get("current_request_safe", True)),
+                topic=str(decision.get("topic") or topic),
+            )
+            if not queued.get("success"):
+                rejections.append({"reason": queued.get("error", "candidate_queue_rejected"), "category": decision.get("category", "unknown")})
+                continue
+            candidates.append(queued["candidate"])
+            if len(candidates) >= 5:
+                break
+        result: Dict[str, Any] = {
+            "success": True,
+            "created_candidate_count": len(candidates),
+            "candidates": candidates,
+            "rejected_count": len(rejections),
+            "rejections": rejections,
+            "mutated_memory": False,
+        }
+        if not candidates:
+            result["reason"] = rejections[0]["reason"] if rejections else "no durable memory signal detected"
+            if rejections and all(item.get("category") == "secret" for item in rejections):
+                result["success"] = False
+                result["error"] = "Refusing to harvest likely secret-bearing content."
+        return result
+
+    def _harvest_segments(self, text: str) -> List[str]:
+        segments: List[str] = []
+        for raw_line in str(text or "").splitlines() or [text]:
+            line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", raw_line).strip()
+            if not line:
+                continue
+            parts = re.split(r"(?<=[.!?])\s+(?=(?:Correction:|Environment fact:|Operating convention:|Marco|User|Biff|Please|Always|Remember|Actually|The|Linear|SecondBrain|Hermes)\b)", line)
+            segments.extend(part.strip() for part in parts if part.strip())
+        return segments[:20]
+
+    def _classify_harvest_segment(self, segment: str, *, source: str, context: str, topic: str) -> Dict[str, Any]:
+        segment = " ".join(str(segment or "").split()).strip()
+        if not segment:
+            return {"accepted": False, "reason": "empty_segment", "category": "empty"}
+        combined = "\n".join([segment, source, context])
+        if self._has_secret_marker(combined):
+            return {"accepted": False, "reason": "secret_or_credential_signal", "category": "secret"}
+        if self._is_private_raw_detail(segment):
+            return {"accepted": False, "reason": "private_or_family_sensitive_raw_detail", "category": "private_sensitive"}
+        if self._is_temporary_or_status_artifact(segment):
+            return {"accepted": False, "reason": "temporary_task_progress_or_status_artifact", "category": "temporary"}
+
+        lower = segment.lower()
+        category = ""
+        confidence = "medium"
+        cleaned = segment
+        rationale = "auto-harvested durable writeback candidate from production work; requires approval"
+        if lower.startswith("correction:") or lower.startswith("user correction:") or lower.startswith("actually,") or lower.startswith("actually "):
+            category = "explicit_user_correction"
+            confidence = "high"
+            cleaned = re.sub(r"(?i)^(?:user\s+)?correction:\s*", "", cleaned).strip()
+            cleaned = re.sub(r"(?i)^actually,?\s*", "", cleaned).strip()
+            rationale = "auto-harvested explicit user correction; queued as candidate and requires approval"
+        elif self._looks_like_durable_preference(segment):
+            category = "durable_preference"
+            rationale = "auto-harvested durable user preference; queued as candidate and requires approval"
+        elif self._looks_like_stable_environment_fact(segment):
+            category = "stable_environment_fact"
+            confidence = "medium"
+            cleaned = re.sub(r"(?i)^environment fact:\s*", "", cleaned).strip()
+            rationale = "auto-harvested stable environment fact; queued as candidate and requires approval"
+        elif self._looks_like_operating_convention(segment):
+            category = "repeated_operating_convention"
+            rationale = "auto-harvested repeated operating convention; queued as candidate and requires approval"
+
+        if not category:
+            return {"accepted": False, "reason": "low_durability_or_no_supported_signal", "category": "low_durability"}
+        if len(_tokens(cleaned)) < 4:
+            return {"accepted": False, "reason": "too_little_context_for_durable_memory", "category": "low_durability"}
+        return {
+            "accepted": True,
+            "category": category,
+            "content": cleaned,
+            "rationale": rationale,
+            "confidence": confidence,
+            "sensitivity": "non_sensitive",
+            "stability": "stable",
+            "current_request_safe": True,
+            "topic": topic or category,
+        }
+
+    @staticmethod
+    def _is_temporary_or_status_artifact(text: str) -> bool:
+        lower = str(text or "").lower()
+        transient_terms = (
+            "temporary update", "today", "tomorrow", "this week", "right now", "in progress", "pending review",
+            "finished pr", "opened pr", "merged pr", "blocked on", "status update", "standup", "debug thought",
+            "one-off", "one off", "scratch", "wip", "todo", "done", "shipped", "commit ",
         )
-        if not candidate.get("success"):
-            return candidate
-        return {"success": True, "created_candidate_count": 1, "candidates": [candidate["candidate"]], "mutated_memory": False}
+        if any(term in lower for term in transient_terms):
+            return True
+        if re.search(r"\b(?:pr|pull request)\s*#?\d+\b", lower):
+            return True
+        if re.search(r"\b[A-Z]{2,10}-\d+\b", str(text or "")) and any(term in lower for term in ("status", "progress", "done", "finished", "pending", "review", "blocked")):
+            return True
+        if re.search(r"\b[0-9a-f]{7,40}\b", lower) and any(term in lower for term in ("commit", "sha", "branch")):
+            return True
+        return False
+
+    @staticmethod
+    def _is_private_raw_detail(text: str) -> bool:
+        lower = str(text or "").lower()
+        private_subject = ("spouse", "wife", "husband", "partner", "child", "kid", "daughter", "son", "family", "parent")
+        sensitive_detail = ("medical", "therapy", "therapist", "diagnosis", "medication", "appointment", "school", "address", "raw notes", "private")
+        return any(term in lower for term in private_subject) and any(term in lower for term in sensitive_detail)
+
+    @staticmethod
+    def _looks_like_durable_preference(text: str) -> bool:
+        lower = str(text or "").lower()
+        patterns = (
+            r"\bmarco prefers\b", r"\bmarco wants\b", r"\bmarco expects\b", r"\buser prefers\b",
+            r"\buser wants\b", r"\bbiff should\b", r"\bbiff must\b", r"\bplease always\b",
+            r"\balways (?:use|keep|default|prefer|queue|ask|avoid)\b", r"\bdo not\b", r"\bdon't\b",
+        )
+        return any(re.search(pattern, lower) for pattern in patterns)
+
+    @staticmethod
+    def _looks_like_stable_environment_fact(text: str) -> bool:
+        lower = str(text or "").lower()
+        if lower.startswith("environment fact:"):
+            return True
+        stable_fact_markers = ("runtime lives at", "is located at", "uses ", "runs on", "source of truth is", "vault is")
+        path_or_system = bool(re.search(r"(?:~?/|/Users/|/var/|localhost|\.local\b|\.hermes\b|\.yaml\b|\.json\b)", text))
+        return path_or_system and any(marker in lower for marker in stable_fact_markers)
+
+    @staticmethod
+    def _looks_like_operating_convention(text: str) -> bool:
+        lower = str(text or "").lower()
+        markers = (
+            "operating convention:", "source of truth", "canonical source", "by default", "default is",
+            "normal biff work", "repeated convention", "linear is", "secondbrain is", "mnemosyne stores",
+        )
+        return any(marker in lower for marker in markers)
 
     def apply_correction(
         self,
@@ -897,15 +1225,15 @@ class MnemosyneProvider(MemoryProvider):
         conflict_group: str = "",
     ) -> Dict[str, Any]:
         if not self._memory_by_id(superseded_memory_id):
-            return {"success": False, "error": f"Memory not found: {superseded_memory_id}"}
+            return {"success": False, "error": f"Memory not found: {superseded_memory_id}", "mutated_memory": False}
         correction_text = "\n".join([content, source, context, rationale])
         if self._has_secret_marker(correction_text):
             return {"success": False, "error": "Refusing likely secret-bearing correction content.", "mutated_memory": False}
-        added = self.add_memory(
+        queued = self.add_candidate(
             content=content,
             source=source,
             context=context,
-            rationale=rationale,
+            rationale=rationale or "explicit correction candidate; requires approval before trusted memory mutation",
             confidence="high",
             sensitivity="non_sensitive",
             stability="stable",
@@ -915,10 +1243,9 @@ class MnemosyneProvider(MemoryProvider):
             conflict_status="resolved" if conflict_group else "unknown",
             supersedes=[superseded_memory_id],
         )
-        if not added.get("success"):
-            return added
-        suppressed = self.suppress_memory(memory_id=superseded_memory_id, rationale="superseded by correction loop", source=source)
-        return {"success": True, "new_memory": added["memory"], "suppression": suppressed.get("suppression"), "mutated_memory": True}
+        if not queued.get("success"):
+            return queued
+        return {"success": True, "candidate": queued["candidate"], "mutated_memory": False}
 
     def discord_decision_digest(self) -> Dict[str, Any]:
         digest = self.memory_digest()
@@ -932,9 +1259,18 @@ class MnemosyneProvider(MemoryProvider):
         if pending:
             parts.append(f"{pending} pending candidate(s): {', '.join(str(x) for x in needs.get('pending_candidate_ids', []))}")
         if hygiene:
-            parts.append(f"{hygiene} hygiene item(s)")
+            hygiene_ids = sorted({
+                str(memory_id)
+                for item in needs.get("hygiene_recommendations", [])
+                for memory_id in (item.get("candidate_memory_ids") or [])
+                if memory_id
+            })
+            suffix = f": {', '.join(hygiene_ids)}" if hygiene_ids else ""
+            parts.append(f"{hygiene} hygiene item(s){suffix}")
         if conflicts:
-            parts.append(f"{conflicts} conflict item(s)")
+            conflict_ids = [str(memory_id) for memory_id in (needs.get("conflict_memory_ids") or []) if memory_id]
+            suffix = f": {', '.join(conflict_ids)}" if conflict_ids else ""
+            parts.append(f"{conflicts} conflict item(s){suffix}")
         message = "Marco decision needed — Mnemosyne memory review: " + "; ".join(parts) + ". Raw memory content omitted."
         return {"success": True, "should_notify": True, "message": message, "digest": digest, "mutated": False}
 
@@ -1500,6 +1836,39 @@ class MnemosyneProvider(MemoryProvider):
             "rollback_action": "reject pending candidate_ids; no trusted memories were created by seed_source",
             "mutated_memory": False,
         }
+
+    @staticmethod
+    def _is_operating_corpus_source_allowlisted(source: str) -> bool:
+        normalized = str(source or "").strip().lower()
+        if not normalized:
+            return False
+        allowed_markers = (
+            "secondbrain",
+            "second brain",
+            "obsidian:",
+            "linear:",
+            "linear/",
+            "linear issue",
+            "bif-",
+        )
+        return any(marker in normalized for marker in allowed_markers)
+
+    @staticmethod
+    def _seed_rejection(index: int, category: str, reason: str) -> Dict[str, Any]:
+        return {
+            "index": index,
+            "category": category,
+            "reason": reason,
+            "redacted": True,
+            "content_included": False,
+        }
+
+    @staticmethod
+    def _seed_rejections_error(rejections: List[Dict[str, Any]]) -> str:
+        categories = sorted({str(item.get("category") or "rejected") for item in rejections})
+        if not categories:
+            return "No seed candidates were accepted."
+        return "No seed candidates were accepted; rejected categories: " + ", ".join(categories)
 
     @staticmethod
     def _validate_writeback_fields(*, content: str, source: str, context: str, rationale: str) -> Dict[str, Any] | None:
