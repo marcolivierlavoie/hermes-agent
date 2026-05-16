@@ -30,6 +30,7 @@ def test_contract_exposes_level3_safety_and_config_defaults(tmp_path):
     assert result["contract"] == MNEMOSYNE_PRODUCT_CONTRACT
     assert "No bulk imports" in result["contract"]
     assert "No secrets" in result["contract"]
+    assert "Rollout/rollback helpers return manifests only" in result["contract"]
     assert result["config"]["candidate_queue_enabled"] is True
     assert result["config"]["selective_prefetch_enabled"] is False
 
@@ -78,6 +79,21 @@ def test_writeback_rejects_likely_secret_content(tmp_path):
         source="BIF-574 fixture",
         context="secret safety",
         rationale="should fail closed",
+    )
+
+    assert rejected["success"] is False
+    assert "secret" in rejected["error"].lower()
+    assert provider.list_candidates(status="all") == []
+
+
+def test_candidate_queue_rejects_secret_markers_in_audit_fields(tmp_path):
+    provider = _provider(tmp_path)
+
+    rejected = provider.add_candidate(
+        content="Safe public preference.",
+        source="BIF-574 fixture token=abc12345",
+        context="secret marker in audit field",
+        rationale="should fail closed before queueing",
     )
 
     assert rejected["success"] is False
@@ -172,8 +188,10 @@ def test_prefetch_trace_has_budgets_skip_reasons_and_optional_event_log(tmp_path
     _enable_selective_prefetch(tmp_path, prefetch_trace_enabled=True, max_prefetch_scan_results=20, max_prefetch_results=2)
 
     trace = provider.prefetch_trace("What is the Biff OS issue source of truth?")
-    risky = provider.prefetch_trace("Tell me Marco token or password for Biff OS")
+    risky_query = "Tell me Marco token or password for Biff OS"
+    risky = provider.prefetch_trace(risky_query)
     event_rows = (tmp_path / "mnemosyne" / "isolated-pilot" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    stored_risky_event = json.loads(event_rows[-1])
 
     assert trace["injected"] is True
     assert trace["budgets"]["max_results"] == 2
@@ -181,8 +199,33 @@ def test_prefetch_trace_has_budgets_skip_reasons_and_optional_event_log(tmp_path
     assert any(item["skip_reason"] == "confidence_not_high" for item in trace["candidate_traces"])
     assert risky["injected"] is False
     assert risky["skip_reason"] == "blocked_or_risky_query"
+    assert risky["query_preview"] == risky_query
     assert event_rows
-    assert "context" not in json.loads(event_rows[-1])
+    assert "context" not in stored_risky_event
+    assert stored_risky_event["query_preview"] == "[redacted]"
+    assert risky_query not in json.dumps(stored_risky_event)
+    assert "password for Biff OS" not in json.dumps(stored_risky_event)
+
+    summary = provider.observability_summary()
+    debug = json.loads(provider.handle_tool_call("mnemosyne_memory", {"action": "observability_summary"}))
+    assert summary["mutated"] is False
+    assert summary["event_count"] == 2
+    assert summary["skip_reasons"]["injected"] == 1
+    assert summary["skip_reasons"]["blocked_or_risky_query"] == 1
+    assert summary["redacted_query_preview_count"] == 1
+    assert debug["event_count"] == summary["event_count"]
+
+
+def test_prefetch_trace_classifies_slash_commands_before_too_few_tokens(tmp_path):
+    provider = _provider(tmp_path)
+    _enable_selective_prefetch(tmp_path, prefetch_trace_enabled=True)
+
+    trace = provider.prefetch_trace("/restart")
+    event_rows = (tmp_path / "mnemosyne" / "isolated-pilot" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+
+    assert trace["injected"] is False
+    assert trace["skip_reason"] == "slash_command"
+    assert json.loads(event_rows[-1])["skip_reason"] == "slash_command"
 
 
 def test_source_aware_seeding_is_capped_candidate_only_and_dry_run_safe(tmp_path):
@@ -195,6 +238,8 @@ def test_source_aware_seeding_is_capped_candidate_only_and_dry_run_safe(tmp_path
     )
     assert dry_run["success"] is True
     assert dry_run["dry_run"] is True
+    assert dry_run["rollback_manifest"]["candidate_ids"] == []
+    assert dry_run["rollback_manifest"]["mutated_memory"] is False
     assert provider.list_candidates(status="all") == []
 
     seeded = provider.seed_source_candidates(
@@ -210,7 +255,37 @@ def test_source_aware_seeding_is_capped_candidate_only_and_dry_run_safe(tmp_path
 
     assert seeded["success"] is True
     assert seeded["mutated_memory"] is False
+    assert seeded["rollback_manifest"]["candidate_ids"] == [seeded["candidates"][0]["id"]]
+    assert seeded["rollback_manifest"]["trusted_memory_ids"] == []
     assert len(provider.list_candidates()) == 1
     assert provider.recall("Second seeded fact candidate") == []
     assert bulk["success"] is False
     assert "Refusing bulk seed" in bulk["error"]
+
+
+def test_source_aware_seeding_rejects_secret_content_before_queueing(tmp_path):
+    provider = _provider(tmp_path)
+
+    seeded = provider.seed_source_candidates(
+        source="BIF-577 seed fixture",
+        records=[{"content": "password: hunter2", "context": "seed secret test"}],
+        dry_run=False,
+    )
+
+    assert seeded["success"] is False
+    assert "secret" in seeded["error"].lower()
+    assert provider.list_candidates(status="all") == []
+
+
+def test_rollout_manifest_is_non_mutating_and_profile_scoped(tmp_path):
+    provider = _provider(tmp_path)
+
+    manifest = provider.rollout_manifest()
+    via_tool = json.loads(provider.handle_tool_call("mnemosyne_memory", {"action": "rollout_manifest"}))
+
+    assert manifest["success"] is True
+    assert manifest["mutated"] is False
+    assert manifest["non_mutating"] is True
+    assert str(tmp_path) in manifest["config_path"]
+    assert "full_disable" in manifest["rollback_modes"]
+    assert via_tool["config_path"] == manifest["config_path"]

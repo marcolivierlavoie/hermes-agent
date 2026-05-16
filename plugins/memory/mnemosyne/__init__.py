@@ -30,9 +30,12 @@ Mnemosyne Level 3 product contract:
 - No bulk imports. Source-aware seeding is capped by max_seed_records and queues candidates only.
 - No secrets: candidate/writeback and seeding paths reject obvious secret-bearing text; explicit adds remain audited and secret/sensitive memories are excluded from selective prefetch.
 - Writeback candidate queue first: proposed memories can be staged, listed, approved, or rejected.
+- Candidate approval is the only path from queued writeback/seed records into trusted recall; rejection and seeding dry-runs never mutate trusted memory.
+- Supersession/conflict metadata is auditable and selective prefetch fails closed when multiple eligible memories conflict.
 - Suppression is non-destructive; hygiene_report is non-mutating and report-only.
 - Prefetch is default-off and fail-closed. Enabled prefetch must satisfy score/overlap/sensitivity/stability/current_request_safe gates.
-- Prefetch observability is available through prefetch_trace and optional local trace logging.
+- Prefetch observability is available through prefetch_trace, observability_summary, and optional local trace logging without storing context bodies.
+- Rollout/rollback helpers return manifests only; they do not edit Hermes production config or Linear.
 
 Config lives at $HERMES_HOME/mnemosyne/config.json. Example:
 {
@@ -315,7 +318,7 @@ class MnemosyneProvider(MemoryProvider):
                             "enum": [
                                 "add", "recall", "suppress", "unsuppress", "inspect", "list", "hygiene_report",
                                 "candidate", "add_candidate", "list_candidates", "approve_candidate", "reject_candidate",
-                                "prefetch_trace", "contract", "seed_source",
+                                "prefetch_trace", "contract", "seed_source", "observability_summary", "rollout_manifest",
                             ],
                         },
                         "content": {"type": "string"},
@@ -406,6 +409,10 @@ class MnemosyneProvider(MemoryProvider):
                     records=args.get("records") if isinstance(args.get("records"), list) else [],
                     dry_run=bool(args.get("dry_run", True)),
                 ))
+            if action == "observability_summary":
+                return _json_result(self.observability_summary())
+            if action == "rollout_manifest":
+                return _json_result(self.rollout_manifest())
             return tool_error(f"Unsupported Mnemosyne action: {action}")
         except Exception as exc:  # defensive tool boundary
             return tool_error(f"Mnemosyne {action or 'operation'} failed: {exc}")
@@ -576,16 +583,63 @@ class MnemosyneProvider(MemoryProvider):
             validation = self._validate_writeback_fields(content=item["content"], source=item["source"], context=item["context"], rationale=item["rationale"])
             if validation:
                 return {"success": False, "error": f"Record {index}: {validation['error']}", "mutated_memory": False}
+            candidate_text = "\n".join(str(item.get(key) or "") for key in ("content", "source", "context", "rationale"))
+            if self._has_secret_marker(candidate_text):
+                return {"success": False, "error": f"Record {index}: refusing likely secret-bearing seed content.", "mutated_memory": False}
             prepared.append(item)
+        manifest = self._seed_rollback_manifest(source=source, dry_run=dry_run, candidates=[])
         if dry_run:
-            return {"success": True, "dry_run": True, "candidate_count": len(prepared), "candidates": prepared, "mutated_memory": False}
+            manifest["candidate_preview_count"] = len(prepared)
+            return {"success": True, "dry_run": True, "candidate_count": len(prepared), "candidates": prepared, "rollback_manifest": manifest, "mutated_memory": False}
         created = []
         for item in prepared:
             result = self.add_candidate(**item)
             if not result.get("success"):
                 return result
             created.append(result["candidate"])
-        return {"success": True, "dry_run": False, "candidate_count": len(created), "candidates": created, "mutated_memory": False}
+        manifest = self._seed_rollback_manifest(source=source, dry_run=False, candidates=created)
+        return {"success": True, "dry_run": False, "candidate_count": len(created), "candidates": created, "rollback_manifest": manifest, "mutated_memory": False}
+
+    def observability_summary(self) -> Dict[str, Any]:
+        """Return non-mutating counters for locally recorded Mnemosyne events."""
+        events = self._read_jsonl(self._events_path)
+        skip_reasons: Dict[str, int] = {}
+        injected = 0
+        redacted_query_previews = 0
+        for event in events:
+            if event.get("injected") is True:
+                injected += 1
+            reason = str(event.get("skip_reason") or "injected")
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            if event.get("query_preview") == "[redacted]":
+                redacted_query_previews += 1
+        return {
+            "success": True,
+            "event_count": len(events),
+            "prefetch_event_count": sum(1 for event in events if event.get("event") == "prefetch"),
+            "injected_count": injected,
+            "skip_reasons": skip_reasons,
+            "redacted_query_preview_count": redacted_query_previews,
+            "events_path": str(self._events_path),
+            "mutated": False,
+        }
+
+    def rollout_manifest(self) -> Dict[str, Any]:
+        """Return profile-scoped rollout/rollback metadata without changing config."""
+        config = self._load_config()
+        return {
+            "success": True,
+            "provider": self.name,
+            "hermes_home": str(self.hermes_home),
+            "mnemosyne_root": str(self._root.parent),
+            "config_path": str(self._config_path),
+            "data_dir": str(self.data_dir),
+            "selective_prefetch_enabled": config.get("selective_prefetch_enabled") is True,
+            "candidate_queue_enabled": config.get("candidate_queue_enabled") is not False,
+            "rollback_modes": ["explicit_only", "selective_prefetch_only", "full_disable"],
+            "non_mutating": True,
+            "mutated": False,
+        }
 
     def suppress_memory(self, *, memory_id: str, rationale: str, source: str) -> Dict[str, Any]:
         memory_id = memory_id.strip()
@@ -944,10 +998,10 @@ class MnemosyneProvider(MemoryProvider):
         normalized = " ".join(str(query or "").split()).lower()
         if not normalized:
             return False, "empty_query"
-        if len(_tokens(normalized)) < 2:
-            return False, "too_few_query_tokens"
         if normalized.startswith("/"):
             return False, "slash_command"
+        if len(_tokens(normalized)) < 2:
+            return False, "too_few_query_tokens"
         blocked = [str(term).lower() for term in config.get("blocked_terms", [])]
         risky = [str(term).lower() for term in config.get("risky_query_terms", [])]
         if any(term and term in normalized for term in blocked + risky):
@@ -1046,7 +1100,25 @@ class MnemosyneProvider(MemoryProvider):
         if config.get("prefetch_trace_enabled") is True or config.get("observability_enabled") is True:
             stored = dict(trace)
             stored.pop("context", None)
+            if self._should_redact_stored_query_preview(stored, config):
+                stored["query_preview"] = "[redacted]"
             self._append_jsonl(self._events_path, stored)
+
+    def _should_redact_stored_query_preview(self, trace: Dict[str, Any], config: Dict[str, Any]) -> bool:
+        """Return True when local observability should not persist query text.
+
+        User-facing prefetch_trace keeps query_preview for debuggability, but the
+        optional local events log should not retain raw credential/risky prompts.
+        """
+        preview = str(trace.get("query_preview") or "")
+        if not preview:
+            return False
+        if str(trace.get("skip_reason") or "") == "blocked_or_risky_query":
+            return True
+        lowered = preview.lower()
+        blocked = [str(term).lower() for term in config.get("blocked_terms", [])]
+        risky = [str(term).lower() for term in config.get("risky_query_terms", [])]
+        return self._has_secret_marker(preview) or any(term and term in lowered for term in blocked + risky)
 
     def _memory_args_from_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -1095,6 +1167,18 @@ class MnemosyneProvider(MemoryProvider):
         if re.search(r"(?:sk-[A-Za-z0-9_-]{8,}|xoxb-[A-Za-z0-9-]{8,}|ghp_[A-Za-z0-9_]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)", text):
             return True
         return False
+
+    @staticmethod
+    def _seed_rollback_manifest(*, source: str, dry_run: bool, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        candidate_ids = [str(candidate.get("id") or "") for candidate in candidates if candidate.get("id")]
+        return {
+            "source": source,
+            "dry_run": dry_run,
+            "candidate_ids": candidate_ids,
+            "trusted_memory_ids": [],
+            "rollback_action": "reject pending candidate_ids; no trusted memories were created by seed_source",
+            "mutated_memory": False,
+        }
 
     @staticmethod
     def _validate_writeback_fields(*, content: str, source: str, context: str, rationale: str) -> Dict[str, Any] | None:
