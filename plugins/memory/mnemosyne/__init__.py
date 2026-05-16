@@ -43,6 +43,11 @@ class MnemosyneMemory:
     rationale: str
     created_at: str
     created_by: str = "mnemosyne-isolated-pilot"
+    confidence: str = "unknown"
+    sensitivity: str = "unknown"
+    stability: str = "unknown"
+    current_request_safe: bool = False
+    rationale_id: str = ""
 
 
 @dataclass
@@ -104,6 +109,8 @@ class MnemosyneProvider(MemoryProvider):
         if config.get("selective_prefetch_enabled") is not True:
             # Default trust boundary: no broad automatic memory injection.
             return ""
+        if not self._query_prefetch_safe(query, config):
+            return ""
 
         limit = self._config_int(config, "max_prefetch_results", default=3, minimum=1, maximum=5)
         min_score = self._config_int(config, "min_prefetch_score", default=2, minimum=1, maximum=100)
@@ -119,6 +126,10 @@ class MnemosyneProvider(MemoryProvider):
                 break
         if not candidates:
             return ""
+        if self._has_prefetch_conflict(candidates, query=query):
+            # Conservative conflict boundary: when multiple eligible memories
+            # appear to answer the same current request differently, inject none.
+            return ""
 
         lines = [
             "Mnemosyne selective prefetch context (gated, unsuppressed, high-confidence):",
@@ -127,9 +138,11 @@ class MnemosyneProvider(MemoryProvider):
             memory = item["memory"]
             lines.append(
                 f"- [{memory.get('id')}; source={memory.get('source')}; "
-                f"created_at={memory.get('created_at')}] {memory.get('content')}"
+                f"rationale_id={memory.get('rationale_id')}; created_at={memory.get('created_at')}; "
+                "eligibility=high_confidence,non_sensitive,stable,current_request_safe] "
+                f"{memory.get('content')}"
             )
-        lines.append("If asked, explain these Mnemosyne memory IDs/sources influenced the response; current user instructions still take precedence.")
+        lines.append("If asked, explain these Mnemosyne memory IDs/sources/rationale IDs influenced the response at a high level; current user instructions still take precedence.")
         return "\n".join(lines)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -155,6 +168,10 @@ class MnemosyneProvider(MemoryProvider):
                         "source": {"type": "string"},
                         "context": {"type": "string"},
                         "rationale": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low", "unknown"]},
+                        "sensitivity": {"type": "string", "enum": ["non_sensitive", "sensitive", "secret", "unknown"]},
+                        "stability": {"type": "string", "enum": ["stable", "current", "temporary", "stale", "unknown"]},
+                        "current_request_safe": {"type": "boolean"},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                         "include_suppressed": {"type": "boolean"},
                     },
@@ -174,6 +191,10 @@ class MnemosyneProvider(MemoryProvider):
                     source=str(args.get("source") or ""),
                     context=str(args.get("context") or ""),
                     rationale=str(args.get("rationale") or ""),
+                    confidence=str(args.get("confidence") or "unknown"),
+                    sensitivity=str(args.get("sensitivity") or "unknown"),
+                    stability=str(args.get("stability") or "unknown"),
+                    current_request_safe=bool(args.get("current_request_safe") or False),
                 ))
             if action == "recall":
                 return _json_result({
@@ -205,21 +226,42 @@ class MnemosyneProvider(MemoryProvider):
         except Exception as exc:  # defensive tool boundary
             return tool_error(f"Mnemosyne {action or 'operation'} failed: {exc}")
 
-    def add_memory(self, *, content: str, source: str, context: str, rationale: str) -> Dict[str, Any]:
+    def add_memory(
+        self,
+        *,
+        content: str,
+        source: str,
+        context: str,
+        rationale: str,
+        confidence: str = "unknown",
+        sensitivity: str = "unknown",
+        stability: str = "unknown",
+        current_request_safe: bool = False,
+    ) -> Dict[str, Any]:
         content = content.strip()
         source = source.strip()
         context = context.strip()
         rationale = rationale.strip()
+        confidence = self._normalize_choice(confidence, {"high", "medium", "low", "unknown"}, default="unknown")
+        sensitivity = self._normalize_choice(sensitivity, {"non_sensitive", "sensitive", "secret", "unknown"}, default="unknown")
+        stability = self._normalize_choice(stability, {"stable", "current", "temporary", "stale", "unknown"}, default="unknown")
+        current_request_safe = bool(current_request_safe)
         missing = [name for name, value in (("content", content), ("source", source), ("context", context), ("rationale", rationale)) if not value]
         if missing:
             return {"success": False, "error": f"Missing required audit fields: {', '.join(missing)}"}
+        memory_id = f"mn_{uuid.uuid4().hex[:12]}"
         memory = MnemosyneMemory(
-            id=f"mn_{uuid.uuid4().hex[:12]}",
+            id=memory_id,
             content=content,
             source=source,
             context=context,
             rationale=rationale,
             created_at=_now_iso(),
+            confidence=confidence,
+            sensitivity=sensitivity,
+            stability=stability,
+            current_request_safe=current_request_safe,
+            rationale_id=f"rat_{uuid.uuid5(uuid.NAMESPACE_URL, memory_id + ':' + rationale).hex[:12]}",
         )
         self._append_jsonl(self._memories_path, asdict(memory))
         return {"success": True, "memory": asdict(memory)}
@@ -384,6 +426,11 @@ class MnemosyneProvider(MemoryProvider):
             "context": memory.get("context"),
             "rationale": memory.get("rationale"),
             "created_at": memory.get("created_at"),
+            "confidence": memory.get("confidence", "unknown"),
+            "sensitivity": memory.get("sensitivity", "unknown"),
+            "stability": memory.get("stability", "unknown"),
+            "current_request_safe": memory.get("current_request_safe", False),
+            "rationale_id": memory.get("rationale_id", ""),
         }
         if score is not None:
             result["score"] = score
@@ -428,6 +475,19 @@ class MnemosyneProvider(MemoryProvider):
                 "replaced",
                 "superseded",
             ],
+            "risky_query_terms": [
+                "fire someone",
+                "ignore consent",
+                "illegal",
+                "self harm",
+                "suicide",
+                "blackmail",
+                "harass",
+                "medical diagnosis",
+                "legal advice",
+                "financial advice",
+            ],
+            "max_prefetch_age_days": 730,
         }
         if not self._config_path.exists():
             return defaults
@@ -444,6 +504,22 @@ class MnemosyneProvider(MemoryProvider):
     def _is_prefetch_eligible(self, memory: Dict[str, Any], *, query: str, config: Dict[str, Any]) -> bool:
         haystack = " ".join(str(memory.get(k) or "") for k in ("content", "source", "context", "rationale"))
         haystack_lower = haystack.lower()
+        if str(memory.get("confidence") or "unknown").lower() != "high":
+            return False
+        if str(memory.get("sensitivity") or "unknown").lower() != "non_sensitive":
+            return False
+        if str(memory.get("stability") or "unknown").lower() not in {"stable", "current"}:
+            return False
+        if memory.get("current_request_safe") is not True:
+            return False
+        if not str(memory.get("rationale_id") or "").startswith("rat_"):
+            return False
+        if self._is_memory_too_old(memory, config):
+            return False
+        query_lower = str(query or "").lower()
+        for phrase in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)+", query_lower):
+            if phrase not in haystack_lower:
+                return False
         if any(str(term).lower() in haystack_lower for term in config.get("blocked_terms", [])):
             return False
         if any(str(term).lower() in haystack_lower for term in config.get("stale_terms", [])):
@@ -456,6 +532,85 @@ class MnemosyneProvider(MemoryProvider):
             return False
         return overlap >= min_overlap_value
 
+    def _query_prefetch_safe(self, query: str, config: Dict[str, Any]) -> bool:
+        normalized = " ".join(str(query or "").split()).lower()
+        if not normalized:
+            return False
+        if len(_tokens(normalized)) < 2:
+            return False
+        if normalized.startswith("/"):
+            return False
+        blocked = [str(term).lower() for term in config.get("blocked_terms", [])]
+        risky = [str(term).lower() for term in config.get("risky_query_terms", [])]
+        if any(term and term in normalized for term in blocked + risky):
+            return False
+        return True
+
+    def _has_prefetch_conflict(self, candidates: List[Dict[str, Any]], *, query: str = "") -> bool:
+        if len(candidates) < 2:
+            return False
+        conflict_subject_groups: Dict[str, set[str]] = {}
+        for item in candidates:
+            memory = item.get("memory") or {}
+            context = str(memory.get("context") or "").lower()
+            if "conflict subject:" not in context:
+                continue
+            subject = context.split("conflict subject:", 1)[1].strip()
+            content_tokens = _tokens(str(memory.get("content") or ""))
+            qualifiers = {"current", "stable", "approved", "biff", "command", "surface", "the", "for", "with"}
+            values = {token for token in content_tokens if token not in _tokens(subject) and token not in qualifiers}
+            if subject:
+                conflict_subject_groups.setdefault(subject, set()).update(values)
+        if any(len(values) > 1 for values in conflict_subject_groups.values()):
+            return True
+
+        # Fallback for unannotated conflicts: if multiple eligible current/stable
+        # memories look like they answer the same query/subject but disagree on
+        # non-query value tokens, fail closed rather than injecting competing facts.
+        query_tokens = _tokens(query) - {"what", "which", "when", "where", "who", "why", "how", "does", "that", "this", "with", "from"}
+        if len(query_tokens) < 2:
+            return False
+        non_value_tokens = query_tokens | {
+            "the", "and", "for", "with", "from", "that", "this", "current", "stable",
+            "approved", "canonical", "active", "safe", "biff", "command", "surface",
+            "operating", "convention", "fixture", "prefetch", "conflict", "rationale",
+            "source", "context", "high", "non_sensitive", "selective", "memory",
+        }
+        for left_index, left_item in enumerate(candidates):
+            left_memory = left_item.get("memory") or {}
+            left_tokens = _tokens(str(left_memory.get("content") or ""))
+            if len(query_tokens & left_tokens) < min(3, len(query_tokens)):
+                continue
+            for right_item in candidates[left_index + 1:]:
+                right_memory = right_item.get("memory") or {}
+                right_tokens = _tokens(str(right_memory.get("content") or ""))
+                if len(query_tokens & right_tokens) < min(3, len(query_tokens)):
+                    continue
+                shared_subject_tokens = (left_tokens & right_tokens) & query_tokens
+                if len(shared_subject_tokens) < min(3, len(query_tokens)):
+                    continue
+                left_values = left_tokens - right_tokens - non_value_tokens
+                right_values = right_tokens - left_tokens - non_value_tokens
+                if left_values and right_values:
+                    return True
+        return False
+
+    def _is_memory_too_old(self, memory: Dict[str, Any], config: Dict[str, Any]) -> bool:
+        max_age_days = self._config_int(config, "max_prefetch_age_days", default=730, minimum=1, maximum=3650)
+        if max_age_days is None:
+            return True
+        raw_created_at = str(memory.get("created_at") or "")
+        try:
+            created_at = datetime.fromisoformat(raw_created_at.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        return (datetime.now(timezone.utc) - created_at).days > max_age_days
+
+    @staticmethod
+    def _normalize_choice(value: Any, allowed: set[str], *, default: str) -> str:
+        normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return normalized if normalized in allowed else default
+
     @staticmethod
     def _config_int(config: Dict[str, Any], key: str, *, default: int, minimum: int, maximum: int) -> int | None:
         raw = config.get(key, default)
@@ -465,7 +620,9 @@ class MnemosyneProvider(MemoryProvider):
             value = int(raw)
         except (TypeError, ValueError):
             return None
-        return max(minimum, min(value, maximum))
+        if value < minimum or value > maximum:
+            return None
+        return value
 
     @staticmethod
     def _read_jsonl(path: Path) -> List[Dict[str, Any]]:

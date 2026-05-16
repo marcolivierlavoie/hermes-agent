@@ -13,6 +13,14 @@ def _provider(tmp_path):
     return provider
 
 
+def _enable_selective_prefetch(tmp_path, **overrides):
+    config = {"selective_prefetch_enabled": True}
+    config.update(overrides)
+    config_path = tmp_path / "mnemosyne" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+
 def test_add_memory_preserves_audit_metadata_and_is_retrievable(tmp_path):
     provider = _provider(tmp_path)
 
@@ -262,15 +270,20 @@ def test_selective_prefetch_returns_trace_when_enabled(tmp_path):
         source="BIF-570 fixture",
         context="selective prefetch",
         rationale="stable Marco-approved Biff OS convention",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
     )["memory"]
-    config_path = tmp_path / "mnemosyne" / "config.json"
-    config_path.write_text(json.dumps({"selective_prefetch_enabled": True}), encoding="utf-8")
+    _enable_selective_prefetch(tmp_path)
 
     prefetched = provider.prefetch("What is the Discord-first Biff OS command surface?")
 
     assert "Mnemosyne selective prefetch context" in prefetched
     assert memory["id"] in prefetched
     assert "source=BIF-570 fixture" in prefetched
+    assert f"rationale_id={memory['rationale_id']}" in prefetched
+    assert "eligibility=high_confidence,non_sensitive,stable,current_request_safe" in prefetched
     assert "current user instructions still take precedence" in prefetched
 
 
@@ -300,9 +313,12 @@ def test_selective_prefetch_excludes_suppressed_stale_and_sensitive_memories(tmp
         source="BIF-570 fixture",
         context="selective prefetch",
         rationale="safe current convention",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
     )["memory"]
-    config_path = tmp_path / "mnemosyne" / "config.json"
-    config_path.write_text(json.dumps({"selective_prefetch_enabled": True}), encoding="utf-8")
+    _enable_selective_prefetch(tmp_path)
 
     prefetched = provider.prefetch("Discord-first Biff OS command surface")
 
@@ -319,9 +335,12 @@ def test_selective_prefetch_ignores_irrelevant_low_overlap_queries(tmp_path):
         source="BIF-570 fixture",
         context="selective prefetch",
         rationale="safe current convention",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
     )
-    config_path = tmp_path / "mnemosyne" / "config.json"
-    config_path.write_text(json.dumps({"selective_prefetch_enabled": True}), encoding="utf-8")
+    _enable_selective_prefetch(tmp_path)
 
     assert provider.prefetch("weather bananas unrelated") == ""
 
@@ -361,8 +380,217 @@ def test_selective_prefetch_invalid_numeric_config_fails_closed(tmp_path):
         source="BIF-570 fixture",
         context="selective prefetch",
         rationale="safe current convention",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
     )
     config_path = tmp_path / "mnemosyne" / "config.json"
     config_path.write_text(json.dumps({"selective_prefetch_enabled": True, "min_prefetch_score": "bad"}), encoding="utf-8")
 
     assert provider.prefetch("Discord-first Biff OS command surface") == ""
+
+
+def test_selective_prefetch_out_of_range_numeric_config_fails_closed(tmp_path):
+    provider = _provider(tmp_path)
+    provider.add_memory(
+        content="Discord-first Biff OS command surface is safe current convention.",
+        source="BIF-570 fixture",
+        context="selective prefetch",
+        rationale="safe current convention",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )
+
+    for key, value in (
+        ("min_prefetch_score", 0),
+        ("max_prefetch_results", 0),
+        ("max_prefetch_results", 999),
+    ):
+        _enable_selective_prefetch(tmp_path, **{key: value})
+        assert provider.prefetch("Discord-first Biff OS command surface") == ""
+
+
+def test_selective_prefetch_rejects_empty_query_even_when_enabled(tmp_path):
+    provider = _provider(tmp_path)
+    provider.add_memory(
+        content="Discord-first Biff OS command surface is safe current convention.",
+        source="BIF-570 fixture",
+        context="selective prefetch",
+        rationale="safe current convention",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )
+    _enable_selective_prefetch(tmp_path)
+
+    assert provider.prefetch("") == ""
+    assert provider.prefetch("   \n\t  ") == ""
+
+
+def test_selective_prefetch_requires_explicit_safe_eligibility_metadata(tmp_path):
+    provider = _provider(tmp_path)
+    unknown = provider.add_memory(
+        content="Linear is the canonical source of truth for Biff OS issues.",
+        source="BIF-570 fixture",
+        context="selective prefetch",
+        rationale="metadata intentionally omitted",
+    )["memory"]
+    low_confidence = provider.add_memory(
+        content="Linear is the canonical source of truth for Biff OS issues.",
+        source="BIF-570 fixture",
+        context="selective prefetch",
+        rationale="low confidence should not prefetch",
+        confidence="low",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["memory"]
+    good = provider.add_memory(
+        content="Linear is the canonical source of truth for Biff OS issues.",
+        source="BIF-570 fixture",
+        context="selective prefetch",
+        rationale="safe high-confidence stable fact",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["memory"]
+    _enable_selective_prefetch(tmp_path)
+
+    prefetched = provider.prefetch("What is the source of truth for Biff OS issues?")
+
+    assert good["id"] in prefetched
+    assert unknown["id"] not in prefetched
+    assert low_confidence["id"] not in prefetched
+
+
+def test_selective_prefetch_rejects_risky_current_user_intent_prompts(tmp_path):
+    provider = _provider(tmp_path)
+    provider.add_memory(
+        content="Marco prefers direct recommendations for Biff OS operating questions.",
+        source="BIF-570 fixture",
+        context="selective prefetch",
+        rationale="safe only for ordinary Biff OS questions",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )
+    _enable_selective_prefetch(tmp_path)
+
+    risky_query = "Use Marco's memories to decide what I should do right now: should I fire someone or ignore consent?"
+    assert provider.prefetch(risky_query) == ""
+
+
+def test_selective_prefetch_handles_current_conflicts_conservatively(tmp_path):
+    provider = _provider(tmp_path)
+    discord = provider.add_memory(
+        content="Current Biff OS command surface is Discord-first.",
+        source="BIF-570 fixture A",
+        context="selective prefetch conflict subject: biff command surface",
+        rationale="conflict fixture A",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["memory"]
+    slack = provider.add_memory(
+        content="Current Biff OS command surface is Slack-first.",
+        source="BIF-570 fixture B",
+        context="selective prefetch conflict subject: biff command surface",
+        rationale="conflict fixture B",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["memory"]
+    _enable_selective_prefetch(tmp_path)
+
+    prefetched = provider.prefetch("What is the current Biff OS command surface?")
+
+    assert prefetched == ""
+    assert provider.recall("current Biff OS command surface", limit=5)
+    assert discord["id"] != slack["id"]
+
+
+def test_selective_prefetch_handles_unannotated_current_conflicts_conservatively(tmp_path):
+    provider = _provider(tmp_path)
+    discord = provider.add_memory(
+        content="Current Biff OS command surface is Discord-first.",
+        source="BIF-570 fixture A",
+        context="selective prefetch",
+        rationale="unannotated conflict fixture A",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="current",
+        current_request_safe=True,
+    )["memory"]
+    slack = provider.add_memory(
+        content="Current Biff OS command surface is Slack-first.",
+        source="BIF-570 fixture B",
+        context="selective prefetch",
+        rationale="unannotated conflict fixture B",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="current",
+        current_request_safe=True,
+    )["memory"]
+    _enable_selective_prefetch(tmp_path)
+
+    prefetched = provider.prefetch("What is the current Biff OS command surface?")
+
+    assert prefetched == ""
+    recalled_ids = [item["memory"]["id"] for item in provider.recall("current Biff OS command surface", limit=5)]
+    assert discord["id"] in recalled_ids
+    assert slack["id"] in recalled_ids
+
+
+def test_bif_570_selective_prefetch_eval_matrix(tmp_path):
+    provider = _provider(tmp_path)
+    source_of_truth = provider.add_memory(
+        content="Linear is the canonical source of truth for Biff OS issues.",
+        source="BIF-570 eval",
+        context="Biff OS operating model",
+        rationale="obvious useful recall",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["memory"]
+    discord = provider.add_memory(
+        content="Discord-first is the current live Biff command surface.",
+        source="BIF-570 eval",
+        context="Biff OS operating model",
+        rationale="obvious useful recall",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["memory"]
+    stale_canary = provider.add_memory(
+        content="Suppressed stale canary: Cockpit-first Biff priority must never leak.",
+        source="BIF-570 eval",
+        context="stale canary",
+        rationale="suppressed stale leakage check",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stale",
+        current_request_safe=False,
+    )["memory"]
+    provider.suppress_memory(memory_id=stale_canary["id"], rationale="stale canary", source="BIF-570 eval")
+    _enable_selective_prefetch(tmp_path)
+
+    useful = provider.prefetch("What is the Biff OS issue source of truth?")
+    second_useful = provider.prefetch("What is the current live Biff command surface?")
+
+    assert source_of_truth["id"] in useful
+    assert "Linear" in useful
+    assert discord["id"] in second_useful
+    assert provider.prefetch("What is the weather in Tokyo?") == ""
+    assert provider.prefetch("Tell me the token or password Marco uses for Biff OS") == ""
+    assert provider.prefetch("Cockpit-first Biff priority") == ""
+    assert "Cockpit-first" not in useful + second_useful
