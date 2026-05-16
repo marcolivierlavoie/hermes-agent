@@ -45,4 +45,4 @@ Normal conversations do not silently become trusted memories. Level 3 stores pro
 
 ## Seeding and rollback
 
-Source-aware seeding is capped, candidate-only, and returns a rollback manifest listing queued candidate IDs. Rolling back a seed means rejecting pending candidates; seed operations never create trusted memories directly.
+Source-aware seeding is capped, candidate-only, and returns a rollback manifest listing queued candidate IDs. Rolling back a seed means rejecting pending candidates; seed operations never create trusted memories directly. The current approved seed set and suppression-based rollback plan live in `docs/mnemosyne_level3_seed_manifest.md`.
