@@ -1403,8 +1403,9 @@ class MnemosyneProvider(MemoryProvider):
                     "suggested_action": "inspect; consider updating metadata before prefetch eligibility",
                 })
             supersedes = self._normalize_ids(memory.get("supersedes") if isinstance(memory.get("supersedes"), list) else None)
-            if supersedes:
-                recommendations.append({"candidate_memory_ids": [memory_id, *supersedes], "reason": "explicit superseded/supersession metadata present", "suggested_action": f"inspect; consider suppressing superseded IDs: {', '.join(supersedes)}"})
+            unsuppressed_superseded = [item for item in supersedes if item not in active]
+            if unsuppressed_superseded:
+                recommendations.append({"candidate_memory_ids": [memory_id, *unsuppressed_superseded], "reason": "explicit superseded/supersession metadata present", "suggested_action": f"inspect; consider suppressing superseded IDs: {', '.join(unsuppressed_superseded)}"})
 
         for index, (left, left_suppressed) in enumerate(memories):
             left_id = str(left.get("id") or "")

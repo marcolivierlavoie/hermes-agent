@@ -192,6 +192,39 @@ def test_hygiene_report_is_non_mutating_and_flags_stale_duplicate_conflict(tmp_p
     assert any(stale["id"] in candidates for candidates in candidate_sets)
 
 
+def test_hygiene_report_treats_suppressed_superseded_ids_as_clean(tmp_path):
+    provider = _provider(tmp_path)
+    old = provider.add_memory(
+        content="Marco wants Dreaming outputs to focus less on tactical recaps.",
+        source="old user correction",
+        context="supersession hygiene regression",
+        rationale="older preference superseded by a clarification",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+        conflict_status="superseded",
+    )["memory"]
+    new = provider.add_memory(
+        content="Marco wants Dreaming outputs to keep tactical recaps and add Biff self-improvement insights.",
+        source="clarifying user correction",
+        context="supersession hygiene regression",
+        rationale="newer clarification replaces the older preference",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+        supersedes=[old["id"]],
+    )["memory"]
+
+    before = provider.hygiene_report(include_suppressed=False)
+    provider.suppress_memory(memory_id=old["id"], rationale="superseded by clarification", source="test")
+    after = provider.hygiene_report(include_suppressed=False)
+
+    assert any(new["id"] in item["candidate_memory_ids"] and old["id"] in item["candidate_memory_ids"] for item in before["recommendations"])
+    assert not any(old["id"] in item["candidate_memory_ids"] for item in after["recommendations"])
+
+
 def test_tool_hygiene_report_action_does_not_auto_suppress(tmp_path):
     provider = _provider(tmp_path)
     stale = provider.add_memory(
