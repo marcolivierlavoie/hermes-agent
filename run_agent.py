@@ -10649,6 +10649,13 @@ class AIAgent:
             return
         self._last_long_turn_signal = governor.mark_tool_call(tool_name, failed=failed)
 
+    def _record_long_turn_tool_failure_signature(self, tool_name: str, args: dict, result: Any) -> dict[str, Any] | None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return None
+        self._last_long_turn_signal = governor.observe_tool_failure(tool_name, args, result)
+        return self._last_long_turn_signal
+
     def _record_long_turn_guardrail(self, decision: ToolGuardrailDecision) -> None:
         governor = getattr(self, "_long_turn_governor", None)
         if governor is None:
@@ -10698,6 +10705,22 @@ class AIAgent:
             function_result,
             failed=failed,
         )
+        if failed and not decision.should_halt:
+            signal = self._record_long_turn_tool_failure_signature(tool_name, function_args, function_result)
+            fallback_decision = (signal or {}).get("fallback_decision") if isinstance(signal, dict) else None
+            if isinstance(fallback_decision, dict):
+                halt = ToolGuardrailDecision(
+                    action="halt",
+                    code="long_turn_repeated_failure_fallback",
+                    message=(
+                        f"Stopped {tool_name}: repeated the same tool/test/error without enough new hypothesis. "
+                        "Pause or switch fallback strategy instead of retrying the same failure loop."
+                    ),
+                    tool_name=tool_name,
+                    count=int(fallback_decision.get("count") or 0),
+                    signature=decision.signature,
+                )
+                self._set_tool_guardrail_halt(halt)
         if decision.action in {"warn", "halt"}:
             self._record_long_turn_guardrail(decision)
             function_result = append_toolguard_guidance(function_result, decision)
@@ -15065,7 +15088,9 @@ class AIAgent:
 
                     if self._tool_guardrail_halt_decision is not None:
                         decision = self._tool_guardrail_halt_decision
-                        _turn_exit_reason = "guardrail_halt"
+                        governor = getattr(self, "_long_turn_governor", None)
+                        fallback_decision = getattr(getattr(governor, "state", None), "fallback_decision", None)
+                        _turn_exit_reason = "long_turn_fallback_pause" if fallback_decision else "guardrail_halt"
                         self._persist_long_turn_resume_packet(_turn_exit_reason)
                         final_response = self._toolguard_controlled_halt_response(decision)
                         self._emit_status(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,6 +83,8 @@ class LongTurnState:
     role_handoffs: list[dict[str, Any]] = field(default_factory=list)
     resume_packet_path: str | None = None
     resume_packet_error: str | None = None
+    fallback_decision: dict[str, Any] | None = None
+    changed_hypothesis_retry: dict[str, Any] | None = None
     threshold_reasons: list[str] = field(default_factory=list)
     last_signal: str = "started"
 
@@ -105,6 +108,8 @@ class LongTurnState:
             "threshold_reasons": list(self.threshold_reasons),
             "resume_packet_path": self.resume_packet_path,
             "resume_packet_error": self.resume_packet_error,
+            "fallback_decision": self.fallback_decision,
+            "changed_hypothesis_retry": self.changed_hypothesis_retry,
             "last_signal": self.last_signal,
             "exit_reason": exit_reason,
         }
@@ -121,6 +126,8 @@ class LongTurnState:
             "threshold_reasons": list(self.threshold_reasons),
             "resume_packet_path": self.resume_packet_path,
             "resume_packet_error": self.resume_packet_error,
+            "fallback_decision": self.fallback_decision,
+            "changed_hypothesis_retry": self.changed_hypothesis_retry,
         }
 
 
@@ -142,6 +149,7 @@ class LongTurnGovernor:
         self.thresholds = thresholds or LongTurnThresholds()
         self.persist_dir = Path(persist_dir) if persist_dir is not None else None
         self._persisted_reasons: set[str] = set()
+        self._failure_observations: dict[str, dict[str, Any]] = {}
 
     def mark_api_call(self, count: int | None = None) -> dict[str, Any]:
         self.state.api_calls = int(count) if count is not None else self.state.api_calls + 1
@@ -175,6 +183,72 @@ class LongTurnGovernor:
                 _decision_metadata(decision),
             )
         return self._check_thresholds()
+
+    def observe_tool_failure(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+        result: Any,
+    ) -> dict[str, Any]:
+        """Observe a failed tool/test/error tuple and decide whether to fall back.
+
+        Two identical failed attempts with no changed hypothesis are treated as a
+        loop and produce a pause/fallback decision. If the retry includes a
+        changed hypothesis, that one retry is allowed; a subsequent failure for
+        the same tool/test/error pauses the turn.
+        """
+
+        if self.state.fallback_decision is not None:
+            return self.state.runtime_signal()
+        failure_key, metadata = _failure_signature(tool_name, args, result)
+        hypothesis_hash = metadata["hypothesis_hash"]
+        record = self._failure_observations.get(failure_key)
+        if record is None:
+            self._failure_observations[failure_key] = {
+                "count": 1,
+                "hypotheses": {hypothesis_hash},
+                "changed_retry_used": False,
+                "metadata": metadata,
+            }
+            return self.state.runtime_signal()
+
+        record["count"] = int(record.get("count", 0)) + 1
+        hypotheses = record.setdefault("hypotheses", set())
+        changed_hypothesis = hypothesis_hash not in hypotheses
+        hypotheses.add(hypothesis_hash)
+        count = int(record["count"])
+
+        if changed_hypothesis and not record.get("changed_retry_used"):
+            record["changed_retry_used"] = True
+            self.state.changed_hypothesis_retry = {
+                "used": True,
+                "count": count,
+                "tool_name": tool_name,
+                "signature": metadata,
+            }
+            self.state.last_signal = "changed_hypothesis_retry"
+            return self.state.runtime_signal()
+
+        reason = (
+            "repeated_failure_changed_hypothesis_exhausted"
+            if record.get("changed_retry_used")
+            else "repeated_failure_same_hypothesis"
+        )
+        self.state.fallback_decision = {
+            "action": "pause",
+            "reason": reason,
+            "count": count,
+            "tool_name": tool_name,
+            "signature": metadata,
+        }
+        self.state.last_signal = "fallback_decision"
+        self.add_evidence(
+            "fallback_decision",
+            f"{tool_name}: {reason}",
+            self.state.fallback_decision,
+        )
+        self._persist_resume_packet("repeated_failure_fallback", force=True)
+        return self.state.runtime_signal()
 
     def add_checkpoint(self, label: str, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
         checkpoint = {
@@ -275,6 +349,8 @@ def build_resume_packet(state: LongTurnState, *, reason: str) -> dict[str, Any]:
         "created_at": time.time(),
         "runtime_signal": state.runtime_signal(),
         "summary_metrics": state.to_metrics(),
+        "fallback_decision": state.fallback_decision,
+        "changed_hypothesis_retry": state.changed_hypothesis_retry,
         "closure_contract": build_turn_closure_contract(state, exit_reason=reason),
         "latest_checkpoint": state.checkpoints[-1] if state.checkpoints else None,
         "evidence_ledger": [entry.to_dict() for entry in state.evidence_ledger],
@@ -322,6 +398,8 @@ def build_turn_closure_contract(
         "session_id": state.session_id,
         "task_id": state.task_id,
         "resume_packet_path": state.resume_packet_path,
+        "fallback_decision": state.fallback_decision,
+        "changed_hypothesis_retry": state.changed_hypothesis_retry,
         "latest_checkpoint_label": latest_checkpoint.get("label") if isinstance(latest_checkpoint, dict) else None,
         "next_action": next_action,
     }
@@ -466,6 +544,55 @@ def render_quiet_checkpoint(state: LongTurnState, *, label: str | None = None) -
     if state.resume_packet_path:
         bits.append(f"resume={state.resume_packet_path}")
     return "⏱ " + " | ".join(bits)
+
+
+def _failure_signature(tool_name: str, args: Mapping[str, Any] | None, result: Any) -> tuple[str, dict[str, str]]:
+    coerced_args = dict(args or {}) if isinstance(args, Mapping) else {}
+    target_args = {
+        key: value
+        for key, value in coerced_args.items()
+        if str(key).lower() not in {"hypothesis", "_hypothesis", "changed_hypothesis", "strategy", "rationale"}
+    }
+    hypothesis_payload = {
+        key: value
+        for key, value in coerced_args.items()
+        if str(key).lower() in {"hypothesis", "_hypothesis", "changed_hypothesis", "strategy", "rationale"}
+    }
+    if not hypothesis_payload:
+        hypothesis_payload = coerced_args
+    target_hash = _hash_json(target_args)
+    hypothesis_hash = _hash_json(hypothesis_payload)
+    error_hash = _hash_json(_error_payload(result))
+    metadata = {
+        "tool_name": str(tool_name or ""),
+        "target_hash": target_hash,
+        "error_hash": error_hash,
+        "hypothesis_hash": hypothesis_hash,
+    }
+    key = _hash_json({"tool_name": metadata["tool_name"], "target_hash": target_hash, "error_hash": error_hash})
+    return key, metadata
+
+
+def _error_payload(result: Any) -> Any:
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except Exception:
+            return " ".join(result.strip().split())[:2000]
+        if isinstance(parsed, Mapping):
+            for key in ("error", "stderr", "exception", "message", "failed"):
+                if key in parsed:
+                    return {key: parsed.get(key)}
+        return parsed
+    return result
+
+
+def _hash_json(value: Any) -> str:
+    try:
+        canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        canonical = str(value)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _decision_metadata(decision: Any) -> dict[str, Any]:

@@ -102,3 +102,56 @@ def test_resume_packet_persistence_failure_is_best_effort(tmp_path):
     assert signal["resume_packet_path"] is None
     assert signal["resume_packet_error"].startswith("FileExistsError:")
     assert state.last_signal == "resume_packet_error"
+
+
+def test_repeated_same_tool_test_error_same_hypothesis_triggers_fallback_packet(tmp_path):
+    state = LongTurnState(session_id="sess", task_id="task", turn_id="turn")
+    governor = LongTurnGovernor(state=state, persist_dir=tmp_path)
+    args = {"test": "pytest tests/foo.py::test_bar", "hypothesis": "missing import"}
+    result = "AssertionError: expected 1 got 2"
+
+    assert governor.observe_tool_failure("terminal", args, result)["fallback_decision"] is None
+    signal = governor.observe_tool_failure("terminal", args, result)
+
+    decision = signal["fallback_decision"]
+    assert decision["action"] == "pause"
+    assert decision["reason"] == "repeated_failure_same_hypothesis"
+    assert decision["count"] == 2
+    assert state.resume_packet_path
+    packet = json.loads(open(state.resume_packet_path).read())
+    assert packet["reason"] == "repeated_failure_fallback"
+    assert packet["fallback_decision"] == decision
+    assert packet["closure_contract"]["fallback_decision"] == decision
+
+
+def test_repeated_same_tool_test_error_changed_hypothesis_allows_one_bounded_retry(tmp_path):
+    state = LongTurnState(session_id="sess", task_id="task", turn_id="turn")
+    governor = LongTurnGovernor(state=state, persist_dir=tmp_path)
+    result = "AssertionError: expected 1 got 2"
+
+    first = governor.observe_tool_failure(
+        "terminal",
+        {"test": "pytest tests/foo.py::test_bar", "hypothesis": "missing import"},
+        result,
+    )
+    second = governor.observe_tool_failure(
+        "terminal",
+        {"test": "pytest tests/foo.py::test_bar", "hypothesis": "fixture order"},
+        result,
+    )
+
+    assert first["fallback_decision"] is None
+    assert second["fallback_decision"] is None
+    assert second["changed_hypothesis_retry"]["used"] is True
+    assert state.resume_packet_path is None
+
+    third = governor.observe_tool_failure(
+        "terminal",
+        {"test": "pytest tests/foo.py::test_bar", "hypothesis": "fixture order"},
+        result,
+    )
+
+    decision = third["fallback_decision"]
+    assert decision["action"] == "pause"
+    assert decision["reason"] == "repeated_failure_changed_hypothesis_exhausted"
+    assert decision["count"] == 3
