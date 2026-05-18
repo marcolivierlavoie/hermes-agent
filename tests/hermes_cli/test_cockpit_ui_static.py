@@ -10,6 +10,7 @@ APP = ROOT / "web" / "src" / "App.tsx"
 API = ROOT / "web" / "src" / "lib" / "api.ts"
 COCKPIT_PAGE = ROOT / "web" / "src" / "pages" / "CockpitPage.tsx"
 CHAT_PAGE = ROOT / "web" / "src" / "pages" / "ChatPage.tsx"
+RITUAL_PAGE = ROOT / "web" / "src" / "pages" / "RitualPage.tsx"
 INDEX_HTML = ROOT / "web" / "index.html"
 VITE_CONFIG = ROOT / "web" / "vite.config.ts"
 MANIFEST = ROOT / "web" / "public" / "cockpit.webmanifest"
@@ -43,6 +44,23 @@ def test_cockpit_page_route_and_nav_are_registered():
     assert 'path: "/cockpit"' in app
     assert 'label: "Cockpit"' in app
     assert 'icon: Activity' in app
+
+
+def test_ritual_surface_route_and_nav_are_registered():
+    app = APP.read_text(encoding="utf-8")
+    page = RITUAL_PAGE.read_text(encoding="utf-8")
+
+    assert 'const RitualPage = lazy(() => import("@/pages/RitualPage"));' in app
+    assert '"/ritual": () => <RitualPage />' in app
+    assert 'path: "/ritual"' in app
+    assert 'label: "Ritual"' in app
+    assert 'icon: Moon' in app
+    assert "Daily Distortion Ritual" in page
+    assert "One prompt only" in page
+    assert "localStorage" in page
+    assert "no API writes" in page
+    for marker in FORBIDDEN_PAGE_MARKERS:
+        assert marker not in page
 
 
 def test_builtin_dashboard_routes_are_lazy_loaded_but_persistent_chat_stays_static():

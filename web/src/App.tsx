@@ -30,6 +30,7 @@ import {
   Globe,
   Heart,
   KeyRound,
+  Moon,
   Menu,
   MessageSquare,
   Package,
@@ -115,6 +116,7 @@ const AnalyticsPage = lazy(() => import("@/pages/AnalyticsPage"));
 const ModelsPage = lazy(() => import("@/pages/ModelsPage"));
 const LogsPage = lazy(() => import("@/pages/LogsPage"));
 const CockpitPage = lazy(() => import("@/pages/CockpitPage"));
+const RitualPage = lazy(() => import("@/pages/RitualPage"));
 const CronPage = lazy(() => import("@/pages/CronPage"));
 const SkillsPage = lazy(() => import("@/pages/SkillsPage"));
 const PluginsPage = lazy(() => import("@/pages/PluginsPage"));
@@ -146,6 +148,7 @@ const BUILTIN_ROUTES_CORE: Record<string, () => ReactNode> = {
   "/models": () => <ModelsPage />,
   "/logs": () => <LogsPage />,
   "/cockpit": () => <CockpitPage />,
+  "/ritual": () => <RitualPage />,
   "/cron": () => <CronPage />,
   "/skills": () => <SkillsPage />,
   "/plugins": () => <PluginsPage />,
@@ -184,6 +187,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cockpit", label: "Cockpit", icon: Activity },
+  { path: "/ritual", label: "Ritual", icon: Moon },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
   { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
@@ -206,6 +210,7 @@ const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
   FileText,
   KeyRound,
   MessageSquare,
+  Moon,
   Package,
   Settings,
   Puzzle,
@@ -351,6 +356,7 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isCockpitRoute = normalizedPath === "/cockpit" || normalizedPath === "/biff/cockpit";
+  const isRitualRoute = normalizedPath === "/ritual" || normalizedPath === "/biff/ritual";
   const isChatRoute = normalizedPath === "/chat";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
 
@@ -432,7 +438,7 @@ export default function App() {
   const layoutVariant = theme.layoutVariant ?? "standard";
 
   useEffect(() => {
-    if (!isCockpitRoute) return;
+    if (!isCockpitRoute && !isRitualRoute) return;
 
     const html = document.documentElement;
     const body = document.body;
@@ -485,7 +491,7 @@ export default function App() {
         root.style.minHeight = previous.rootMinHeight;
       }
     };
-  }, [isCockpitRoute]);
+  }, [isCockpitRoute, isRitualRoute]);
 
   useEffect(() => {
     if (!mobileOpen) return;
@@ -524,6 +530,18 @@ export default function App() {
         <PageHeaderProvider pluginTabs={pluginTabMeta}>
           <Suspense fallback={<CockpitRouteLoadingFallback />}>
             <CockpitPage standalone />
+          </Suspense>
+        </PageHeaderProvider>
+      </div>
+    );
+  }
+
+  if (isRitualRoute) {
+    return (
+      <div data-ritual-shell className="min-h-dvh bg-[var(--cockpit-shell)] text-[var(--cockpit-text)] antialiased">
+        <PageHeaderProvider pluginTabs={pluginTabMeta}>
+          <Suspense fallback={<CockpitRouteLoadingFallback />}>
+            <RitualPage />
           </Suspense>
         </PageHeaderProvider>
       </div>
