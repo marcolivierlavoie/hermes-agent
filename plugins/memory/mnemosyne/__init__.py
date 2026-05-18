@@ -1386,7 +1386,10 @@ class MnemosyneProvider(MemoryProvider):
             if markers and not suppressed:
                 recommendations.append({"candidate_memory_ids": [memory_id], "reason": f"stale/deprecation marker(s): {', '.join(markers)}", "suggested_action": "inspect"})
             sensitivity = str(memory.get("sensitivity") or "unknown").lower()
-            if sensitivity in {"sensitive", "secret"} or self._has_secret_marker(text_for(memory)):
+            has_secret_marker = self._has_secret_marker(text_for(memory))
+            if sensitivity == "secret" or has_secret_marker or (
+                sensitivity == "sensitive" and not self._is_approved_safe_sensitive_memory(memory)
+            ):
                 recommendations.append({
                     "candidate_memory_ids": [memory_id],
                     "reason": "possible sensitive/secret content or sensitive classification",
@@ -1445,6 +1448,48 @@ class MnemosyneProvider(MemoryProvider):
             "recommendations": recommendations,
             "mutated": False,
         }
+
+    def _is_approved_safe_sensitive_memory(self, memory: Dict[str, Any]) -> bool:
+        """Return true for sensitive-but-approved memories that should not create hygiene work.
+
+        This deliberately keeps secret markers fail-closed in hygiene_report and only
+        trusts explicit approval signals in audit metadata, not the memory body.
+        """
+        if str(memory.get("sensitivity") or "unknown").lower() != "sensitive":
+            return False
+        if str(memory.get("stability") or "unknown").lower() != "stable":
+            return False
+        if memory.get("current_request_safe") is not True:
+            return False
+        approval_text = " ".join(str(memory.get(k) or "") for k in ("source", "context", "rationale")).lower()
+        negative_approval_markers = (
+            "not explicitly approved",
+            "not user-approved",
+            "not user approved",
+            "not marco-approved",
+            "not marco approved",
+            "no explicit approval",
+            "without explicit approval",
+        )
+        if any(marker in approval_text for marker in negative_approval_markers):
+            return False
+        approval_markers = (
+            "user-approved",
+            "user approved",
+            "marco-approved",
+            "marco approved",
+            "approved by user",
+            "approved by marco",
+            "explicit user approval",
+            "explicitly approved",
+            "explicit memory request",
+            "user explicit memory request",
+            "user asked to store",
+            "user asked to remember",
+            "store this in mnemosyne",
+            "remember this",
+        )
+        return any(marker in approval_text for marker in approval_markers)
 
     @staticmethod
     def _memory_result(memory: Dict[str, Any], *, score: int | None, suppressed: bool) -> Dict[str, Any]:

@@ -760,3 +760,56 @@ def test_l3_hygiene_flags_missing_metadata_without_mutation(tmp_path):
     assert before == after
     assert report["mutated"] is False
     assert any(memory["id"] in item["candidate_memory_ids"] and "metadata" in item["reason"] for item in report["recommendations"])
+
+
+def test_hygiene_does_not_flag_approved_safe_sensitive_memory_or_expose_body(tmp_path):
+    provider = _provider(tmp_path)
+    body = "Postal-code shopping anchor regression fixture 12345."
+    candidate = provider.add_candidate(
+        content=body,
+        source="BIF-601 fixture",
+        context="explicit user approval regression",
+        rationale="sensitive local preference candidate",
+        confidence="high",
+        sensitivity="sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["candidate"]
+    approved = provider.approve_candidate(candidate_id=candidate["id"], rationale="Marco-approved sensitive shopping anchor")
+    memory_id = approved["memory"]["id"]
+
+    report = provider.hygiene_report(include_suppressed=True)
+
+    assert report["success"] is True
+    assert not any(memory_id in item["candidate_memory_ids"] for item in report["recommendations"])
+    assert body not in json.dumps(report, sort_keys=True)
+
+
+def test_hygiene_still_flags_sensitive_memory_without_approval_and_secret_markers(tmp_path):
+    provider = _provider(tmp_path)
+    unapproved = provider.add_memory(
+        content="Sensitive local preference regression fixture.",
+        source="BIF-601 fixture",
+        context="no explicit approval marker",
+        rationale="sensitive but not explicitly approved",
+        confidence="high",
+        sensitivity="sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["memory"]
+    secret_marked = provider.add_memory(
+        content="BIF-601 credential regression token: abc123",
+        source="BIF-601 fixture",
+        context="Marco-approved metadata should not override secret marker",
+        rationale="Marco-approved but includes secret marker",
+        confidence="high",
+        sensitivity="sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )["memory"]
+
+    report = provider.hygiene_report(include_suppressed=True)
+
+    flagged_ids = {memory_id for item in report["recommendations"] for memory_id in item["candidate_memory_ids"]}
+    assert unapproved["id"] in flagged_ids
+    assert secret_marked["id"] in flagged_ids
