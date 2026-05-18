@@ -6,6 +6,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
 const STORAGE_KEY = "biff.daily_distortion_ritual.v1";
+const INACTIVITY_TIMEOUT_MINUTES = 30;
+const INACTIVITY_TIMEOUT_MS = INACTIVITY_TIMEOUT_MINUTES * 60 * 1000;
 
 const INTRO = "Daily Distortion Ritual (60-180 sec)\n\nPause gently. Pick one current worry and keep it broad enough for a public-safe note.";
 const QUESTIONS = [
@@ -45,7 +47,8 @@ type RitualState = {
   updatedAt: string;
   completedAt?: string;
   stoppedAt?: string;
-  exitReason?: "completed" | "stopped";
+  expiredAt?: string;
+  exitReason?: "completed" | "stopped" | "inactivity_timeout";
 };
 
 function nowIso(): string {
@@ -63,13 +66,31 @@ function freshState(): RitualState {
   };
 }
 
+function isTimedOut(value: string | undefined, nowMs = Date.now()): boolean {
+  if (!value) return false;
+  const thenMs = new Date(value).getTime();
+  if (Number.isNaN(thenMs)) return false;
+  return nowMs - thenMs > INACTIVITY_TIMEOUT_MS;
+}
+
+function expireIfInactive(state: RitualState, now = nowIso()): RitualState {
+  if (!state.active || !isTimedOut(state.updatedAt, new Date(now).getTime())) return state;
+  return {
+    ...state,
+    active: false,
+    updatedAt: now,
+    expiredAt: now,
+    exitReason: "inactivity_timeout",
+  };
+}
+
 function safeStoredState(raw: string | null): RitualState | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as Partial<RitualState>;
     if (!parsed || !Array.isArray(parsed.answers)) return null;
     const index = Number(parsed.questionIndex ?? 0);
-    return {
+    return expireIfInactive({
       active: parsed.active !== false,
       questionIndex: Number.isFinite(index) ? Math.min(Math.max(index, 0), QUESTIONS.length) : 0,
       answers: parsed.answers
@@ -85,8 +106,12 @@ function safeStoredState(raw: string | null): RitualState | null {
       updatedAt: String(parsed.updatedAt ?? nowIso()),
       completedAt: parsed.completedAt ? String(parsed.completedAt) : undefined,
       stoppedAt: parsed.stoppedAt ? String(parsed.stoppedAt) : undefined,
-      exitReason: parsed.exitReason === "completed" || parsed.exitReason === "stopped" ? parsed.exitReason : undefined,
-    };
+      expiredAt: parsed.expiredAt ? String(parsed.expiredAt) : undefined,
+      exitReason:
+        parsed.exitReason === "completed" || parsed.exitReason === "stopped" || parsed.exitReason === "inactivity_timeout"
+          ? parsed.exitReason
+          : undefined,
+    });
   } catch {
     return null;
   }
@@ -110,6 +135,13 @@ export default function RitualPage() {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }, [state]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setState((previous) => expireIfInactive(previous));
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const currentQuestion = state.questionIndex < QUESTIONS.length ? QUESTIONS[state.questionIndex] : null;
   const complete = !state.active || state.questionIndex >= QUESTIONS.length;
   const progress = Math.min(state.questionIndex + (complete ? 0 : 1), QUESTIONS.length);
@@ -118,15 +150,27 @@ export default function RitualPage() {
   const statusLabel = useMemo(() => {
     if (state.exitReason === "completed") return "Complete";
     if (state.exitReason === "stopped") return "Stopped";
+    if (state.exitReason === "inactivity_timeout") return "Timed out";
     return "In progress";
   }, [state.exitReason]);
 
+  const handleDraftChange = useCallback((value: string) => {
+    setDraft(value);
+    setState((previous) => {
+      if (!previous.active) return previous;
+      const checked = expireIfInactive(previous);
+      if (!checked.active) return checked;
+      return { ...checked, updatedAt: nowIso() };
+    });
+  }, []);
+
   const advance = useCallback((answer: string | null, skipped: boolean) => {
     setState((previous) => {
-      if (!previous.active || previous.questionIndex >= QUESTIONS.length) return previous;
-      const index = previous.questionIndex;
+      const checked = expireIfInactive(previous);
+      if (!checked.active || checked.questionIndex >= QUESTIONS.length) return checked;
+      const index = checked.questionIndex;
       const answers = [
-        ...previous.answers,
+        ...checked.answers,
         {
           questionIndex: index,
           question: QUESTIONS[index],
@@ -139,7 +183,7 @@ export default function RitualPage() {
       const now = nowIso();
       if (nextIndex >= QUESTIONS.length) {
         return {
-          ...previous,
+          ...checked,
           active: false,
           questionIndex: nextIndex,
           answers,
@@ -149,7 +193,7 @@ export default function RitualPage() {
         };
       }
       return {
-        ...previous,
+        ...checked,
         questionIndex: nextIndex,
         answers,
         updatedAt: now,
@@ -169,10 +213,11 @@ export default function RitualPage() {
 
   const handleStop = useCallback(() => {
     setState((previous) => {
-      if (!previous.active) return previous;
+      const checked = expireIfInactive(previous);
+      if (!checked.active) return checked;
       const now = nowIso();
       return {
-        ...previous,
+        ...checked,
         active: false,
         stoppedAt: now,
         updatedAt: now,
@@ -244,7 +289,7 @@ export default function RitualPage() {
                     <span className="sr-only">Answer</span>
                     <textarea
                       value={draft}
-                      onChange={(event) => setDraft(event.target.value)}
+                      onChange={(event) => handleDraftChange(event.target.value)}
                       rows={5}
                       placeholder="Short phrase is enough. This stays in this browser's localStorage."
                       className="w-full resize-none rounded-3xl border border-[var(--cockpit-border)] bg-[var(--cockpit-shell)] p-4 text-base leading-7 text-[var(--cockpit-text)] outline-none transition placeholder:text-[color-mix(in_srgb,var(--cockpit-muted)_72%,transparent)] focus:border-[color-mix(in_srgb,var(--cockpit-active)_65%,transparent)]"
@@ -275,10 +320,10 @@ export default function RitualPage() {
                   <div className="rounded-3xl border border-[color-mix(in_srgb,var(--cockpit-healthy)_42%,transparent)] bg-[color-mix(in_srgb,var(--cockpit-healthy)_10%,transparent)] p-5">
                     <div className="flex items-center gap-3 text-[var(--cockpit-active)]">
                       <ShieldCheck className="h-5 w-5" />
-                      <p className="text-xs uppercase tracking-[0.2em]">{state.exitReason === "completed" ? "Ritual complete" : "Ritual stopped"}</p>
+                      <p className="text-xs uppercase tracking-[0.2em]">{state.exitReason === "completed" ? "Ritual complete" : state.exitReason === "inactivity_timeout" ? "Ritual timed out" : "Ritual stopped"}</p>
                     </div>
-                    <h2 className="mt-4 text-xl font-semibold text-[var(--cockpit-text)]">{state.exitReason === "completed" ? CLOSE : "Stopped. Nothing else is required."}</h2>
-                    <p className="mt-3 text-sm leading-6 text-[color-mix(in_srgb,var(--cockpit-text)_74%,transparent)]">Answers remain only in this browser unless Marco chooses to copy them elsewhere. n8n can stay the scheduler/notification owner; Discord should only point here or act as fallback.</p>
+                    <h2 className="mt-4 text-xl font-semibold text-[var(--cockpit-text)]">{state.exitReason === "completed" ? CLOSE : state.exitReason === "inactivity_timeout" ? `Timed out after ${INACTIVITY_TIMEOUT_MINUTES} minutes of inactivity. Nothing else is required.` : "Stopped. Nothing else is required."}</h2>
+                    <p className="mt-3 text-sm leading-6 text-[color-mix(in_srgb,var(--cockpit-text)_74%,transparent)]">Answers remain only in this browser unless Marco chooses to copy them elsewhere. n8n can stay the scheduler/notification owner; Discord should only point here or act as fallback. In-progress sessions time out locally after {INACTIVITY_TIMEOUT_MINUTES} minutes of inactivity.</p>
                   </div>
 
                   <div className="space-y-3">

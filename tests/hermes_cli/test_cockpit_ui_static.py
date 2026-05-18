@@ -59,6 +59,10 @@ def test_ritual_surface_route_and_nav_are_registered():
     assert "One prompt only" in page
     assert "localStorage" in page
     assert "no API writes" in page
+    assert "INACTIVITY_TIMEOUT_MINUTES = 30" in page
+    assert "expireIfInactive" in page
+    assert "inactivity_timeout" in page
+    assert "Timed out after" in page
     for marker in FORBIDDEN_PAGE_MARKERS:
         assert marker not in page
 
