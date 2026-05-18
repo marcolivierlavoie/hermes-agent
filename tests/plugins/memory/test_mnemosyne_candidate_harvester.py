@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from plugins.memory.mnemosyne import MnemosyneProvider
 
 
@@ -98,6 +100,48 @@ def test_harvest_rejects_secrets_temp_progress_and_private_raw_content(tmp_path)
         assert result["mutated_memory"] is False
         assert result.get("rejections") or result.get("reason")
         assert result["rejections"][0]["category"] == expected_category
+
+    assert provider.list_candidates(status="all") == []
+    assert provider.list_memories(include_suppressed=True) == []
+
+
+def test_sync_turn_auto_capture_is_config_gated_candidate_only(tmp_path):
+    provider = _provider(tmp_path)
+
+    provider.sync_turn(
+        "Marco prefers Biff to keep Slack work in the current chat, not new threads.",
+        "Acknowledged.",
+        session_id="disabled-session",
+    )
+    assert provider.list_candidates(status="all") == []
+
+    config_path = tmp_path / "mnemosyne" / "config.json"
+    config_path.write_text(json.dumps({"l3_auto_capture_enabled": True}), encoding="utf-8")
+    provider.sync_turn(
+        "Marco prefers Biff to keep Slack work in the current chat, not new threads.",
+        "Acknowledged.",
+        session_id="enabled-session",
+    )
+
+    candidates = provider.list_candidates(status="pending")
+    assert len(candidates) == 1
+    assert candidates[0]["content"] == "Marco prefers Biff to keep Slack work in the current chat, not new threads."
+    assert candidates[0]["source"] == "mnemosyne_sync_turn:enabled-session"
+    assert candidates[0]["status"] == "pending"
+    assert provider.list_memories(include_suppressed=True) == []
+
+
+def test_sync_turn_auto_capture_skips_non_primary_context(tmp_path):
+    config_path = tmp_path / "mnemosyne" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({"l3_auto_capture_enabled": True}), encoding="utf-8")
+    provider = MnemosyneProvider()
+    provider.initialize("subagent-session", hermes_home=str(tmp_path), agent_context="subagent")
+
+    provider.sync_turn(
+        "Marco prefers Biff to keep Slack work in the current chat, not new threads.",
+        "Acknowledged.",
+    )
 
     assert provider.list_candidates(status="all") == []
     assert provider.list_memories(include_suppressed=True) == []

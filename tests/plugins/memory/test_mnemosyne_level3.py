@@ -167,6 +167,43 @@ def test_supersession_and_conflict_metadata_are_exposed_and_reported(tmp_path):
     assert report["mutated"] is False
 
 
+def test_memory_digest_reports_only_actionable_unsuppressed_active_conflicts(tmp_path):
+    provider = _provider(tmp_path)
+    suppressed_active = provider.add_memory(
+        content="Old command surface is Cockpit-first for Biff.",
+        source="BIF-609 digest fixture",
+        context="superseded conflict fixture",
+        rationale="legacy fact",
+        conflict_group="biff command surface",
+        conflict_status="active",
+    )["memory"]
+    provider.suppress_memory(
+        memory_id=suppressed_active["id"],
+        rationale="superseded fixture should not require a Discord decision",
+        source="test",
+    )
+    provider.add_memory(
+        content="Resolved command surface is Discord-first for Biff.",
+        source="BIF-609 digest fixture",
+        context="resolved conflict fixture",
+        rationale="resolved fact",
+        conflict_group="biff command surface",
+        conflict_status="resolved",
+    )
+    active = provider.add_memory(
+        content="Active unresolved command surface conflict fixture.",
+        source="BIF-609 digest fixture",
+        context="active conflict fixture",
+        rationale="active conflict requires review",
+        conflict_group="biff command surface active",
+        conflict_status="active",
+    )["memory"]
+
+    digest = provider.memory_digest()
+
+    assert digest["needs_decision"]["conflict_memory_ids"] == [active["id"]]
+
+
 def test_prefetch_conflict_detection_skips_unannotated_conflicting_memories(tmp_path):
     provider = _provider(tmp_path)
     provider.add_memory(

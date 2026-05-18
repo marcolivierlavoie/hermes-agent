@@ -138,6 +138,7 @@ class MnemosyneProvider(MemoryProvider):
         self.hermes_home = get_hermes_home()
         self.data_dir = Path(os.environ.get("MNEMOSYNE_DATA_DIR", self._effective_mnemosyne_root(self.hermes_home) / "data")).expanduser()
         self.config: Dict[str, Any] = {}
+        self._agent_context = "primary"
         self._last_prefetch_trace: Dict[str, Any] = {}
         mnemosyne_root = self._effective_mnemosyne_root(self.hermes_home)
         self._root = mnemosyne_root / "isolated-pilot"
@@ -183,6 +184,7 @@ class MnemosyneProvider(MemoryProvider):
         self.config = self._load_config()
         self._session_id = session_id
         self.session_id = session_id
+        self._agent_context = str(kwargs.get("agent_context") or "primary")
         self._root.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._snapshots_dir().mkdir(parents=True, exist_ok=True)
@@ -201,6 +203,30 @@ class MnemosyneProvider(MemoryProvider):
             "Suppression is non-destructive by default and can be rolled back. "
             "Automatic broad recall/prefetch is disabled; recall Mnemosyne explicitly "
             "when the user asks about memory/history or when a memory check is required."
+        )
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+        """Optionally harvest durable completed-turn facts into candidates.
+
+        This is candidate-only and disabled by default. When explicitly enabled
+        via ``l3_auto_capture_enabled``, the completed turn is scanned with the
+        same conservative harvester used by the tool surface; accepted snippets
+        are queued for approval and never written directly to trusted memory.
+        """
+        config = self._load_config()
+        if config.get("l3_auto_capture_enabled") is not True:
+            return
+        if self._agent_context != "primary":
+            return
+        combined = "\n".join(part for part in (user_content, assistant_content) if part)
+        if not combined.strip():
+            return
+        active_session = session_id or self._session_id
+        self.harvest_candidates(
+            content=combined,
+            source=f"mnemosyne_sync_turn:{active_session}",
+            context="completed primary conversation turn; auto-capture candidate-only",
+            topic="auto-captured production memory candidate",
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -736,12 +762,12 @@ class MnemosyneProvider(MemoryProvider):
         """Return a Discord/operator-friendly Phase 4 decisions digest without raw memory bodies."""
         pending = self.list_candidates(status="pending")
         hygiene = self.hygiene_report(include_suppressed=False)
-        memories = self.list_memories(include_suppressed=True)
+        memories = self.list_memories(include_suppressed=False)
         suppressions = [row for row in self._read_jsonl(self._suppressions_path) if row.get("active") is True]
         conflict_memory_ids = sorted({
             item["memory"]["id"]
             for item in memories
-            if item.get("conflict_group") or item.get("conflict_status") not in {"", "unknown", None}
+            if item["memory"].get("conflict_status") == "active"
         })
         hygiene_items = [
             {
