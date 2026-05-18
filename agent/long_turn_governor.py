@@ -221,6 +221,9 @@ class LongTurnGovernor:
     def persist_resume_packet(self, reason: str = "manual") -> Path | None:
         return self._persist_resume_packet(reason)
 
+    def persist_closure_packet(self, exit_reason: str = "final_response") -> Path | None:
+        return self._persist_resume_packet(exit_reason, force=True)
+
     def _check_thresholds(self) -> dict[str, Any]:
         reasons: list[str] = []
         if self.state.api_calls >= self.thresholds.api_calls:
@@ -240,11 +243,11 @@ class LongTurnGovernor:
                 self._persist_resume_packet(reason)
         return self.state.runtime_signal()
 
-    def _persist_resume_packet(self, reason: str) -> Path | None:
+    def _persist_resume_packet(self, reason: str, *, force: bool = False) -> Path | None:
         if self.persist_dir is None:
             return None
         key = reason or "threshold"
-        if key in self._persisted_reasons and self.state.resume_packet_path:
+        if not force and key in self._persisted_reasons and self.state.resume_packet_path:
             return Path(self.state.resume_packet_path)
         try:
             self.persist_dir.mkdir(parents=True, exist_ok=True)
@@ -272,6 +275,7 @@ def build_resume_packet(state: LongTurnState, *, reason: str) -> dict[str, Any]:
         "created_at": time.time(),
         "runtime_signal": state.runtime_signal(),
         "summary_metrics": state.to_metrics(),
+        "closure_contract": build_turn_closure_contract(state, exit_reason=reason),
         "latest_checkpoint": state.checkpoints[-1] if state.checkpoints else None,
         "evidence_ledger": [entry.to_dict() for entry in state.evidence_ledger],
         "role_handoffs": list(state.role_handoffs),
@@ -280,6 +284,174 @@ def build_resume_packet(state: LongTurnState, *, reason: str) -> dict[str, Any]:
             "and avoid repeating guardrail-triggering calls unchanged."
         ),
     }
+
+
+def build_turn_closure_contract(
+    state: LongTurnState,
+    *,
+    exit_reason: str | None,
+) -> dict[str, Any]:
+    """Return the explicit resume/closure contract for a long turn.
+
+    This is deliberately machine-readable and conservative: only normal final
+    assistant exits are marked closed.  Timeouts, interrupts, budget exhaustion,
+    guardrail halts, and manual checkpoint packets are resumable and must not be
+    represented to a user/operator as fully complete.
+    """
+
+    reason = exit_reason or "unknown"
+    closed_reasons = {"final_response", "completed", "normal", "success"}
+    closed_prefixes = ("text_response(",)
+    resume_required = reason not in closed_reasons and not reason.startswith(closed_prefixes)
+    latest_checkpoint = state.checkpoints[-1] if state.checkpoints else None
+    next_action = None
+    if isinstance(latest_checkpoint, dict):
+        metadata = latest_checkpoint.get("metadata") or {}
+        if isinstance(metadata, Mapping):
+            raw_next = metadata.get("next_action") or metadata.get("action")
+            if raw_next is not None:
+                next_action = str(raw_next)
+
+    return {
+        "schema_version": 1,
+        "status": "resume_required" if resume_required else "closed",
+        "resume_required": resume_required,
+        "exit_reason": reason,
+        "user_visible_claim": "not_complete" if resume_required else "complete",
+        "turn_id": state.turn_id,
+        "session_id": state.session_id,
+        "task_id": state.task_id,
+        "resume_packet_path": state.resume_packet_path,
+        "latest_checkpoint_label": latest_checkpoint.get("label") if isinstance(latest_checkpoint, dict) else None,
+        "next_action": next_action,
+    }
+
+
+def should_render_action_relevant_checkpoint(
+    signal: Mapping[str, Any] | None,
+    *,
+    turn_exit_reason: str | None = None,
+) -> bool:
+    """Return True only for checkpoints that change Marco's action/risk.
+
+    Threshold-only long turns are intentionally quiet. Visible Discord/gateway
+    checkpoints are reserved for interrupted/resumable turns, approval/blocker
+    boundaries, or explicit action-required metadata.
+    """
+
+    data = dict(signal or {})
+    reason = turn_exit_reason or ""
+    if reason.startswith(("interrupted", "budget_exhausted", "guardrail_halt", "max_iterations_reached")):
+        return True
+    if data.get("action_required") or data.get("approval_required") or data.get("blocked"):
+        return True
+    if data.get("signal") in {"guardrail_halt", "approval_required", "blocked"}:
+        return True
+    contract = data.get("closure_contract")
+    if isinstance(contract, Mapping) and contract.get("resume_required"):
+        return True
+    return False
+
+
+def render_action_relevant_checkpoint(
+    signal: Mapping[str, Any] | None,
+    state: LongTurnState | None = None,
+) -> str:
+    """Render a terse gateway-safe checkpoint line.
+
+    The gateway should show what changed and the next action, not local file
+    paths or implementation internals.  Paths remain available in logs and the
+    resume packet; chat surfaces get a profile-safe checkpoint breadcrumb.
+    """
+
+    data = dict(signal or {})
+    api_calls = data.get("api_calls", getattr(state, "api_calls", 0) if state else 0)
+    tool_calls = data.get("tool_calls", getattr(state, "tool_calls", 0) if state else 0)
+    if "threshold_reasons" in data:
+        reasons = data.get("threshold_reasons") or []
+    elif state is not None:
+        reasons = getattr(state, "threshold_reasons", []) or []
+    else:
+        reasons = []
+    if isinstance(reasons, str):
+        reasons_text = reasons
+    else:
+        reasons_text = ",".join(str(r) for r in (reasons or []))
+
+    latest_checkpoint = state.checkpoints[-1] if state and state.checkpoints else None
+    next_action = _checkpoint_next_action(latest_checkpoint)
+
+    bits = ["⏱ Checkpoint saved", f"api={api_calls}", f"tools={tool_calls}"]
+    if reasons_text:
+        bits.append(f"threshold={reasons_text}")
+    if next_action:
+        bits.append(f"next: {next_action}")
+    return " | ".join(bits)
+
+
+def load_latest_resume_packet(persist_dir: Path | str, session_id: str) -> dict[str, Any] | None:
+    """Load the newest resumable packet for a session, if one exists."""
+
+    session_dir = Path(persist_dir) / _safe_component(session_id or "no-session")
+    if not session_dir.exists() or not session_dir.is_dir():
+        return None
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    for path in session_dir.glob("*.json"):
+        try:
+            packet = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        contract = packet.get("closure_contract") if isinstance(packet, dict) else None
+        if not isinstance(contract, Mapping) or not contract.get("resume_required"):
+            continue
+        created_at = packet.get("created_at")
+        try:
+            created = float(created_at)
+        except (TypeError, ValueError):
+            created = path.stat().st_mtime
+        candidates.append((created, packet))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def render_resume_reanchor(packet: Mapping[str, Any] | None) -> str:
+    """Render a compact, path-safe resume context from a packet."""
+
+    if not isinstance(packet, Mapping):
+        return ""
+    contract = packet.get("closure_contract") or {}
+    checkpoint = packet.get("latest_checkpoint") or {}
+    evidence = packet.get("evidence_ledger") or []
+    latest_label = checkpoint.get("label") if isinstance(checkpoint, Mapping) else None
+    next_action = _checkpoint_next_action(checkpoint) if isinstance(checkpoint, Mapping) else None
+    if not next_action and isinstance(contract, Mapping):
+        raw_next = contract.get("next_action")
+        next_action = str(raw_next) if raw_next else None
+    evidence_bits: list[str] = []
+    if isinstance(evidence, list):
+        for entry in evidence[-3:]:
+            if isinstance(entry, Mapping) and entry.get("summary"):
+                evidence_bits.append(str(entry["summary"]))
+    parts = ["Resume context from prior interrupted long turn"]
+    if latest_label:
+        parts.append(f"checkpoint: {latest_label}")
+    if evidence_bits:
+        parts.append("evidence: " + "; ".join(evidence_bits))
+    if next_action:
+        parts.append(f"next: {next_action}")
+    return " | ".join(parts)
+
+
+def _checkpoint_next_action(checkpoint: Mapping[str, Any] | None) -> str | None:
+    if isinstance(checkpoint, Mapping):
+        metadata = checkpoint.get("metadata") or {}
+        if isinstance(metadata, Mapping):
+            raw_next = metadata.get("next_action") or metadata.get("action")
+            if raw_next is not None:
+                return str(raw_next)
+    return None
 
 
 def render_quiet_checkpoint(state: LongTurnState, *, label: str | None = None) -> str:

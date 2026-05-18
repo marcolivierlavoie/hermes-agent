@@ -185,6 +185,8 @@ from agent.long_turn_governor import (
     LongTurnGovernor,
     LongTurnState,
     LongTurnThresholds,
+    load_latest_resume_packet,
+    render_resume_reanchor,
 )
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
@@ -10581,6 +10583,34 @@ class AIAgent:
     def _long_turn_persist_dir(self) -> Path:
         return Path(get_hermes_home()) / "runtime" / "long_turns"
 
+    def _should_long_turn_reanchor(self, user_message: str) -> bool:
+        if not isinstance(user_message, str):
+            return False
+        lowered = user_message.strip().lower()
+        if not lowered:
+            return False
+        exact_commands = {"go", "go man", "continue", "resume", "finish"}
+        if lowered in exact_commands:
+            return True
+        continuation_patterns = (
+            r"\bcontinue\b",
+            r"\bresume\b",
+            r"\bfinish\b",
+            r"\bcarry on\b",
+            r"\bwhere were we\b",
+            r"\bpick back up\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in continuation_patterns)
+
+    def _long_turn_resume_reanchor_text(self) -> str | None:
+        try:
+            packet = load_latest_resume_packet(self._long_turn_persist_dir(), self.session_id or "")
+            rendered = render_resume_reanchor(packet)
+            return rendered or None
+        except Exception:
+            logger.debug("long-turn resume reanchor failed", exc_info=True)
+            return None
+
     def _long_turn_thresholds(self) -> LongTurnThresholds:
         try:
             from hermes_cli.config import load_config as _load_ltg_config
@@ -12110,6 +12140,15 @@ class AIAgent:
             if self._turns_since_memory >= self._memory_nudge_interval:
                 _should_review_memory = True
                 self._turns_since_memory = 0
+
+        # Add compact resume context for a prior interrupted long turn only when
+        # the new user turn is clearly asking to continue/resume. This is quiet
+        # by default and path-safe; it avoids visible progress chatter while
+        # preventing work-position amnesia after interruptions/restarts.
+        if self._should_long_turn_reanchor(user_message):
+            reanchor = self._long_turn_resume_reanchor_text()
+            if reanchor:
+                user_message = f"{reanchor}\n\nCurrent user request:\n{user_message}"
 
         # Add user message
         user_msg = {"role": "user", "content": user_message}
@@ -15713,6 +15752,11 @@ class AIAgent:
         }
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
+        if completed and not interrupted:
+            governor = getattr(self, "_long_turn_governor", None)
+            if governor is not None:
+                governor.persist_closure_packet(_turn_exit_reason)
+                self._last_long_turn_signal = governor.state.runtime_signal()
         _long_turn_metrics = self._long_turn_summary_metrics(exit_reason=_turn_exit_reason)
         if _long_turn_metrics is not None:
             result["long_turn"] = _long_turn_metrics

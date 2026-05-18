@@ -15759,6 +15759,24 @@ class GatewayRunner:
                     _run_message = message
 
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                try:
+                    _lt_signal = result.get("long_turn_signal") if isinstance(result, dict) else None
+                    _turn_exit_reason = result.get("turn_exit_reason") if isinstance(result, dict) else None
+                    if progress_queue is not None and isinstance(_lt_signal, dict):
+                        from agent.long_turn_governor import (
+                            render_action_relevant_checkpoint,
+                            should_render_action_relevant_checkpoint,
+                        )
+
+                        if should_render_action_relevant_checkpoint(
+                            _lt_signal,
+                            turn_exit_reason=_turn_exit_reason,
+                        ):
+                            _lt_state = getattr(agent, "_long_turn_governor", None)
+                            _lt_state = getattr(_lt_state, "state", None)
+                            progress_queue.put(render_action_relevant_checkpoint(_lt_signal, _lt_state))
+                except Exception:
+                    logger.debug("long-turn checkpoint progress render failed", exc_info=True)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
