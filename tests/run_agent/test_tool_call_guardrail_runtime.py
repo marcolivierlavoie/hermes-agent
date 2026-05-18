@@ -237,7 +237,7 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
-def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
+def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error(tmp_path):
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
     same_args = {"query": "same"}
     responses = [
@@ -252,6 +252,7 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
 
     with (
         patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
+        patch.object(agent, "_long_turn_persist_dir", return_value=tmp_path),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
@@ -267,9 +268,34 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
     assert "stopped retrying" in result["final_response"]
     assert result["guardrail"]["code"] == "repeated_exact_failure_block"
     assert result["guardrail"]["tool_name"] == "web_search"
+    resume_path = result["long_turn"]["resume_packet_path"]
+    assert resume_path
+    packet = json.loads(open(resume_path).read())
+    assert packet["reason"] == "guardrail_halt"
 
     assistant_tool_calls = [m for m in result["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
     for assistant_msg in assistant_tool_calls:
         call_ids = [tc["id"] for tc in assistant_msg["tool_calls"]]
         following_results = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") in call_ids]
         assert len(following_results) == len(call_ids)
+
+
+def test_interrupted_run_persists_long_turn_resume_packet(tmp_path):
+    agent = _make_agent("web_search", max_iterations=10)
+    agent.interrupt("new user input")
+
+    with (
+        patch.object(agent, "_long_turn_persist_dir", return_value=tmp_path),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do long work")
+
+    assert result["interrupted"] is True
+    assert result["turn_exit_reason"] == "interrupted_by_user"
+    resume_path = result["long_turn"]["resume_packet_path"]
+    assert resume_path
+    packet = json.loads(open(resume_path).read())
+    assert packet["reason"] == "interrupted_by_user"
+    assert packet["runtime_signal"]["resume_packet_path"] == resume_path

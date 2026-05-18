@@ -181,6 +181,11 @@ from agent.tool_guardrails import (
     append_toolguard_guidance,
     toolguard_synthetic_result,
 )
+from agent.long_turn_governor import (
+    LongTurnGovernor,
+    LongTurnState,
+    LongTurnThresholds,
+)
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     file_mutation_result_landed,
@@ -1390,6 +1395,8 @@ class AIAgent:
         self._executing_tools = False
         self._tool_guardrails = ToolCallGuardrailController()
         self._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+        self._long_turn_governor: LongTurnGovernor | None = None
+        self._last_long_turn_signal: dict[str, Any] | None = None
 
         # Interrupt mechanism for breaking out of tool loops
         self._interrupt_requested = False
@@ -10571,6 +10578,73 @@ class AIAgent:
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
             self._tool_guardrail_halt_decision = decision
 
+    def _long_turn_persist_dir(self) -> Path:
+        return Path(get_hermes_home()) / "runtime" / "long_turns"
+
+    def _long_turn_thresholds(self) -> LongTurnThresholds:
+        try:
+            from hermes_cli.config import load_config as _load_ltg_config
+            cfg = _load_ltg_config() or {}
+            section = cfg.get("long_turn_governor", {}) or {}
+            if isinstance(section, dict):
+                thresholds = section.get("thresholds", section)
+                return LongTurnThresholds.from_mapping(thresholds)
+        except Exception:
+            pass
+        return LongTurnThresholds()
+
+    def _start_long_turn_governor(self, effective_task_id: str) -> None:
+        turn_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        state = LongTurnState(
+            session_id=self.session_id or "",
+            task_id=effective_task_id or "",
+            turn_id=turn_id,
+        )
+        self._long_turn_governor = LongTurnGovernor(
+            state=state,
+            thresholds=self._long_turn_thresholds(),
+            persist_dir=self._long_turn_persist_dir(),
+        )
+        self._last_long_turn_signal = state.runtime_signal()
+
+    def _record_long_turn_api_call(self, api_call_count: int) -> None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return
+        self._last_long_turn_signal = governor.mark_api_call(api_call_count)
+
+    def _record_long_turn_tool_call(self, tool_name: str, *, failed: bool = False) -> None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return
+        self._last_long_turn_signal = governor.mark_tool_call(tool_name, failed=failed)
+
+    def _record_long_turn_guardrail(self, decision: ToolGuardrailDecision) -> None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return
+        before_path = governor.state.resume_packet_path
+        self._last_long_turn_signal = governor.observe_guardrail(decision)
+        if governor.state.resume_packet_path and governor.state.resume_packet_path != before_path:
+            checkpoint = governor.add_checkpoint("tool guardrail threshold")
+            logger.info("long-turn checkpoint: %s", governor.quiet_checkpoint_text(checkpoint["label"]))
+
+    def _long_turn_summary_metrics(self, *, exit_reason: str | None = None) -> dict[str, Any] | None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return None
+        return governor.summary_metrics(exit_reason=exit_reason)
+
+    def _persist_long_turn_resume_packet(self, reason: str) -> None:
+        """Best-effort resume packet persistence for non-normal turn exits."""
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return
+        path = governor.persist_resume_packet(reason)
+        self._last_long_turn_signal = governor.state.runtime_signal()
+        if path:
+            logger.info("long-turn resume packet persisted: reason=%s path=%s", reason, path)
+
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         tool = decision.tool_name or "a tool"
         return (
@@ -10595,12 +10669,14 @@ class AIAgent:
             failed=failed,
         )
         if decision.action in {"warn", "halt"}:
+            self._record_long_turn_guardrail(decision)
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
+        self._record_long_turn_guardrail(decision)
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
@@ -11057,6 +11133,7 @@ class AIAgent:
                 function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
                 if not blocked:
+                    self._record_long_turn_tool_call(function_name, failed=is_error)
                     function_result = self._append_guardrail_observation(
                         function_name,
                         function_args,
@@ -11488,6 +11565,7 @@ class AIAgent:
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
             if not _execution_blocked:
+                self._record_long_turn_tool_call(function_name, failed=_is_error_result)
                 function_result = self._append_guardrail_observation(
                     function_name,
                     function_args,
@@ -11909,6 +11987,7 @@ class AIAgent:
         # state registry.  Set BEFORE any tool dispatch so snapshots taken at
         # child-launch time see the parent's real id, not None.
         self._current_task_id = effective_task_id
+        self._start_long_turn_governor(effective_task_id)
         
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
@@ -12278,12 +12357,14 @@ class AIAgent:
             if self._interrupt_requested:
                 interrupted = True
                 _turn_exit_reason = "interrupted_by_user"
+                self._persist_long_turn_resume_packet(_turn_exit_reason)
                 if not self.quiet_mode:
                     self._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
                 break
             
             api_call_count += 1
             self._api_call_count = api_call_count
+            self._record_long_turn_api_call(api_call_count)
             self._touch_activity(f"starting API call #{api_call_count}")
 
             # Grace call: the budget is exhausted but we gave the model one
@@ -12293,6 +12374,7 @@ class AIAgent:
                 self._budget_grace_call = False
             elif not self.iteration_budget.consume():
                 _turn_exit_reason = "budget_exhausted"
+                self._persist_long_turn_resume_packet(_turn_exit_reason)
                 if not self.quiet_mode:
                     self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
                 break
@@ -14945,6 +15027,7 @@ class AIAgent:
                     if self._tool_guardrail_halt_decision is not None:
                         decision = self._tool_guardrail_halt_decision
                         _turn_exit_reason = "guardrail_halt"
+                        self._persist_long_turn_resume_packet(_turn_exit_reason)
                         final_response = self._toolguard_controlled_halt_response(decision)
                         self._emit_status(
                             f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
@@ -15630,6 +15713,11 @@ class AIAgent:
         }
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
+        _long_turn_metrics = self._long_turn_summary_metrics(exit_reason=_turn_exit_reason)
+        if _long_turn_metrics is not None:
+            result["long_turn"] = _long_turn_metrics
+            if self._last_long_turn_signal is not None:
+                result["long_turn_signal"] = self._last_long_turn_signal
         # If a /steer landed after the final assistant turn (no more tool
         # batches to drain into), hand it back to the caller so it can be
         # delivered as the next user turn instead of being silently lost.
