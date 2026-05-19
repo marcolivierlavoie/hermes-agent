@@ -270,6 +270,7 @@ def run_conversation(
     # state registry.  Set BEFORE any tool dispatch so snapshots taken at
     # child-launch time see the parent's real id, not None.
     agent._current_task_id = effective_task_id
+    agent._start_long_turn_governor(effective_task_id)
 
     # Reset retry counters and iteration budget at the start of each turn
     # so subagent usage from a previous turn doesn't eat into the next one.
@@ -609,6 +610,7 @@ def run_conversation(
 
         api_call_count += 1
         agent._api_call_count = api_call_count
+        agent._record_long_turn_api_call(api_call_count)
         agent._touch_activity(f"starting API call #{api_call_count}")
 
         # Grace call: the budget is exhausted but we gave the model one
@@ -3338,7 +3340,10 @@ def run_conversation(
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
-                    _turn_exit_reason = "guardrail_halt"
+                    if decision.code == "long_turn_repeated_failure_fallback":
+                        _turn_exit_reason = "long_turn_fallback_pause"
+                    else:
+                        _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(
                         f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
@@ -3855,6 +3860,11 @@ def run_conversation(
     # Determine if conversation completed successfully
     completed = final_response is not None and api_call_count < agent.max_iterations
 
+    if _turn_exit_reason in {"interrupted_by_user", "interrupted_during_api_call", "long_turn_fallback_pause"}:
+        agent._persist_long_turn_resume_packet(_turn_exit_reason)
+
+    _long_turn_metrics = agent._long_turn_summary_metrics(exit_reason=_turn_exit_reason)
+
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
@@ -4024,6 +4034,8 @@ def run_conversation(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    if _long_turn_metrics is not None:
+        result["long_turn"] = _long_turn_metrics
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.

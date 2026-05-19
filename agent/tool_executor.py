@@ -247,6 +247,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
         duration = time.time() - start
         is_error, _ = _detect_tool_failure(function_name, result)
+        try:
+            agent._record_long_turn_tool_call(function_name, failed=is_error)
+        except Exception:
+            pass
         if is_error:
             logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
         else:
@@ -796,6 +800,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        try:
+            agent._record_long_turn_tool_call(function_name, failed=_is_error_result)
+        except Exception:
+            pass
         if not _execution_blocked:
             function_result = agent._append_guardrail_observation(
                 function_name,
