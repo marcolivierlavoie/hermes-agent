@@ -2810,9 +2810,9 @@ class GatewayRunner:
         """Load background process notification mode from config or env var.
 
         Modes:
-          - ``all``    — push running-output updates *and* the final message (default)
+          - ``all``    — push running-output updates *and* the final message
           - ``result`` — only the final completion message (regardless of exit code)
-          - ``error``  — only the final message when exit code is non-zero
+          - ``error``  — only the final message when exit code is non-zero (default)
           - ``off``    — no watcher messages at all
         """
         mode = os.getenv("HERMES_BACKGROUND_NOTIFICATIONS", "")
@@ -2830,14 +2830,14 @@ class GatewayRunner:
                         mode = str(raw)
             except Exception:
                 pass
-        mode = (mode or "all").strip().lower()
+        mode = (mode or "error").strip().lower()
         valid = {"all", "result", "error", "off"}
         if mode not in valid:
             logger.warning(
-                "Unknown background_process_notifications '%s', defaulting to 'all'",
+                "Unknown background_process_notifications '%s', defaulting to 'error'",
                 mode,
             )
-            return "all"
+            return "error"
         return mode
 
     @staticmethod
@@ -14689,7 +14689,11 @@ class GatewayRunner:
                 # --- Agent-triggered completion: inject synthetic message ---
                 # Skip if the agent already consumed the result via wait/poll/log
                 from tools.process_registry import process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                should_agent_notify = (
+                    notify_mode in {"all", "result"}
+                    or (notify_mode == "error" and session.exit_code not in {0, None})
+                )
+                if agent_notify and should_agent_notify and not _pr_check.is_completion_consumed(session_id):
                     from tools.ansi_strip import strip_ansi
                     _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
                     # Truncate at line boundaries so notifications never start

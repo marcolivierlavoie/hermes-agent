@@ -333,15 +333,21 @@ When the agent running a background session uses `terminal(background=true)` to 
 
 ```yaml
 display:
-  background_process_notifications: all    # all | result | error | off
+  background_process_notifications: error  # all | result | error | off
 ```
 
 | Mode | What you receive |
 |------|-----------------|
-| `all` | Running-output updates **and** the final completion message (default) |
+| `all` | Running-output updates **and** the final completion message |
 | `result` | Only the final completion message (regardless of exit code) |
-| `error` | Only the final message when the exit code is non-zero |
+| `error` | Only the final message when the exit code is non-zero (default) |
 | `off` | No process watcher messages at all |
+
+The default is intentionally quiet for successful background processes so noisy
+test/build output does not get pasted into chat platforms like Discord. Agents
+should inspect routine background work with the `process` tool (`wait`, `poll`,
+or `log`) and send a concise summary instead of relying on raw completion
+payloads.
 
 You can also set this via environment variable:
 

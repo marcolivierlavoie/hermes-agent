@@ -904,12 +904,10 @@ Do NOT use echo/cat heredoc to create files — use write_file instead.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
-Background: Set background=true to get a session_id. Two patterns:
-  (1) Long-lived processes that never exit (servers, watchers).
-  (2) Long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
+Background: Set background=true to get a session_id for long-lived processes that never exit (servers, watchers) or commands that must outlive one tool call. For bounded tests/builds/scripts, prefer foreground with a generous timeout; if background is necessary, keep logs local and use process(action="wait"), process(action="poll"), or process(action="log") to inspect results and summarize.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
-Use process(action="poll") for progress checks, process(action="wait") to block until done.
+Do NOT set notify_on_complete for routine/noisy jobs unless the user explicitly asks for an automatic completion turn; messaging gateways are quiet for successful completions by default.
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
@@ -1678,7 +1676,7 @@ def terminal_tool(
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
-        notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
+        notify_on_complete: If True and background=True, Hermes asks the agent to handle process completion when it exits. Avoid this for routine or noisy long tasks in messaging platforms; prefer process(action='wait'|'poll'|'log') and summarize results yourself. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
     Returns:
@@ -1746,8 +1744,8 @@ def terminal_tool(
             return json.dumps({
                 "error": (
                     f"Foreground timeout {timeout}s exceeds the maximum of "
-                    f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
-                    f"notify_on_complete=true for long-running commands."
+                    f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true for commands "
+                    f"that must outlive a tool call, then inspect results with the process tool."
                 ),
             }, ensure_ascii=False)
 
@@ -2322,7 +2320,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background. Two patterns: (1) Long-lived processes that never exit (servers, watchers). (2) Long-running tasks paired with notify_on_complete=true — you can keep working and get notified when the task finishes. For short commands, prefer foreground with a generous timeout instead.",
+                "description": "Run the command in the background. Use for long-lived processes that never exit (servers, watchers) or commands that must outlive a single tool call. For bounded tests/builds/scripts, prefer foreground with a generous timeout; if background is necessary, keep logs local and use process(action='wait'|'poll'|'log') to inspect and summarize. Do not set notify_on_complete for routine/noisy jobs unless the user explicitly wants an automatic completion turn.",
                 "default": False
             },
             "timeout": {
@@ -2341,7 +2339,7 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "When true (and background=true), you'll be automatically notified exactly once when the process finishes. **This is the right choice for almost every long-running task** — tests, builds, deployments, multi-item batch jobs, anything that takes over a minute and has a defined end. Use this and keep working on other things; the system notifies you on exit. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
+                "description": "When true (and background=true), Hermes queues an automatic completion event when the process finishes. In messaging platforms (including Discord), successful completions are quiet by default unless display.background_process_notifications is set to 'result' or 'all'; failures still surface in the default 'error' mode. Avoid this for routine/noisy jobs — prefer process(action='wait'|'poll'|'log') and send a concise summary. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
                 "default": False
             },
             "watch_patterns": {

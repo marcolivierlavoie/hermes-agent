@@ -881,10 +881,14 @@ detects process completion and triggers a new agent turn. Control verbosity of b
 messages with `display.background_process_notifications`
 in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 
-- `all` — running-output updates + final message (default)
+- `all` — running-output updates + final message
 - `result` — only the final completion message
-- `error` — only the final message when exit code != 0
+- `error` — only the final message when exit code != 0 (default)
 - `off` — no watcher messages at all
+
+Successful completions are quiet by default to avoid raw test/build payloads
+being auto-delivered into chat platforms such as Discord. Agents should inspect
+routine background work with the `process` tool and send concise summaries.
 
 ---
 

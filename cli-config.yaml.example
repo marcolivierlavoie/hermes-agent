@@ -955,11 +955,14 @@ display:
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use
   # terminal(background=true, notify_on_complete=true) from Telegram/Discord/etc.
+  # Successful completions are quiet by default to avoid raw test/build output
+  # dumps in chat platforms. Inspect routine background jobs with the process
+  # tool and send concise summaries instead.
   #   off:     No watcher messages at all
   #   result:  Only the final completion message
-  #   error:   Only the final message when exit code != 0
-  #   all:     Running output updates + final message (default)
-  background_process_notifications: all
+  #   error:   Only the final message when exit code != 0 (default)
+  #   all:     Running output updates + final message
+  background_process_notifications: error
 
 
   # Play terminal bell when agent finishes a response.

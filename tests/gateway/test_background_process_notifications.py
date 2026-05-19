@@ -2,7 +2,7 @@
 
 The gateway process watcher pushes status updates to users' chats when
 background terminal commands run.  ``display.background_process_notifications``
-controls verbosity: off | result | error | all (default).
+controls verbosity: off | result | error (default) | all.
 
 Contributed by @PeterFile (PR #593), reimplemented on current main.
 """
@@ -71,11 +71,11 @@ def _watcher_dict(session_id="proc_test", thread_id=""):
 
 class TestLoadBackgroundNotificationsMode:
 
-    def test_defaults_to_all(self, monkeypatch, tmp_path):
+    def test_defaults_to_error(self, monkeypatch, tmp_path):
         import gateway.run as gw
         monkeypatch.setattr(gw, "_hermes_home", tmp_path)
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
-        assert GatewayRunner._load_background_notifications_mode() == "all"
+        assert GatewayRunner._load_background_notifications_mode() == "error"
 
     def test_reads_config_yaml(self, monkeypatch, tmp_path):
         (tmp_path / "config.yaml").write_text(
@@ -104,14 +104,14 @@ class TestLoadBackgroundNotificationsMode:
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
         assert GatewayRunner._load_background_notifications_mode() == "off"
 
-    def test_invalid_value_defaults_to_all(self, monkeypatch, tmp_path):
+    def test_invalid_value_defaults_to_error(self, monkeypatch, tmp_path):
         (tmp_path / "config.yaml").write_text(
             "display:\n  background_process_notifications: banana\n"
         )
         import gateway.run as gw
         monkeypatch.setattr(gw, "_hermes_home", tmp_path)
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
-        assert GatewayRunner._load_background_notifications_mode() == "all"
+        assert GatewayRunner._load_background_notifications_mode() == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +321,72 @@ async def test_agent_notification_carries_message_id_reply_anchor(monkeypatch, t
     assert synth_event.internal is True
     assert synth_event.message_id == "555"
     assert synth_event.source.thread_id == "24296"
+
+
+@pytest.mark.asyncio
+async def test_agent_notification_success_is_quiet_in_default_error_mode(monkeypatch, tmp_path):
+    """Successful notify_on_complete events do not inject raw completion payloads
+    when the gateway is in the default/error notification mode."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="lots of noisy build output\n", exited=True, exit_code=0, command="make build",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "error")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    watcher = {
+        "session_id": "proc_success_quiet",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123:24296",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "notify_on_complete": True,
+    }
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_notification_failure_still_injects_in_default_error_mode(monkeypatch, tmp_path):
+    """Failed notify_on_complete events still surface in the default/error mode."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="traceback\n", exited=True, exit_code=1, command="make build",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "error")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    watcher = {
+        "session_id": "proc_failure_visible",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123:24296",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "notify_on_complete": True,
+    }
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert "proc_failure_visible" in synth_event.text
+    assert "traceback" in synth_event.text
 
 
 @pytest.mark.asyncio
