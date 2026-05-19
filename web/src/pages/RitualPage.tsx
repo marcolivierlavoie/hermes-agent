@@ -15,21 +15,47 @@ const QUESTIONS = [
   "2. Influence: What is one part I can nudge, ask for, or prepare?",
   "3. No Control: What part can I release for now?",
   "4. Distortion check: Am I mind-reading, catastrophizing, all-or-nothing thinking, should-ing, or discounting positives?",
-  "5. Balanced thought: What is a kinder, more accurate sentence I can believe at least 10%?",
-  "6. One small action: What is the next 2-minute step?",
-  "7. Evidence point: What is one fact that I have handled something like this before?",
+  "5. Pattern to watch: Which thinking pattern do I want to notice today?",
+  "6. Cue to catch it: What cue will tell me this pattern is starting? Pick, edit, or write my own.",
+  "7. Pause/name/reset: What simple move will I use when the selected pattern and cue show up?",
 ] as const;
-const CLOSE = "Close: choose the small action, then stop the loop.";
+const CLOSE = "Close: use the pause/name/reset move, then stop the loop.";
 
 const EXPLANATIONS = [
   "Name the part that is genuinely inside your next choices: a boundary, a message, a tiny action, a breath, or how you frame the problem.",
   "Name a gentle lever: something you can ask, prepare, clarify, schedule, or make easier, without pretending you control the outcome.",
   "Name the piece that is not yours to solve right now. Releasing is not approval; it is refusing to keep carrying what cannot be moved by rumination.",
   "Look for common brain shortcuts: mind-reading, catastrophizing, all-or-nothing thinking, should-ing, or ignoring evidence that things are not all bad.",
-  "Write one sentence that is kinder and more accurate than the worry story. It only needs to feel 10% believable.",
-  "Choose the smallest visible next move, ideally something that takes two minutes or less.",
-  "Find one factual receipt from your life that says: I have survived, learned, repaired, asked for help, or handled something adjacent before.",
+  "Choose one pattern to watch without arguing with it. Naming it early is the practice.",
+  "Pick a cue that is easy to notice in real time. You can use a suggestion as-is, edit it, or write a custom cue.",
+  "Keep the reset tiny: pause, name the pattern, then do one grounding move or next-right action.",
 ] as const;
+
+const THINKING_PATTERNS = [
+  "mind-reading",
+  "catastrophizing",
+  "all-or-nothing thinking",
+  "should-ing",
+  "discounting positives",
+] as const;
+
+const CUE_SUGGESTIONS: Record<string, string[]> = {
+  "mind-reading": ["I am assuming what someone thinks before asking", "I start treating silence as evidence", "I replay a message looking for hidden meaning"],
+  catastrophizing: ["My mind jumps straight to the worst outcome", "I feel urgency before I have facts", "I use always/never language about what will happen"],
+  "all-or-nothing thinking": ["I call the day a win or a failure", "One imperfect moment starts feeling like the whole story", "I notice only two options"],
+  "should-ing": ["My sentence starts with I should or I have to", "I turn a preference into a rule", "I feel guilty before checking what matters"],
+  "discounting positives": ["I explain away something that went well", "A compliment or win feels like it does not count", "I skip over evidence that I am trying"],
+  default: ["My body gets tight before I have the facts", "I hear a familiar harsh phrase", "The loop repeats more than twice"],
+};
+
+const RESET_SUGGESTIONS: Record<string, string[]> = {
+  "mind-reading": ["Pause; name mind-reading; ask for one real fact or one clean question", "Hand on chest; say maybe, not proven; wait for evidence"],
+  catastrophizing: ["Pause; name catastrophizing; ask what is the next safe step", "Exhale longer than inhale; write the most likely outcome"],
+  "all-or-nothing thinking": ["Pause; name all-or-nothing; find the 10% middle", "Say both/and once, then choose one small next move"],
+  "should-ing": ["Pause; name should-ing; swap should for I choose or I prefer", "Ask whose rule this is, then pick the kind next step"],
+  "discounting positives": ["Pause; name discounting positives; count one thing that still counts", "Put one real receipt beside the worry before moving on"],
+  default: ["Pause; name the pattern; take one slow breath; choose one next-right action", "Feet on floor; label the loop; return to one controllable step"],
+};
 
 type RitualAnswer = {
   questionIndex: number;
@@ -123,6 +149,34 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(date);
 }
 
+function answerFor(state: RitualState, questionIndex: number): string {
+  return state.answers.find((answer) => answer.questionIndex === questionIndex && !answer.skipped)?.answer?.trim() ?? "";
+}
+
+function normalizePattern(value: string): string {
+  const lower = value.toLowerCase();
+  return THINKING_PATTERNS.find((pattern) => lower.includes(pattern)) ?? "default";
+}
+
+function selectedPatternLabel(state: RitualState): string {
+  const answer = answerFor(state, 4);
+  const pattern = normalizePattern(answer);
+  return pattern === "default" ? answer || "the selected pattern" : pattern;
+}
+
+function suggestionOptions(state: RitualState): string[] {
+  if (state.questionIndex === 4) return [...THINKING_PATTERNS];
+  if (state.questionIndex === 5) return CUE_SUGGESTIONS[normalizePattern(answerFor(state, 4))] ?? CUE_SUGGESTIONS.default;
+  if (state.questionIndex === 6) {
+    const pattern = normalizePattern(answerFor(state, 4));
+    const cue = answerFor(state, 5);
+    const base = RESET_SUGGESTIONS[pattern] ?? RESET_SUGGESTIONS.default;
+    if (!cue) return base;
+    return [`Pause; name ${selectedPatternLabel(state)}; reset when I notice: ${cue}`, ...base];
+  }
+  return [];
+}
+
 export default function RitualPage() {
   const [state, setState] = useState<RitualState>(() => {
     if (typeof window === "undefined") return freshState();
@@ -146,6 +200,7 @@ export default function RitualPage() {
   const complete = !state.active || state.questionIndex >= QUESTIONS.length;
   const progress = Math.min(state.questionIndex + (complete ? 0 : 1), QUESTIONS.length);
   const answeredCount = state.answers.length;
+  const suggestions = useMemo(() => suggestionOptions(state), [state]);
 
   const statusLabel = useMemo(() => {
     if (state.exitReason === "completed") return "Complete";
@@ -282,6 +337,34 @@ export default function RitualPage() {
                   {showExplain && (
                     <div className="rounded-3xl border border-[color-mix(in_srgb,var(--cockpit-secondary)_40%,transparent)] bg-[color-mix(in_srgb,var(--cockpit-secondary)_10%,transparent)] p-4 text-sm leading-6 text-[color-mix(in_srgb,var(--cockpit-text)_82%,transparent)]">
                       {EXPLANATIONS[state.questionIndex]}
+                    </div>
+                  )}
+
+                  {suggestions.length > 0 && (
+                    <div className="space-y-3 rounded-3xl border border-[var(--cockpit-border)] bg-[var(--cockpit-card-raised)] p-4" data-testid="ritual-adaptive-suggestions">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-xs uppercase tracking-[0.18em] text-[var(--cockpit-muted)]">Adaptive suggestions</p>
+                        <span className="text-xs text-[var(--cockpit-muted)]">Pick, edit, or custom</span>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {suggestions.map((suggestion) => (
+                          <button
+                            key={suggestion}
+                            type="button"
+                            onClick={() => handleDraftChange(suggestion)}
+                            className="rounded-2xl border border-[var(--cockpit-border)] px-3 py-2 text-left text-sm leading-5 text-[color-mix(in_srgb,var(--cockpit-text)_86%,transparent)] transition hover:border-[color-mix(in_srgb,var(--cockpit-active)_55%,transparent)] hover:text-[var(--cockpit-text)]"
+                          >
+                            {suggestion}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          onClick={() => handleDraftChange("")}
+                          className="rounded-2xl border border-[var(--cockpit-border)] px-3 py-2 text-sm text-[var(--cockpit-muted)] transition hover:text-[var(--cockpit-text)]"
+                        >
+                          Custom answer
+                        </button>
+                      </div>
                     </div>
                   )}
 

@@ -11,6 +11,7 @@ API = ROOT / "web" / "src" / "lib" / "api.ts"
 COCKPIT_PAGE = ROOT / "web" / "src" / "pages" / "CockpitPage.tsx"
 CHAT_PAGE = ROOT / "web" / "src" / "pages" / "ChatPage.tsx"
 RITUAL_PAGE = ROOT / "web" / "src" / "pages" / "RitualPage.tsx"
+DAILY_HEALTH_FLOW = ROOT.parent / "plugins" / "daily_health_flow" / "flow.py"
 INDEX_HTML = ROOT / "web" / "index.html"
 VITE_CONFIG = ROOT / "web" / "vite.config.ts"
 MANIFEST = ROOT / "web" / "public" / "cockpit.webmanifest"
@@ -63,6 +64,47 @@ def test_ritual_surface_route_and_nav_are_registered():
     assert "expireIfInactive" in page
     assert "inactivity_timeout" in page
     assert "Timed out after" in page
+    for marker in FORBIDDEN_PAGE_MARKERS:
+        assert marker not in page
+
+
+def test_ritual_distortion_awareness_prompts_and_adaptive_suggestions_are_local_only():
+    page = RITUAL_PAGE.read_text(encoding="utf-8")
+    flow = DAILY_HEALTH_FLOW.read_text(encoding="utf-8")
+
+    unchanged_prompts = (
+        "1. Control: What is one part I directly control?",
+        "2. Influence: What is one part I can nudge, ask for, or prepare?",
+        "3. No Control: What part can I release for now?",
+        "4. Distortion check: Am I mind-reading, catastrophizing, all-or-nothing thinking, should-ing, or discounting positives?",
+    )
+    new_prompts = (
+        "5. Pattern to watch: Which thinking pattern do I want to notice today?",
+        "6. Cue to catch it: What cue will tell me this pattern is starting? Pick, edit, or write my own.",
+        "7. Pause/name/reset: What simple move will I use when the selected pattern and cue show up?",
+    )
+    adaptive_markers = (
+        "THINKING_PATTERNS",
+        "CUE_SUGGESTIONS",
+        "RESET_SUGGESTIONS",
+        "Adaptive suggestions",
+        "Pick, edit, or custom",
+        "ritual-adaptive-suggestions",
+        "selectedPatternLabel",
+    )
+
+    for prompt in unchanged_prompts + new_prompts:
+        assert prompt in page
+        assert prompt in flow
+    for removed_prompt in ("Balanced thought", "One small action", "Evidence point"):
+        assert removed_prompt not in page
+        assert removed_prompt not in flow
+    for marker in adaptive_markers:
+        assert marker in page
+    for marker in ("THINKING_PATTERNS", "CUE_SUGGESTIONS", "RESET_SUGGESTIONS", "adaptive_suggestions", "pick one, edit it, or write a custom answer"):
+        assert marker in flow
+    assert "localStorage" in page
+    assert "no API writes" in page
     for marker in FORBIDDEN_PAGE_MARKERS:
         assert marker not in page
 
