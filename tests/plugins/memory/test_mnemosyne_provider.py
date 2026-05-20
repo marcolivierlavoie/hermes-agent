@@ -242,6 +242,148 @@ def test_tool_hygiene_report_action_does_not_auto_suppress(tmp_path):
     assert provider.inspect(stale["id"])["suppressed"] is False
 
 
+def test_structured_fact_candidate_approval_recall_and_supersession(tmp_path):
+    provider = _provider(tmp_path)
+
+    queued = provider.add_structured_fact_candidate(
+        subject="n8n prod",
+        relation="runs_at",
+        object="https://biff.tail460c2.ts.net:5678/",
+        source="BIF-623 fixture",
+        context="structured operational fact recall",
+        rationale="prove exact URL lookup without fuzzy prose recall",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+    )
+
+    assert queued["success"] is True
+    candidate = queued["candidate"]
+    assert candidate["id"].startswith("sf_cand_")
+    assert candidate["status"] == "pending"
+    assert provider.recall_structured_facts("where does n8n prod run?")["facts"] == []
+
+    approved = provider.approve_structured_fact_candidate(candidate_id=candidate["id"], rationale="fixture approval")
+
+    assert approved["success"] is True
+    fact = approved["fact"]
+    assert fact["id"].startswith("sf_")
+    assert fact["subject"] == "n8n prod"
+    assert fact["relation"] == "runs_at"
+    assert fact["object"] == "https://biff.tail460c2.ts.net:5678/"
+    assert fact["source"] == "BIF-623 fixture"
+    assert fact["created_at"].endswith("Z")
+
+    recalled = provider.recall_structured_facts("where does n8n prod run?", limit=5)
+    assert recalled["success"] is True
+    assert recalled["facts"][0]["fact"]["id"] == fact["id"]
+    assert recalled["facts"][0]["fact"]["object"] == "https://biff.tail460c2.ts.net:5678/"
+
+    replacement_candidate = provider.add_structured_fact_candidate(
+        subject="n8n prod",
+        relation="runs_at",
+        object="https://n8n.example.invalid/",
+        source="BIF-623 fixture replacement",
+        context="structured operational fact recall",
+        rationale="prove supersession excludes old fact",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+        supersedes=[fact["id"]],
+    )["candidate"]
+    replacement = provider.approve_structured_fact_candidate(candidate_id=replacement_candidate["id"], rationale="fixture replacement")["fact"]
+
+    recalled_after_supersession = provider.recall_structured_facts("where does n8n prod run?", limit=5)
+    recalled_ids = [item["fact"]["id"] for item in recalled_after_supersession["facts"]]
+    assert replacement["id"] in recalled_ids
+    assert fact["id"] not in recalled_ids
+
+
+def test_structured_fact_conflicts_fail_closed_and_suppression_excludes(tmp_path):
+    provider = _provider(tmp_path)
+    first = provider.add_structured_fact(
+        subject="dashboard",
+        relation="lives_at",
+        object="https://one.example.invalid/",
+        source="BIF-623 conflict fixture",
+        context="first active fact",
+        rationale="prove conflict metadata is explicit",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+        conflict_group="dashboard-url",
+        conflict_status="active",
+    )["fact"]
+    second = provider.add_structured_fact(
+        subject="dashboard",
+        relation="lives_at",
+        object="https://two.example.invalid/",
+        source="BIF-623 conflict fixture",
+        context="second active fact",
+        rationale="prove conflict metadata is explicit",
+        confidence="high",
+        sensitivity="non_sensitive",
+        stability="stable",
+        current_request_safe=True,
+        conflict_group="dashboard-url",
+        conflict_status="active",
+    )["fact"]
+
+    conflicted = provider.recall_structured_facts("where does dashboard live?", limit=5)
+
+    assert conflicted["success"] is True
+    assert conflicted["conflict_detected"] is True
+    assert conflicted["facts"] == []
+    assert set(conflicted["conflict_fact_ids"]) == {first["id"], second["id"]}
+
+    provider.suppress_structured_fact(fact_id=second["id"], rationale="resolve conflict for default recall", source="BIF-623 test")
+    recalled = provider.recall_structured_facts("where does dashboard live?", limit=5)
+
+    assert recalled["conflict_detected"] is False
+    assert [item["fact"]["id"] for item in recalled["facts"]] == [first["id"]]
+
+
+def test_structured_fact_tool_surface_and_operational_recall_precedence(tmp_path):
+    provider = _provider(tmp_path)
+    provider.add_memory(
+        content="Old prose says n8n prod might run at http://localhost:5678.",
+        source="legacy prose",
+        context="semantic memory fixture",
+        rationale="structured exact fact should be returned first",
+    )
+    queued = json.loads(provider.handle_tool_call(
+        "mnemosyne_memory",
+        {
+            "action": "add_structured_fact_candidate",
+            "subject": "n8n prod",
+            "relation": "runs_at",
+            "object": "https://biff.tail460c2.ts.net:5678/",
+            "source": "BIF-623 tool fixture",
+            "context": "tool structured fact candidate",
+            "rationale": "prove tool candidate-first behavior",
+            "confidence": "high",
+            "sensitivity": "non_sensitive",
+            "stability": "stable",
+            "current_request_safe": True,
+        },
+    ))["candidate"]
+    json.loads(provider.handle_tool_call(
+        "mnemosyne_memory",
+        {"action": "approve_structured_fact_candidate", "candidate_id": queued["id"], "rationale": "approve fixture"},
+    ))
+
+    recalled = json.loads(provider.handle_tool_call(
+        "mnemosyne_memory",
+        {"action": "recall", "query": "where does n8n prod run?", "limit": 5},
+    ))
+
+    assert recalled["structured_facts"][0]["fact"]["object"] == "https://biff.tail460c2.ts.net:5678/"
+    assert recalled["memories"][0]["memory"]["content"].startswith("Old prose")
+
+
 def test_bif_568_recall_quality_regression_matrix(tmp_path):
     provider = _provider(tmp_path)
     fixtures = [

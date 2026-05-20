@@ -124,6 +124,57 @@ class MnemosyneSuppression:
     unsuppress_rationale: str | None = None
 
 
+@dataclass
+class MnemosyneStructuredFact:
+    id: str
+    subject: str
+    relation: str
+    object: str
+    source: str
+    context: str
+    rationale: str
+    created_at: str
+    created_by: str = "mnemosyne-isolated-pilot"
+    confidence: str = "unknown"
+    sensitivity: str = "unknown"
+    stability: str = "unknown"
+    current_request_safe: bool = False
+    topic: str = ""
+    conflict_group: str = ""
+    conflict_status: str = "unknown"
+    supersedes: List[str] | None = None
+    superseded_by: str = ""
+    valid_from: str = ""
+    valid_until: str = ""
+
+
+@dataclass
+class MnemosyneStructuredFactCandidate:
+    id: str
+    subject: str
+    relation: str
+    object: str
+    source: str
+    context: str
+    rationale: str
+    created_at: str
+    proposed_by: str = "mnemosyne-isolated-pilot"
+    status: str = "pending"
+    confidence: str = "unknown"
+    sensitivity: str = "unknown"
+    stability: str = "unknown"
+    current_request_safe: bool = False
+    topic: str = ""
+    conflict_group: str = ""
+    conflict_status: str = "unknown"
+    supersedes: List[str] | None = None
+    valid_from: str = ""
+    valid_until: str = ""
+    decision_rationale: str = ""
+    decided_at: str = ""
+    approved_fact_id: str = ""
+
+
 class MnemosyneProvider(MemoryProvider):
     """Profile-scoped, local-only memory pilot with non-destructive suppression."""
 
@@ -146,6 +197,9 @@ class MnemosyneProvider(MemoryProvider):
         self._memories_path = self._root / "memories.jsonl"
         self._suppressions_path = self._root / "suppressions.jsonl"
         self._candidates_path = self._root / "candidates.jsonl"
+        self._structured_facts_path = self._root / "structured_facts.jsonl"
+        self._structured_fact_candidates_path = self._root / "structured_fact_candidates.jsonl"
+        self._structured_fact_suppressions_path = self._root / "structured_fact_suppressions.jsonl"
         self._events_path = self._root / "events.jsonl"
         self._last_prefetch_trace: Dict[str, Any] = {}
 
@@ -179,6 +233,9 @@ class MnemosyneProvider(MemoryProvider):
             self._memories_path = self._root / "memories.jsonl"
             self._suppressions_path = self._root / "suppressions.jsonl"
             self._candidates_path = self._root / "candidates.jsonl"
+            self._structured_facts_path = self._root / "structured_facts.jsonl"
+            self._structured_fact_candidates_path = self._root / "structured_fact_candidates.jsonl"
+            self._structured_fact_suppressions_path = self._root / "structured_fact_suppressions.jsonl"
             self._events_path = self._root / "events.jsonl"
         self.data_dir = Path(os.environ.get("MNEMOSYNE_DATA_DIR", self._effective_mnemosyne_root(self.hermes_home) / "data")).expanduser()
         self.config = self._load_config()
@@ -191,6 +248,9 @@ class MnemosyneProvider(MemoryProvider):
         self._memories_path.touch(exist_ok=True)
         self._suppressions_path.touch(exist_ok=True)
         self._candidates_path.touch(exist_ok=True)
+        self._structured_facts_path.touch(exist_ok=True)
+        self._structured_fact_candidates_path.touch(exist_ok=True)
+        self._structured_fact_suppressions_path.touch(exist_ok=True)
         self._events_path.touch(exist_ok=True)
         self._store_path().touch(exist_ok=True)
 
@@ -348,9 +408,16 @@ class MnemosyneProvider(MemoryProvider):
                                 "memory_digest", "decisions_digest", "recall_policy", "semantic_quality_gates",
                                 "production_eval_pack", "run_production_eval", "explain_memory", "answer_attribution", "semantic_recall",
                                 "harvest_candidates", "apply_correction", "discord_decision_digest",
+                                "add_structured_fact_candidate", "list_structured_fact_candidates", "approve_structured_fact_candidate",
+                                "reject_structured_fact_candidate", "structured_recall", "recall_structured_facts",
+                                "suppress_structured_fact", "unsuppress_structured_fact",
                             ],
                         },
                         "content": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "relation": {"type": "string"},
+                        "object": {"type": "string"},
+                        "fact_id": {"type": "string"},
                         "query": {"type": "string"},
                         "memory_id": {"type": "string"},
                         "memory_ids": {"type": "array", "items": {"type": "string"}},
@@ -405,9 +472,39 @@ class MnemosyneProvider(MemoryProvider):
                 return _json_result(self.approve_candidate(candidate_id=str(args.get("candidate_id") or ""), rationale=str(args.get("rationale") or "")))
             if action == "reject_candidate":
                 return _json_result(self.reject_candidate(candidate_id=str(args.get("candidate_id") or ""), rationale=str(args.get("rationale") or "")))
+            if action == "add_structured_fact_candidate":
+                return _json_result(self.add_structured_fact_candidate(**self._structured_fact_args_from_tool(args)))
+            if action == "list_structured_fact_candidates":
+                return _json_result({"success": True, "candidates": self.list_structured_fact_candidates(status=str(args.get("status") or "pending"))})
+            if action == "approve_structured_fact_candidate":
+                return _json_result(self.approve_structured_fact_candidate(candidate_id=str(args.get("candidate_id") or ""), rationale=str(args.get("rationale") or "")))
+            if action == "reject_structured_fact_candidate":
+                return _json_result(self.reject_structured_fact_candidate(candidate_id=str(args.get("candidate_id") or ""), rationale=str(args.get("rationale") or "")))
+            if action in {"structured_recall", "recall_structured_facts"}:
+                return _json_result(self.recall_structured_facts(
+                    str(args.get("query") or ""),
+                    limit=int(args.get("limit") or 5),
+                    include_suppressed=bool(args.get("include_suppressed") or False),
+                ))
+            if action == "suppress_structured_fact":
+                return _json_result(self.suppress_structured_fact(
+                    fact_id=str(args.get("fact_id") or args.get("memory_id") or ""),
+                    rationale=str(args.get("rationale") or ""),
+                    source=str(args.get("source") or "mnemosyne_memory"),
+                ))
+            if action == "unsuppress_structured_fact":
+                return _json_result(self.unsuppress_structured_fact(fact_id=str(args.get("fact_id") or args.get("memory_id") or ""), rationale=str(args.get("rationale") or "")))
             if action == "recall":
+                structured = self.recall_structured_facts(
+                    str(args.get("query") or ""),
+                    limit=int(args.get("limit") or 5),
+                    include_suppressed=bool(args.get("include_suppressed") or False),
+                )
                 return _json_result({
                     "success": True,
+                    "structured_facts": structured.get("facts", []),
+                    "structured_conflict_detected": structured.get("conflict_detected", False),
+                    "structured_conflict_fact_ids": structured.get("conflict_fact_ids", []),
                     "memories": self.recall(
                         str(args.get("query") or ""),
                         limit=int(args.get("limit") or 5),
@@ -622,6 +719,207 @@ class MnemosyneProvider(MemoryProvider):
             self._write_jsonl(self._candidates_path, rows)
             return {"success": True, "candidate": row, "mutated_memory": False}
         return {"success": False, "error": f"Candidate not found: {candidate_id}"}
+
+    def add_structured_fact(
+        self,
+        *,
+        subject: str,
+        relation: str,
+        object: str,
+        source: str,
+        context: str,
+        rationale: str,
+        confidence: str = "unknown",
+        sensitivity: str = "unknown",
+        stability: str = "unknown",
+        current_request_safe: bool = False,
+        topic: str = "",
+        conflict_group: str = "",
+        conflict_status: str = "unknown",
+        supersedes: List[str] | None = None,
+        valid_from: str = "",
+        valid_until: str = "",
+    ) -> Dict[str, Any]:
+        validation = self._validate_structured_fact_fields(subject=subject, relation=relation, object=object, source=source, context=context, rationale=rationale)
+        if validation:
+            return validation
+        fact = MnemosyneStructuredFact(
+            id=f"sf_{uuid.uuid4().hex[:12]}",
+            subject=subject.strip(),
+            relation=self._normalize_relation(relation),
+            object=object.strip(),
+            source=source.strip(),
+            context=context.strip(),
+            rationale=rationale.strip(),
+            created_at=_now_iso(),
+            confidence=self._normalize_choice(confidence, {"high", "medium", "low", "unknown"}, default="unknown"),
+            sensitivity=self._normalize_choice(sensitivity, {"non_sensitive", "sensitive", "secret", "unknown"}, default="unknown"),
+            stability=self._normalize_choice(stability, {"stable", "current", "temporary", "stale", "unknown"}, default="unknown"),
+            current_request_safe=bool(current_request_safe),
+            topic=topic.strip(),
+            conflict_group=conflict_group.strip(),
+            conflict_status=self._normalize_choice(conflict_status, {"unknown", "active", "resolved", "superseded"}, default="unknown"),
+            supersedes=self._normalize_ids(supersedes),
+            valid_from=valid_from.strip(),
+            valid_until=valid_until.strip(),
+        )
+        row = asdict(fact)
+        self._append_jsonl(self._structured_facts_path, row)
+        self._apply_structured_fact_supersession(row)
+        return {"success": True, "fact": row}
+
+    def add_structured_fact_candidate(self, **kwargs) -> Dict[str, Any]:
+        config = self._load_config()
+        if config.get("candidate_queue_enabled") is False or config.get("candidate_writeback_enabled") is False:
+            return {"success": False, "error": "Candidate writeback is disabled by config.", "mutated_memory": False}
+        validation = self._validate_structured_fact_fields(
+            subject=str(kwargs.get("subject") or ""),
+            relation=str(kwargs.get("relation") or ""),
+            object=str(kwargs.get("object") or ""),
+            source=str(kwargs.get("source") or ""),
+            context=str(kwargs.get("context") or ""),
+            rationale=str(kwargs.get("rationale") or ""),
+        )
+        if validation:
+            validation["mutated_memory"] = False
+            return validation
+        candidate_text = "\n".join(str(kwargs.get(key) or "") for key in ("subject", "relation", "object", "source", "context", "rationale"))
+        if self._has_secret_marker(candidate_text):
+            return {"success": False, "error": "Refusing to queue likely secret-bearing structured fact.", "mutated_memory": False}
+        candidate = MnemosyneStructuredFactCandidate(
+            id=f"sf_cand_{uuid.uuid4().hex[:12]}",
+            subject=str(kwargs.get("subject") or "").strip(),
+            relation=self._normalize_relation(str(kwargs.get("relation") or "")),
+            object=str(kwargs.get("object") or "").strip(),
+            source=str(kwargs.get("source") or "").strip(),
+            context=str(kwargs.get("context") or "").strip(),
+            rationale=str(kwargs.get("rationale") or "").strip(),
+            created_at=_now_iso(),
+            confidence=self._normalize_choice(kwargs.get("confidence"), {"high", "medium", "low", "unknown"}, default="unknown"),
+            sensitivity=self._normalize_choice(kwargs.get("sensitivity"), {"non_sensitive", "sensitive", "secret", "unknown"}, default="unknown"),
+            stability=self._normalize_choice(kwargs.get("stability"), {"stable", "current", "temporary", "stale", "unknown"}, default="unknown"),
+            current_request_safe=bool(kwargs.get("current_request_safe") or False),
+            topic=str(kwargs.get("topic") or "").strip(),
+            conflict_group=str(kwargs.get("conflict_group") or "").strip(),
+            conflict_status=self._normalize_choice(kwargs.get("conflict_status"), {"unknown", "active", "resolved", "superseded"}, default="unknown"),
+            supersedes=self._normalize_ids(kwargs.get("supersedes") if isinstance(kwargs.get("supersedes"), list) else None),
+            valid_from=str(kwargs.get("valid_from") or "").strip(),
+            valid_until=str(kwargs.get("valid_until") or "").strip(),
+        )
+        row = asdict(candidate)
+        self._append_jsonl(self._structured_fact_candidates_path, row)
+        return {"success": True, "candidate": row, "mutated_memory": False}
+
+    def list_structured_fact_candidates(self, *, status: str = "pending") -> List[Dict[str, Any]]:
+        normalized = self._normalize_choice(status, {"pending", "approved", "rejected", "all"}, default="pending")
+        rows = self._read_jsonl(self._structured_fact_candidates_path)
+        if normalized == "all":
+            return rows
+        return [row for row in rows if row.get("status", "pending") == normalized]
+
+    def approve_structured_fact_candidate(self, *, candidate_id: str, rationale: str = "") -> Dict[str, Any]:
+        candidate_id = candidate_id.strip()
+        rows = self._read_jsonl(self._structured_fact_candidates_path)
+        for row in rows:
+            if row.get("id") != candidate_id:
+                continue
+            if row.get("status", "pending") != "pending":
+                return {"success": False, "error": f"Structured fact candidate is not pending: {candidate_id}"}
+            fact_args = {k: row.get(k) for k in (
+                "subject", "relation", "object", "source", "context", "confidence", "sensitivity", "stability", "current_request_safe",
+                "topic", "conflict_group", "conflict_status", "supersedes", "valid_from", "valid_until",
+            )}
+            fact_args["rationale"] = rationale.strip() or str(row.get("rationale") or "")
+            approved = self.add_structured_fact(**fact_args)
+            if not approved.get("success"):
+                return approved
+            row["status"] = "approved"
+            row["decision_rationale"] = rationale.strip()
+            row["decided_at"] = _now_iso()
+            row["approved_fact_id"] = approved["fact"]["id"]
+            self._write_jsonl(self._structured_fact_candidates_path, rows)
+            return {"success": True, "candidate": row, "fact": approved["fact"]}
+        return {"success": False, "error": f"Structured fact candidate not found: {candidate_id}"}
+
+    def reject_structured_fact_candidate(self, *, candidate_id: str, rationale: str) -> Dict[str, Any]:
+        candidate_id = candidate_id.strip()
+        rationale = rationale.strip()
+        if not candidate_id or not rationale:
+            return {"success": False, "error": "candidate_id and rationale are required for structured fact rejection.", "mutated_memory": False}
+        rows = self._read_jsonl(self._structured_fact_candidates_path)
+        for row in rows:
+            if row.get("id") != candidate_id:
+                continue
+            if row.get("status", "pending") != "pending":
+                return {"success": False, "error": f"Structured fact candidate is not pending: {candidate_id}", "mutated_memory": False}
+            row["status"] = "rejected"
+            row["decision_rationale"] = rationale
+            row["decided_at"] = _now_iso()
+            self._write_jsonl(self._structured_fact_candidates_path, rows)
+            return {"success": True, "candidate": row, "mutated_memory": False}
+        return {"success": False, "error": f"Structured fact candidate not found: {candidate_id}", "mutated_memory": False}
+
+    def recall_structured_facts(self, query: str, *, limit: int = 5, include_suppressed: bool = False) -> Dict[str, Any]:
+        q_tokens = _tokens(query)
+        active = self._active_structured_fact_suppressed_ids()
+        scored: List[tuple[int, Dict[str, Any]]] = []
+        for fact in self._read_jsonl(self._structured_facts_path):
+            fact_id = str(fact.get("id") or "")
+            suppressed = fact_id in active
+            if suppressed and not include_suppressed:
+                continue
+            if str(fact.get("superseded_by") or "") and not include_suppressed:
+                continue
+            if str(fact.get("conflict_status") or "unknown") == "superseded" and not include_suppressed:
+                continue
+            haystack = self._structured_fact_haystack(fact)
+            f_tokens = _tokens(haystack)
+            score = len(q_tokens & f_tokens) if q_tokens else 1
+            score += self._structured_relation_query_bonus(str(fact.get("relation") or ""), str(query or ""))
+            if query and query.lower() in haystack.lower():
+                score += 5
+            if score <= 0:
+                continue
+            scored.append((score, self._structured_fact_result(fact, score=score, suppressed=suppressed)))
+        scored.sort(key=lambda item: (-item[0], item[1]["fact"].get("created_at", "")))
+        results = [item for _, item in scored[: max(1, min(int(limit or 5), 20))]]
+        conflict_ids = self._structured_conflict_ids([item["fact"] for item in results])
+        if conflict_ids and not include_suppressed:
+            return {"success": True, "facts": [], "conflict_detected": True, "conflict_fact_ids": conflict_ids, "mutated": False}
+        return {"success": True, "facts": results, "conflict_detected": False, "conflict_fact_ids": [], "mutated": False}
+
+    def suppress_structured_fact(self, *, fact_id: str, rationale: str, source: str) -> Dict[str, Any]:
+        fact_id = fact_id.strip()
+        rationale = rationale.strip()
+        source = source.strip() or "mnemosyne_memory"
+        if not fact_id or not rationale:
+            return {"success": False, "error": "fact_id and rationale are required for structured fact suppression."}
+        if not self._structured_fact_by_id(fact_id):
+            return {"success": False, "error": f"Structured fact not found: {fact_id}"}
+        existing = self._active_structured_fact_suppression(fact_id)
+        if existing:
+            return {"success": True, "suppression": existing, "message": "Structured fact already suppressed."}
+        suppression = MnemosyneSuppression(id=f"sf_sup_{uuid.uuid4().hex[:12]}", memory_id=fact_id, rationale=rationale, source=source, created_at=_now_iso())
+        self._append_jsonl(self._structured_fact_suppressions_path, asdict(suppression))
+        return {"success": True, "suppression": asdict(suppression)}
+
+    def unsuppress_structured_fact(self, *, fact_id: str, rationale: str) -> Dict[str, Any]:
+        fact_id = fact_id.strip()
+        rationale = rationale.strip()
+        if not fact_id or not rationale:
+            return {"success": False, "error": "fact_id and rationale are required for structured fact unsuppress."}
+        suppressions = self._read_jsonl(self._structured_fact_suppressions_path)
+        changed = False
+        for row in suppressions:
+            if row.get("memory_id") == fact_id and row.get("active", True):
+                row["active"] = False
+                row["unsuppressed_at"] = _now_iso()
+                row["unsuppress_rationale"] = rationale
+                changed = True
+        if not changed:
+            return {"success": False, "error": f"No active structured fact suppression found for {fact_id}"}
+        self._write_jsonl(self._structured_fact_suppressions_path, suppressions)
+        return {"success": True, "fact_id": fact_id, "message": "Structured fact suppression rolled back."}
 
     def seed_source_candidates(self, *, source: str, records: List[Dict[str, Any]], dry_run: bool = True) -> Dict[str, Any]:
         """Stage allowlisted SecondBrain/Linear operating-corpus snippets as candidates only.
@@ -1848,6 +2146,138 @@ class MnemosyneProvider(MemoryProvider):
         blocked = [str(term).lower() for term in config.get("blocked_terms", [])]
         risky = [str(term).lower() for term in config.get("risky_query_terms", [])]
         return self._has_secret_marker(preview) or any(term and term in lowered for term in blocked + risky)
+
+    def _apply_structured_fact_supersession(self, fact: Dict[str, Any]) -> None:
+        supersedes = self._normalize_ids(fact.get("supersedes") if isinstance(fact.get("supersedes"), list) else None)
+        if not supersedes:
+            return
+        rows = self._read_jsonl(self._structured_facts_path)
+        changed = False
+        for row in rows:
+            if row.get("id") in supersedes:
+                row["superseded_by"] = fact.get("id")
+                if not row.get("conflict_status") or row.get("conflict_status") == "unknown":
+                    row["conflict_status"] = "superseded"
+                changed = True
+        if changed:
+            self._write_jsonl(self._structured_facts_path, rows)
+
+    def _structured_fact_by_id(self, fact_id: str) -> Dict[str, Any] | None:
+        for row in self._read_jsonl(self._structured_facts_path):
+            if row.get("id") == fact_id:
+                return row
+        return None
+
+    def _active_structured_fact_suppression(self, fact_id: str) -> Dict[str, Any] | None:
+        for row in reversed(self._read_jsonl(self._structured_fact_suppressions_path)):
+            if row.get("memory_id") == fact_id and row.get("active", True):
+                return row
+        return None
+
+    def _active_structured_fact_suppressed_ids(self) -> set[str]:
+        return {str(row.get("memory_id")) for row in self._read_jsonl(self._structured_fact_suppressions_path) if row.get("active", True)}
+
+    @staticmethod
+    def _structured_fact_haystack(fact: Dict[str, Any]) -> str:
+        return " ".join(str(fact.get(k) or "") for k in (
+            "subject", "relation", "object", "source", "context", "rationale", "topic", "conflict_group"
+        ))
+
+    @staticmethod
+    def _normalize_relation(relation: str) -> str:
+        return re.sub(r"[^a-z0-9_]+", "_", str(relation or "").strip().lower()).strip("_")
+
+    @staticmethod
+    def _structured_relation_query_bonus(relation: str, query: str) -> int:
+        relation = str(relation or "").lower()
+        query = str(query or "").lower()
+        synonyms = {
+            "runs_at": ("run", "runs", "where", "url", "host"),
+            "lives_at": ("live", "lives", "where", "url", "path"),
+            "source_of_truth": ("source", "truth", "canonical"),
+            "resolves_to": ("resolve", "resolves", "credential", "alias"),
+            "uses": ("use", "uses", "tool", "system"),
+        }
+        terms = synonyms.get(relation, tuple(part for part in relation.split("_") if part))
+        return 2 if any(term and term in query for term in terms) else 0
+
+    @staticmethod
+    def _structured_fact_result(fact: Dict[str, Any], *, score: int | None, suppressed: bool) -> Dict[str, Any]:
+        result = {
+            "fact": fact,
+            "suppressed": suppressed,
+            "trusted": True,
+            "source": fact.get("source"),
+            "context": fact.get("context"),
+            "rationale": fact.get("rationale"),
+            "created_at": fact.get("created_at"),
+            "confidence": fact.get("confidence", "unknown"),
+            "sensitivity": fact.get("sensitivity", "unknown"),
+            "stability": fact.get("stability", "unknown"),
+            "current_request_safe": fact.get("current_request_safe", False),
+            "topic": fact.get("topic", ""),
+            "conflict_group": fact.get("conflict_group", ""),
+            "conflict_status": fact.get("conflict_status", "unknown"),
+            "supersedes": fact.get("supersedes") or [],
+            "superseded_by": fact.get("superseded_by", ""),
+            "valid_from": fact.get("valid_from", ""),
+            "valid_until": fact.get("valid_until", ""),
+        }
+        if score is not None:
+            result["score"] = score
+        return result
+
+    @staticmethod
+    def _structured_conflict_ids(facts: List[Dict[str, Any]]) -> List[str]:
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for fact in facts:
+            if str(fact.get("conflict_status") or "unknown") != "active":
+                continue
+            group = str(fact.get("conflict_group") or "").strip().lower()
+            if not group:
+                group = f"{str(fact.get('subject') or '').strip().lower()}::{str(fact.get('relation') or '').strip().lower()}"
+            groups.setdefault(group, []).append(fact)
+        conflict_ids: List[str] = []
+        for rows in groups.values():
+            objects = {str(row.get("object") or "").strip().lower() for row in rows}
+            if len(rows) > 1 and len(objects) > 1:
+                conflict_ids.extend(str(row.get("id") or "") for row in rows if row.get("id"))
+        return sorted(set(conflict_ids))
+
+    def _structured_fact_args_from_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "subject": str(args.get("subject") or ""),
+            "relation": str(args.get("relation") or ""),
+            "object": str(args.get("object") or ""),
+            "source": str(args.get("source") or ""),
+            "context": str(args.get("context") or ""),
+            "rationale": str(args.get("rationale") or ""),
+            "confidence": str(args.get("confidence") or "unknown"),
+            "sensitivity": str(args.get("sensitivity") or "unknown"),
+            "stability": str(args.get("stability") or "unknown"),
+            "current_request_safe": bool(args.get("current_request_safe") or False),
+            "topic": str(args.get("topic") or ""),
+            "conflict_group": str(args.get("conflict_group") or ""),
+            "conflict_status": str(args.get("conflict_status") or "unknown"),
+            "supersedes": args.get("supersedes") if isinstance(args.get("supersedes"), list) else None,
+            "valid_from": str(args.get("valid_from") or ""),
+            "valid_until": str(args.get("valid_until") or ""),
+        }
+
+    @staticmethod
+    def _validate_structured_fact_fields(*, subject: str, relation: str, object: str, source: str, context: str, rationale: str) -> Dict[str, Any] | None:
+        values = {
+            "subject": str(subject or "").strip(),
+            "relation": str(relation or "").strip(),
+            "object": str(object or "").strip(),
+            "source": str(source or "").strip(),
+            "context": str(context or "").strip(),
+            "rationale": str(rationale or "").strip(),
+        }
+        missing = [name for name, value in values.items() if not value]
+        if missing:
+            return {"success": False, "error": f"Missing required structured fact fields: {', '.join(missing)}"}
+        return None
 
     def _memory_args_from_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
         return {
