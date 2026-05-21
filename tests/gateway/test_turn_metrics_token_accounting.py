@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 
-from gateway.run import _gateway_turn_token_metrics, _gateway_turn_wall_metrics
+from gateway.run import (
+    _gateway_hygiene_needs_compress,
+    _gateway_turn_token_metrics,
+    _gateway_turn_wall_metrics,
+)
 
 
 class _Compressor:
@@ -50,9 +54,11 @@ def test_turn_metrics_token_accounting_falls_back_when_counter_resets():
 
 def test_turn_wall_metrics_reports_phase_durations_and_long_turn_counts():
     metrics = _gateway_turn_wall_metrics(
-        wall_time=12.3456,
+        wall_time=13.3456,
+        gateway_pre_agent_time=0.5,
         gateway_prep_time=1.2345,
         agent_loop_time=10.0,
+        gateway_run_agent_overhead_time=0.25,
         gateway_postprocess_time=1.1111,
         long_turn={
             "elapsed_seconds": 9.8765,
@@ -63,13 +69,54 @@ def test_turn_wall_metrics_reports_phase_durations_and_long_turn_counts():
     )
 
     assert metrics == {
-        "wall_time": 12.346,
+        "wall_time": 13.346,
+        "gateway_pre_agent_time": 0.5,
         "gateway_prep_time": 1.234,
         "agent_loop_time": 10.0,
+        "gateway_run_agent_overhead_time": 0.25,
         "gateway_postprocess_time": 1.111,
-        "gateway_other_time": 0.001,
+        "gateway_other_time": 0.251,
         "long_turn_elapsed": 9.877,
         "long_turn_tool_calls": 7,
         "long_turn_checkpoints": 2,
         "long_turn_thresholds": "api_calls",
     }
+
+
+def test_hygiene_skips_hard_message_limit_when_actual_tokens_are_below_threshold():
+    needs_compress, reason = _gateway_hygiene_needs_compress(
+        approx_tokens=114_566,
+        compress_token_threshold=231_200,
+        msg_count=465,
+        hard_msg_limit=400,
+        token_source="actual",
+    )
+
+    assert needs_compress is False
+    assert reason == "below_threshold"
+
+
+def test_hygiene_still_compresses_estimated_runaway_message_counts():
+    needs_compress, reason = _gateway_hygiene_needs_compress(
+        approx_tokens=114_566,
+        compress_token_threshold=231_200,
+        msg_count=465,
+        hard_msg_limit=400,
+        token_source="estimated",
+    )
+
+    assert needs_compress is True
+    assert reason == "hard_message_limit"
+
+
+def test_hygiene_token_threshold_overrides_actual_token_source():
+    needs_compress, reason = _gateway_hygiene_needs_compress(
+        approx_tokens=240_000,
+        compress_token_threshold=231_200,
+        msg_count=100,
+        hard_msg_limit=400,
+        token_source="actual",
+    )
+
+    assert needs_compress is True
+    assert reason == "token_threshold"

@@ -202,22 +202,28 @@ def _metric_seconds(value: Any) -> float:
 def _gateway_turn_wall_metrics(
     *,
     wall_time: Any,
+    gateway_pre_agent_time: Any = 0.0,
     gateway_prep_time: Any,
     agent_loop_time: Any,
+    gateway_run_agent_overhead_time: Any = 0.0,
     gateway_postprocess_time: Any,
     long_turn: Any = None,
 ) -> Dict[str, Any]:
     """Build non-sensitive phase-level wall-clock metrics for a gateway turn."""
     metrics: Dict[str, Any] = {
         "wall_time": _metric_seconds(wall_time),
+        "gateway_pre_agent_time": _metric_seconds(gateway_pre_agent_time),
         "gateway_prep_time": _metric_seconds(gateway_prep_time),
         "agent_loop_time": _metric_seconds(agent_loop_time),
+        "gateway_run_agent_overhead_time": _metric_seconds(gateway_run_agent_overhead_time),
         "gateway_postprocess_time": _metric_seconds(gateway_postprocess_time),
     }
     metrics["gateway_other_time"] = _metric_seconds(
         metrics["wall_time"]
+        - metrics["gateway_pre_agent_time"]
         - metrics["gateway_prep_time"]
         - metrics["agent_loop_time"]
+        - metrics["gateway_run_agent_overhead_time"]
         - metrics["gateway_postprocess_time"]
     )
     if isinstance(long_turn, dict):
@@ -237,6 +243,32 @@ def _gateway_turn_wall_metrics(
             "long_turn_thresholds": "",
         })
     return metrics
+
+
+def _gateway_hygiene_needs_compress(
+    *,
+    approx_tokens: Any,
+    compress_token_threshold: Any,
+    msg_count: Any,
+    hard_msg_limit: Any,
+    token_source: str,
+) -> tuple[bool, str]:
+    """Decide whether pre-agent session hygiene should compress this turn.
+
+    Actual provider-reported prompt tokens are a stronger signal than raw
+    transcript message count.  When actual tokens are safely below the context
+    threshold, a high message count alone should not trigger an expensive
+    pre-agent summarization call on every Discord turn.
+    """
+    _tokens = _metric_int(approx_tokens)
+    _threshold = _metric_int(compress_token_threshold)
+    _count = _metric_int(msg_count)
+    _limit = _metric_int(hard_msg_limit)
+    if _threshold > 0 and _tokens >= _threshold:
+        return True, "token_threshold"
+    if _limit > 0 and _count >= _limit and str(token_source or "").lower() != "actual":
+        return True, "hard_message_limit"
+    return False, "below_threshold"
 
 
 def _gateway_platform_value(platform: Any) -> str:
@@ -8414,19 +8446,24 @@ class GatewayRunner:
                 # compression.hygiene_hard_message_limit.
                 # (#2153)
                 _HARD_MSG_LIMIT = _hyg_hard_msg_limit
-                _needs_compress = (
-                    _approx_tokens >= _compress_token_threshold
-                    or _msg_count >= _HARD_MSG_LIMIT
+                _needs_compress, _compress_reason = _gateway_hygiene_needs_compress(
+                    approx_tokens=_approx_tokens,
+                    compress_token_threshold=_compress_token_threshold,
+                    msg_count=_msg_count,
+                    hard_msg_limit=_HARD_MSG_LIMIT,
+                    token_source=_token_source,
                 )
 
                 if _needs_compress:
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                        "(threshold: %s%% of %s = %s tokens)",
+                        "reason=%s (threshold: %s%% of %s = %s tokens; hard_msg_limit=%s)",
                         _msg_count, f"{_approx_tokens:,}", _token_source,
+                        _compress_reason,
                         int(_hyg_threshold_pct * 100),
                         f"{_hyg_context_length:,}",
                         f"{_compress_token_threshold:,}",
+                        _HARD_MSG_LIMIT,
                     )
 
                     _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
@@ -8673,6 +8710,7 @@ class GatewayRunner:
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
+            _run_agent_started_at = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -8728,10 +8766,19 @@ class GatewayRunner:
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
             _phase = agent_result.get("phase_metrics") or {}
+            _gateway_pre_agent_time = _run_agent_started_at - _msg_start_monotonic
+            _run_agent_wall_time = _agent_returned_at - _run_agent_started_at
+            _gateway_run_agent_overhead_time = (
+                _run_agent_wall_time
+                - float(_phase.get("gateway_prep_time", 0.0) or 0.0)
+                - float(_phase.get("agent_loop_time", 0.0) or 0.0)
+            )
             _wall_metrics = _gateway_turn_wall_metrics(
                 wall_time=time.monotonic() - _msg_start_monotonic,
+                gateway_pre_agent_time=_gateway_pre_agent_time,
                 gateway_prep_time=_phase.get("gateway_prep_time", 0.0),
                 agent_loop_time=_phase.get("agent_loop_time", 0.0),
+                gateway_run_agent_overhead_time=_gateway_run_agent_overhead_time,
                 gateway_postprocess_time=time.monotonic() - _agent_returned_at,
                 long_turn=agent_result.get("long_turn"),
             )
@@ -8741,15 +8788,17 @@ class GatewayRunner:
                 _response_time, _api_calls, _resp_len,
             )
             logger.info(
-                "turn_metrics: platform=%s chat=%s session=%s model=%s time=%.3fs wall_time=%.3fs gateway_prep_time=%.3fs agent_loop_time=%.3fs gateway_postprocess_time=%.3fs gateway_other_time=%.3fs api_calls=%d input_tokens=%d output_tokens=%d last_prompt_tokens=%d context_length=%d response_chars=%d history_user_chars=%d history_assistant_chars=%d history_tool_output_chars_before_cap=%d history_tool_output_chars_after_cap=%d tool_output_chars_omitted=%d tool_outputs_capped_count=%d tool_schema_chars=%d system_context_prompt_chars=%d channel_prompt_chars=%d long_turn_elapsed=%.3fs long_turn_tool_calls=%d long_turn_checkpoints=%d long_turn_thresholds=%s",
+                "turn_metrics: platform=%s chat=%s session=%s model=%s time=%.3fs wall_time=%.3fs gateway_pre_agent_time=%.3fs gateway_prep_time=%.3fs agent_loop_time=%.3fs gateway_run_agent_overhead_time=%.3fs gateway_postprocess_time=%.3fs gateway_other_time=%.3fs api_calls=%d input_tokens=%d output_tokens=%d last_prompt_tokens=%d context_length=%d response_chars=%d history_user_chars=%d history_assistant_chars=%d history_tool_output_chars_before_cap=%d history_tool_output_chars_after_cap=%d tool_output_chars_omitted=%d tool_outputs_capped_count=%d tool_schema_chars=%d system_context_prompt_chars=%d channel_prompt_chars=%d long_turn_elapsed=%.3fs long_turn_tool_calls=%d long_turn_checkpoints=%d long_turn_thresholds=%s",
                 _platform_name,
                 source.chat_id or "unknown",
                 session_entry.session_id,
                 agent_result.get("model") or "",
                 _response_time,
                 _wall_metrics["wall_time"],
+                _wall_metrics["gateway_pre_agent_time"],
                 _wall_metrics["gateway_prep_time"],
                 _wall_metrics["agent_loop_time"],
+                _wall_metrics["gateway_run_agent_overhead_time"],
                 _wall_metrics["gateway_postprocess_time"],
                 _wall_metrics["gateway_other_time"],
                 _api_calls,
