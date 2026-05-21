@@ -260,6 +260,81 @@ class TestSessionHygieneCaps:
         assert stats.tool_output_chars_after == sum(len(m["content"]) for m in tool_messages)
         assert stats.tool_output_chars_omitted > 0
 
+    def test_model_facing_tool_cap_enforces_aggregate_budget_for_many_large_outputs(self):
+        history = []
+        for i in range(40):
+            history.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"call_large_{i}"}]})
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_large_{i}",
+                    "content": f"tool {i} wrote /tmp/large-evidence-{i}.log\n" + (str(i % 10) * 20_000),
+                }
+            )
+
+        capped, stats = cap_model_facing_tool_outputs(
+            history,
+            session_id="sess-many-large",
+            transcript_ref="/tmp/sess-many-large.jsonl",
+            max_tool_output_chars=16_000,
+            max_total_tool_output_chars=48_000,
+            preview_chars=1_000,
+        )
+
+        tool_messages = [m for m in capped if m["role"] == "tool"]
+        total_tool_chars = sum(len(m["content"]) for m in tool_messages)
+        assert total_tool_chars <= 48_000
+        assert [m["role"] for m in capped] == [m["role"] for m in history]
+        assert capped[0]["tool_calls"] == history[0]["tool_calls"]
+        assert capped[1]["tool_call_id"] == "call_large_0"
+        assert "[Gateway model-facing historical tool output summarized]" in tool_messages[0]["content"]
+        assert "session_id=sess-many-large" in tool_messages[0]["content"]
+        assert "message_index=1" in tool_messages[0]["content"]
+        assert "transcript_ref=/tmp/sess-many-large.jsonl" in tool_messages[0]["content"]
+        assert "sha256=" in tool_messages[0]["content"]
+        assert "/tmp/large-evidence-0.log" in tool_messages[0]["content"]
+        assert stats.tool_outputs_capped_count == 40
+        assert stats.tool_output_chars_after == total_tool_chars
+
+    def test_model_facing_tool_cap_enforces_aggregate_budget_for_mixed_small_and_large_outputs(self):
+        history = []
+        for i in range(24):
+            is_large = i % 3 == 0
+            size = 22_000 if is_large else 2_000
+            history.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"call_mixed_{i}"}]})
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_mixed_{i}",
+                    "content": f"tool {i} wrote /tmp/mixed-evidence-{i}.txt\n" + ("x" * size),
+                }
+            )
+
+        capped, stats = cap_model_facing_tool_outputs(
+            history,
+            session_id="sess-mixed",
+            transcript_ref="sqlite:sess-mixed",
+            max_tool_output_chars=16_000,
+            max_total_tool_output_chars=48_000,
+            preview_chars=1_000,
+        )
+
+        tool_messages = [m for m in capped if m["role"] == "tool"]
+        total_tool_chars = sum(len(m["content"]) for m in tool_messages)
+        assert total_tool_chars <= 48_000
+        assert [m["role"] for m in capped] == [m["role"] for m in history]
+        assert all(capped[i]["tool_calls"] == history[i]["tool_calls"] for i in range(0, len(history), 2))
+        assert all(capped[i]["tool_call_id"] == history[i]["tool_call_id"] for i in range(1, len(history), 2))
+        assert tool_messages[-1]["content"].startswith("tool 23 wrote")
+        assert "[Gateway model-facing historical tool output summarized]" in tool_messages[0]["content"]
+        assert "session_id=sess-mixed" in tool_messages[0]["content"]
+        assert "message_index=1" in tool_messages[0]["content"]
+        assert "transcript_ref=sqlite:sess-mixed" in tool_messages[0]["content"]
+        assert "sha256=" in tool_messages[0]["content"]
+        assert "/tmp/mixed-evidence-0.txt" in tool_messages[0]["content"]
+        assert stats.tool_outputs_capped_count > 0
+        assert stats.tool_output_chars_after == total_tool_chars
+
     def test_token_source_metrics_include_tool_output_before_after_and_omitted(self):
         history = [
             {"role": "user", "content": "hello"},

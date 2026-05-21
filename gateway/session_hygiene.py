@@ -509,6 +509,24 @@ def _summarize_historical_tool_output_marker(
     return marker, len(raw)
 
 
+def _fit_tool_output_marker_to_budget(marker: str, max_chars: int) -> str:
+    """Return a marker no longer than max_chars, preserving leading handles.
+
+    Normal Biff budgets are large enough for every compact marker. This guard
+    keeps the aggregate cap strict even under unusually tiny configured budgets.
+    """
+
+    max_chars = int(max_chars)
+    if max_chars <= 0:
+        return ""
+    if len(marker) <= max_chars:
+        return marker
+    suffix = "\n[marker truncated to fit aggregate tool-output budget]"
+    if max_chars <= len(suffix):
+        return marker[:max_chars]
+    return marker[: max_chars - len(suffix)] + suffix
+
+
 def cap_model_facing_tool_outputs(
     history: Iterable[Mapping[str, Any]],
     *,
@@ -532,23 +550,8 @@ def cap_model_facing_tool_outputs(
     chars_before = 0
     chars_after = 0
     omitted_total = 0
-
-    # Prefer retaining recent tool evidence verbatim. Older tool outputs are
-    # summarized once the model-facing aggregate budget would be exceeded. This
-    # shapes only the prompt copy; transcripts/storage remain untouched.
-    keep_tool_indexes: set[int] = set()
     total_budget = int(max_total_tool_output_chars or 0)
-    if total_budget > 0:
-        remaining = total_budget
-        for index in range(len(capped_history) - 1, -1, -1):
-            msg = capped_history[index]
-            if msg.get("role") not in ("tool", "function"):
-                continue
-            content = msg.get("content")
-            content_len = len(content) if isinstance(content, str) else _content_char_len(content)
-            if content_len <= max_tool_output_chars and content_len <= remaining:
-                keep_tool_indexes.add(index)
-                remaining -= content_len
+    tool_entries: list[dict[str, Any]] = []
 
     for index, msg in enumerate(capped_history):
         transcript_message_index = msg.pop("_transcript_message_index", index)
@@ -564,39 +567,91 @@ def cap_model_facing_tool_outputs(
                     msg["content"] = new_content
                     message_capped_count += 1
             continue
+
         content = msg.get("content")
         if not isinstance(content, str):
             chars_after += _content_char_len(content)
             continue
-        if total_budget > 0 and len(content) <= max_tool_output_chars and index not in keep_tool_indexes:
-            chars_before += len(content)
-            marker, omitted_chars = _summarize_historical_tool_output_marker(
+
+        if total_budget <= 0:
+            if len(content) <= max_tool_output_chars:
+                chars_after += len(content)
+                continue
+            marker, omitted_chars = _tool_output_marker(
                 content,
                 session_id=session_id,
                 message_index=transcript_message_index,
                 transcript_ref=transcript_ref,
+                preview_chars=preview_chars,
             )
             msg["content"] = marker
             capped_count += 1
+            chars_before += len(content)
             chars_after += len(marker)
             omitted_total += omitted_chars
             continue
-        if len(content) <= max_tool_output_chars:
-            chars_after += len(content)
-            continue
 
-        chars_before += len(content)
-        marker, omitted_chars = _tool_output_marker(
+        summary_marker, summary_omitted = _summarize_historical_tool_output_marker(
             content,
             session_id=session_id,
             message_index=transcript_message_index,
             transcript_ref=transcript_ref,
-            preview_chars=preview_chars,
         )
-        msg["content"] = marker
-        capped_count += 1
-        chars_after += len(marker)
-        omitted_total += omitted_chars
+        if len(content) <= max_tool_output_chars:
+            preferred_marker = content
+            preferred_omitted = 0
+        else:
+            preferred_marker, preferred_omitted = _tool_output_marker(
+                content,
+                session_id=session_id,
+                message_index=transcript_message_index,
+                transcript_ref=transcript_ref,
+                preview_chars=preview_chars,
+            )
+        tool_entries.append(
+            {
+                "msg": msg,
+                "raw": content,
+                "summary": summary_marker,
+                "summary_omitted": summary_omitted,
+                "preferred": preferred_marker,
+                "preferred_omitted": preferred_omitted,
+            }
+        )
+
+    if total_budget > 0 and tool_entries:
+        # Reserve a compact retrieval marker for every string tool/function
+        # message first. Then spend any surplus from newest to oldest to keep
+        # recent raw small outputs or richer head/tail previews. This makes the
+        # aggregate cap strict for both raw outputs and replacement markers.
+        base_total = sum(len(entry["summary"]) for entry in tool_entries)
+        final_by_entry: dict[int, tuple[str, int]] = {}
+        if base_total > total_budget:
+            remaining = total_budget
+            for entry_pos, entry in enumerate(tool_entries):
+                marker = _fit_tool_output_marker_to_budget(entry["summary"], remaining)
+                final_by_entry[entry_pos] = (marker, entry["summary_omitted"])
+                remaining -= len(marker)
+        else:
+            surplus = total_budget - base_total
+            for entry_pos, entry in enumerate(tool_entries):
+                final_by_entry[entry_pos] = (entry["summary"], entry["summary_omitted"])
+            for entry_pos in range(len(tool_entries) - 1, -1, -1):
+                entry = tool_entries[entry_pos]
+                extra = len(entry["preferred"]) - len(entry["summary"])
+                if extra <= surplus:
+                    final_by_entry[entry_pos] = (entry["preferred"], entry["preferred_omitted"])
+                    surplus -= max(0, extra)
+
+        for entry_pos, entry in enumerate(tool_entries):
+            final_content, final_omitted = final_by_entry[entry_pos]
+            entry["msg"]["content"] = final_content
+            raw_content = entry["raw"]
+            chars_after += len(final_content)
+            if final_content != raw_content:
+                capped_count += 1
+                chars_before += len(raw_content)
+                omitted_total += final_omitted
 
     return capped_history, ToolOutputCapStats(
         tool_outputs_capped_count=capped_count,
