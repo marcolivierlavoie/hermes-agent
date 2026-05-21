@@ -135,6 +135,92 @@ BIFF_EVIDENCE_ONLY_SAFE_TOOLSETS: frozenset[str] = frozenset(
     }
 )
 
+# Opt-in narrowed schema for Biff-facing turns.  This is intentionally a
+# conservative subset of normal Discord/Biff work: it preserves persona/memory
+# (memory, session_search), BIF implementation capability (terminal/file),
+# structured planning and persona instructions (todo/skills), clarification,
+# bounded code/delegation, and read-only evidence surfaces.  It excludes large
+# nice-to-have or higher-risk fixed schemas (browser, cronjob, image/tts,
+# messaging, kanban) unless the operator explicitly selects the full profile.
+BIFF_CORE_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
+    {
+        "terminal",
+        "file",
+        "memory",
+        "session_search",
+        "skills",
+        "todo",
+        "clarify",
+        "code_execution",
+        "delegation",
+        "web",
+        "search",
+        "vision",
+        "discord",
+    }
+)
+
+
+def _normalize_biff_tool_schema_profile(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "": "full",
+        "default": "full",
+        "normal": "full",
+        "all": "full",
+        "wide": "full",
+        "core": "core",
+        "narrow": "core",
+        "lean": "core",
+        "reduced": "core",
+        "biff-core": "core",
+    }
+    return aliases.get(raw, raw) if aliases.get(raw, raw) in {"full", "core"} else "full"
+
+
+def resolve_biff_tool_schema_profile(config: Mapping[str, Any] | None = None, platform_key: str | None = None) -> str:
+    """Resolve Biff's tool-schema profile.
+
+    Default is ``full`` for compatibility.  ``core`` is opt-in via
+    HERMES_BIFF_TOOL_SCHEMA_PROFILE, biff.platforms.<platform>.tool_schema_profile,
+    or biff.tool_schema_profile.
+    """
+
+    env_profile = os.getenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE")
+    if env_profile:
+        return _normalize_biff_tool_schema_profile(env_profile)
+
+    cfg = config if isinstance(config, Mapping) else {}
+    biff_cfg = cfg.get("biff") if isinstance(cfg.get("biff"), Mapping) else {}
+    profile_value = None
+    if platform_key and isinstance(biff_cfg, Mapping):
+        platforms = biff_cfg.get("platforms") if isinstance(biff_cfg.get("platforms"), Mapping) else {}
+        platform_cfg = platforms.get(platform_key) if isinstance(platforms.get(platform_key), Mapping) else {}
+        profile_value = platform_cfg.get("tool_schema_profile") or platform_cfg.get("tools_profile")
+    if profile_value is None and isinstance(biff_cfg, Mapping):
+        profile_value = biff_cfg.get("tool_schema_profile") or biff_cfg.get("tools_profile")
+    return _normalize_biff_tool_schema_profile(profile_value)
+
+
+def apply_biff_tool_schema_profile(
+    config: Mapping[str, Any] | None,
+    platform_key: str | None,
+    enabled_toolsets: Iterable[str] | None,
+) -> list[str]:
+    """Apply Biff's opt-in fixed tool-schema narrowing.
+
+    The core profile only removes toolsets from the already-configured platform
+    selection; it never grants new toolsets.  Full-tool escalation is preserved
+    by the default/full profile and the HERMES_BIFF_TOOL_SCHEMA_PROFILE=full
+    override.
+    """
+
+    original = [str(toolset) for toolset in (enabled_toolsets or []) if str(toolset).strip()]
+    profile = resolve_biff_tool_schema_profile(config, platform_key)
+    if profile != "core":
+        return sorted(dict.fromkeys(original))
+    return sorted({toolset for toolset in original if toolset in BIFF_CORE_TOOL_SCHEMA_TOOLSETS})
+
 
 def filter_biff_mode_enabled_toolsets(mode: BiffOperatingMode, enabled_toolsets: Iterable[str] | None) -> list[str]:
     """Return toolsets allowed for a Biff operating mode.

@@ -15672,6 +15672,7 @@ class GatewayRunner:
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         from gateway.session_hygiene import (
+            apply_biff_tool_schema_profile,
             biff_operating_mode_prompt,
             filter_biff_mode_enabled_toolsets,
             resolve_biff_operating_mode,
@@ -15679,9 +15680,10 @@ class GatewayRunner:
         _biff_mode = resolve_biff_operating_mode(user_config, platform_key)
 
         from hermes_cli.tools_config import _get_platform_tools
+        _configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         enabled_toolsets = filter_biff_mode_enabled_toolsets(
             _biff_mode,
-            sorted(_get_platform_tools(user_config, platform_key)),
+            apply_biff_tool_schema_profile(user_config, platform_key, _configured_toolsets),
         )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None

@@ -22,6 +22,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_hygiene import (
+    apply_biff_tool_schema_profile,
     biff_operating_mode_prompt,
     cap_hygiene_history,
     cap_model_facing_tool_outputs,
@@ -309,6 +310,58 @@ class TestSessionHygieneCaps:
         assert "Gateway model-facing tool output capped" in capped[2]["content"]
         assert stats.message_contents_capped_count == 1
         assert stats.tool_outputs_capped_count == 1
+
+    def test_biff_tool_schema_profile_defaults_to_full_toolsets(self, monkeypatch):
+        monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
+        configured = ["terminal", "file", "memory", "browser", "cronjob", "messaging"]
+
+        assert apply_biff_tool_schema_profile({}, "discord", configured) == sorted(configured)
+
+    def test_biff_tool_schema_core_profile_keeps_bif_execution_core_only(self, monkeypatch):
+        monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
+        configured = [
+            "terminal",
+            "file",
+            "memory",
+            "session_search",
+            "skills",
+            "todo",
+            "clarify",
+            "code_execution",
+            "delegation",
+            "web",
+            "vision",
+            "browser",
+            "cronjob",
+            "image_gen",
+            "messaging",
+            "tts",
+            "kanban",
+            "discord",
+        ]
+        cfg = {"biff": {"platforms": {"discord": {"tool_schema_profile": "core"}}}}
+
+        assert apply_biff_tool_schema_profile(cfg, "discord", configured) == [
+            "clarify",
+            "code_execution",
+            "delegation",
+            "discord",
+            "file",
+            "memory",
+            "session_search",
+            "skills",
+            "terminal",
+            "todo",
+            "vision",
+            "web",
+        ]
+
+    def test_biff_tool_schema_profile_env_full_preserves_escalation(self, monkeypatch):
+        monkeypatch.setenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", "full")
+        configured = ["terminal", "file", "browser", "cronjob", "messaging"]
+        cfg = {"biff": {"platforms": {"discord": {"tool_schema_profile": "core"}}}}
+
+        assert apply_biff_tool_schema_profile(cfg, "discord", configured) == sorted(configured)
 
 class TestSessionHygieneThresholds:
     """Test that the threshold logic correctly identifies large sessions.
