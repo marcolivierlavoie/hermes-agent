@@ -1,7 +1,11 @@
 from types import SimpleNamespace
 
+import asyncio
+import time
+
 from gateway.run import (
     _biff_trivial_greeting_fast_response,
+    _finalize_gateway_stream_task,
     _gateway_hygiene_needs_compress,
     _gateway_turn_token_metrics,
     _gateway_turn_wall_metrics,
@@ -132,6 +136,22 @@ def test_hygiene_token_threshold_overrides_actual_token_source():
 
     assert needs_compress is True
     assert reason == "token_threshold"
+
+
+def test_gateway_stream_task_without_consumer_is_cancelled_without_timeout_wait():
+    async def _run():
+        async def _idle_poll():
+            await asyncio.sleep(30)
+
+        task = asyncio.create_task(_idle_poll())
+        started = time.monotonic()
+        await _finalize_gateway_stream_task(task, None, timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        assert task.cancelled()
+        assert elapsed < 0.5
+
+    asyncio.run(_run())
 
 
 def test_biff_trivial_greeting_fast_path_accepts_exact_discord_salutations():

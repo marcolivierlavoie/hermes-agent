@@ -133,6 +133,47 @@ _GATEWAY_SECRET_PATTERNS = (
 )
 
 
+async def _finalize_gateway_stream_task(
+    stream_task: Optional[asyncio.Task],
+    stream_consumer: Any,
+    *,
+    timeout: float = 5.0,
+) -> None:
+    """Finish or cancel the gateway stream-consumer task without adding latency.
+
+    ``_start_stream_consumer`` polls for a consumer that is created inside the
+    agent worker thread.  Many ordinary gateway turns never create a consumer
+    (streaming disabled, non-editable adapter, setup skipped).  In that case the
+    poller can sleep for its full 10s window, and awaiting it during finalization
+    adds up to ``timeout`` seconds to user-visible latency.  With no consumer
+    there is no final edit to flush, so cancel immediately; when a consumer exists,
+    preserve the old bounded wait for final delivery correctness.
+    """
+    if stream_task is None:
+        return
+    if stream_task.done():
+        try:
+            await stream_task
+        except asyncio.CancelledError:
+            pass
+        return
+    if stream_consumer is None:
+        stream_task.cancel()
+        try:
+            await stream_task
+        except asyncio.CancelledError:
+            pass
+        return
+    try:
+        await asyncio.wait_for(stream_task, timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        stream_task.cancel()
+        try:
+            await stream_task
+        except asyncio.CancelledError:
+            pass
+
+
 def _metric_int(value: Any) -> int:
     """Return a safe non-negative integer for best-effort metrics fields."""
     try:
@@ -18000,13 +18041,7 @@ class GatewayRunner:
                     _sc = stream_consumer_holder[0]
                     if _sc and stream_task:
                         try:
-                            await asyncio.wait_for(stream_task, timeout=5.0)
-                        except (asyncio.TimeoutError, asyncio.CancelledError):
-                            stream_task.cancel()
-                            try:
-                                await stream_task
-                            except asyncio.CancelledError:
-                                pass
+                            await _finalize_gateway_stream_task(stream_task, _sc, timeout=5.0)
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
                     _previewed = bool(result.get("response_previewed"))
@@ -18119,16 +18154,14 @@ class GatewayRunner:
             interrupt_monitor.cancel()
             _notify_task.cancel()
 
-            # Wait for stream consumer to finish its final edit
-            if stream_task:
-                try:
-                    await asyncio.wait_for(stream_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    stream_task.cancel()
-                    try:
-                        await stream_task
-                    except asyncio.CancelledError:
-                        pass
+            # Wait for stream consumer to finish its final edit when one exists.
+            # If no consumer was created, cancel the polling task immediately;
+            # waiting here used to add a fixed 5s to ordinary non-streaming turns.
+            await _finalize_gateway_stream_task(
+                stream_task,
+                stream_consumer_holder[0],
+                timeout=5.0,
+            )
             
             # Clean up tracking
             tracking_task.cancel()
