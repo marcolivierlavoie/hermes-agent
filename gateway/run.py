@@ -7546,6 +7546,44 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         
+        # Natural-language Biff bundle auto-selection. Slash commands have
+        # already been dispatched above, so explicit /biff-* invocations and
+        # all other slash commands keep precedence. This is quiet by design:
+        # the user sees only the normal agent response; gateway.log records the
+        # selected bundle for observability.
+        if not command:
+            try:
+                from agent.biff_bundle_selector import select_biff_bundle_for_prompt
+                from agent.skill_bundles import (
+                    build_bundle_invocation_message,
+                    get_skill_bundles,
+                )
+
+                _original_text = event.text or ""
+                _selection = select_biff_bundle_for_prompt(
+                    _original_text,
+                    get_skill_bundles(),
+                )
+                if _selection is not None:
+                    _bundle_result = build_bundle_invocation_message(
+                        _selection.command_key,
+                        _original_text,
+                        task_id=_quick_key,
+                    )
+                    if _bundle_result:
+                        _msg, _loaded, _missing = _bundle_result
+                        event.text = _msg
+                        logger.info(
+                            "Auto-selected Biff bundle %s for %s prompt (score=%s, skills=%d, missing=%d)",
+                            _selection.command_key,
+                            source.platform.value if source.platform else "gateway",
+                            _selection.score,
+                            len(_loaded),
+                            len(_missing),
+                        )
+            except Exception as exc:
+                logger.debug("Biff bundle auto-selection skipped: %s", exc)
+
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
