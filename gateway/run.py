@@ -133,6 +133,63 @@ _GATEWAY_SECRET_PATTERNS = (
 )
 
 
+def _metric_int(value: Any) -> int:
+    """Return a safe non-negative integer for best-effort metrics fields."""
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
+
+
+def _gateway_turn_token_baseline(agent: Any) -> Dict[str, int]:
+    """Snapshot cumulative agent token counters before a gateway turn runs."""
+    return {
+        "input_tokens": _metric_int(getattr(agent, "session_prompt_tokens", 0)),
+        "output_tokens": _metric_int(getattr(agent, "session_completion_tokens", 0)),
+    }
+
+
+def _baseline_value(baseline: Any, key: str) -> int:
+    if isinstance(baseline, dict):
+        return _metric_int(baseline.get(key, 0))
+    return _metric_int(getattr(baseline, key, 0))
+
+
+def _counter_delta(current: Any, baseline: Any) -> int:
+    """Return the per-turn delta for a cumulative counter.
+
+    Cached gateway agents keep session_prompt_tokens/session_completion_tokens as
+    session-cumulative counters. turn_metrics is a per-turn log line used for
+    speed/quota decisions, so logging the raw cumulative value makes long-lived
+    sessions look like million-token turns. If a counter reset or a fresh agent
+    makes the current value smaller than the baseline, treat the current value as
+    the turn value rather than producing a negative metric.
+    """
+    current_int = _metric_int(current)
+    baseline_int = _metric_int(baseline)
+    if current_int >= baseline_int:
+        return current_int - baseline_int
+    return current_int
+
+
+def _gateway_turn_token_metrics(agent: Any, baseline: Any = None) -> Dict[str, int]:
+    """Extract per-turn token metrics from an agent without changing runtime behavior."""
+    compressor = getattr(agent, "context_compressor", None)
+    return {
+        "last_prompt_tokens": _metric_int(getattr(compressor, "last_prompt_tokens", 0)),
+        "input_tokens": _counter_delta(
+            getattr(agent, "session_prompt_tokens", 0),
+            _baseline_value(baseline, "input_tokens"),
+        ),
+        "output_tokens": _counter_delta(
+            getattr(agent, "session_completion_tokens", 0),
+            _baseline_value(baseline, "output_tokens"),
+        ),
+        "context_length": _metric_int(getattr(compressor, "context_length", 0)),
+    }
+
+
 def _gateway_platform_value(platform: Any) -> str:
     """Return a normalized gateway platform value for enums or raw strings."""
     return str(getattr(platform, "value", platform) or "").strip().lower()
@@ -16718,6 +16775,7 @@ class GatewayRunner:
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent
+            _turn_token_baseline = _gateway_turn_token_baseline(agent)
             # Capture the full tool definitions for transcript logging
             tools_holder[0] = agent.tools if hasattr(agent, 'tools') else None
             try:
@@ -17082,17 +17140,24 @@ class GatewayRunner:
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
 
-            # Extract actual token counts from the agent instance used for this run
-            _last_prompt_toks = 0
-            _input_toks = 0
-            _output_toks = 0
-            _context_length = 0
+            # Extract per-turn token counts from the agent instance used for this run.
+            # The agent counters are session-cumulative (especially for cached
+            # gateway agents), so turn_metrics must use the delta from the
+            # pre-run snapshot rather than the raw cumulative values.
             _agent = agent_holder[0]
-            if _agent and hasattr(_agent, "context_compressor"):
-                _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
-                _input_toks = getattr(_agent, "session_prompt_tokens", 0)
-                _output_toks = getattr(_agent, "session_completion_tokens", 0)
-                _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+            _turn_metrics = _gateway_turn_token_metrics(
+                _agent,
+                baseline=_turn_token_baseline,
+            ) if _agent else {
+                "last_prompt_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "context_length": 0,
+            }
+            _last_prompt_toks = _turn_metrics["last_prompt_tokens"]
+            _input_toks = _turn_metrics["input_tokens"]
+            _output_toks = _turn_metrics["output_tokens"]
+            _context_length = _turn_metrics["context_length"]
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
