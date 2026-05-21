@@ -15,6 +15,7 @@ import re
 import socket as _socket
 import subprocess
 import sys
+import time
 import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
@@ -3263,11 +3264,21 @@ class BasePlatformAdapter(ABC):
                     # button. Do not infer controls from response text; normal
                     # replies may legitimately discuss quota wording.
                     _thread_metadata.update(_response_metadata)
+                    _send_started_at = time.monotonic()
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
                         metadata=_thread_metadata,
+                    )
+                    _send_elapsed = time.monotonic() - _send_started_at
+                    logger.info(
+                        "delivery_metrics: platform=%s chat=%s send_time=%.3fs success=%s response_chars=%d",
+                        self.platform.value,
+                        event.source.chat_id,
+                        _send_elapsed,
+                        bool(getattr(result, "success", False)),
+                        len(text_content),
                     )
                     _record_delivery(result)
 

@@ -190,6 +190,55 @@ def _gateway_turn_token_metrics(agent: Any, baseline: Any = None) -> Dict[str, i
     }
 
 
+def _metric_seconds(value: Any) -> float:
+    """Return a safe non-negative seconds value rounded for parseable logs."""
+    try:
+        parsed = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, parsed), 3)
+
+
+def _gateway_turn_wall_metrics(
+    *,
+    wall_time: Any,
+    gateway_prep_time: Any,
+    agent_loop_time: Any,
+    gateway_postprocess_time: Any,
+    long_turn: Any = None,
+) -> Dict[str, Any]:
+    """Build non-sensitive phase-level wall-clock metrics for a gateway turn."""
+    metrics: Dict[str, Any] = {
+        "wall_time": _metric_seconds(wall_time),
+        "gateway_prep_time": _metric_seconds(gateway_prep_time),
+        "agent_loop_time": _metric_seconds(agent_loop_time),
+        "gateway_postprocess_time": _metric_seconds(gateway_postprocess_time),
+    }
+    metrics["gateway_other_time"] = _metric_seconds(
+        metrics["wall_time"]
+        - metrics["gateway_prep_time"]
+        - metrics["agent_loop_time"]
+        - metrics["gateway_postprocess_time"]
+    )
+    if isinstance(long_turn, dict):
+        metrics.update({
+            "long_turn_elapsed": _metric_seconds(long_turn.get("elapsed_seconds")),
+            "long_turn_tool_calls": _metric_int(long_turn.get("tool_calls")),
+            "long_turn_checkpoints": _metric_int(long_turn.get("checkpoint_count")),
+            "long_turn_thresholds": ",".join(
+                str(reason) for reason in (long_turn.get("threshold_reasons") or [])
+            ),
+        })
+    else:
+        metrics.update({
+            "long_turn_elapsed": 0.0,
+            "long_turn_tool_calls": 0,
+            "long_turn_checkpoints": 0,
+            "long_turn_thresholds": "",
+        })
+    return metrics
+
+
 def _gateway_platform_value(platform: Any) -> str:
     """Return a normalized gateway platform value for enums or raw strings."""
     return str(getattr(platform, "value", platform) or "").strip().lower()
@@ -7992,6 +8041,7 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _msg_start_monotonic = time.monotonic()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
@@ -8634,6 +8684,7 @@ class GatewayRunner:
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
             )
+            _agent_returned_at = time.monotonic()
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -8676,18 +8727,31 @@ class GatewayRunner:
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
+            _phase = agent_result.get("phase_metrics") or {}
+            _wall_metrics = _gateway_turn_wall_metrics(
+                wall_time=time.monotonic() - _msg_start_monotonic,
+                gateway_prep_time=_phase.get("gateway_prep_time", 0.0),
+                agent_loop_time=_phase.get("agent_loop_time", 0.0),
+                gateway_postprocess_time=time.monotonic() - _agent_returned_at,
+                long_turn=agent_result.get("long_turn"),
+            )
             logger.info(
                 "response ready: platform=%s chat=%s time=%.1fs api_calls=%d response=%d chars",
                 _platform_name, source.chat_id or "unknown",
                 _response_time, _api_calls, _resp_len,
             )
             logger.info(
-                "turn_metrics: platform=%s chat=%s session=%s model=%s time=%.3fs api_calls=%d input_tokens=%d output_tokens=%d last_prompt_tokens=%d context_length=%d response_chars=%d history_user_chars=%d history_assistant_chars=%d history_tool_output_chars_before_cap=%d history_tool_output_chars_after_cap=%d tool_output_chars_omitted=%d tool_outputs_capped_count=%d tool_schema_chars=%d system_context_prompt_chars=%d channel_prompt_chars=%d",
+                "turn_metrics: platform=%s chat=%s session=%s model=%s time=%.3fs wall_time=%.3fs gateway_prep_time=%.3fs agent_loop_time=%.3fs gateway_postprocess_time=%.3fs gateway_other_time=%.3fs api_calls=%d input_tokens=%d output_tokens=%d last_prompt_tokens=%d context_length=%d response_chars=%d history_user_chars=%d history_assistant_chars=%d history_tool_output_chars_before_cap=%d history_tool_output_chars_after_cap=%d tool_output_chars_omitted=%d tool_outputs_capped_count=%d tool_schema_chars=%d system_context_prompt_chars=%d channel_prompt_chars=%d long_turn_elapsed=%.3fs long_turn_tool_calls=%d long_turn_checkpoints=%d long_turn_thresholds=%s",
                 _platform_name,
                 source.chat_id or "unknown",
                 session_entry.session_id,
                 agent_result.get("model") or "",
                 _response_time,
+                _wall_metrics["wall_time"],
+                _wall_metrics["gateway_prep_time"],
+                _wall_metrics["agent_loop_time"],
+                _wall_metrics["gateway_postprocess_time"],
+                _wall_metrics["gateway_other_time"],
                 _api_calls,
                 int(agent_result.get("input_tokens") or 0),
                 int(agent_result.get("output_tokens") or 0),
@@ -8703,6 +8767,10 @@ class GatewayRunner:
                 int(agent_result.get("tool_schema_chars") or 0),
                 int(agent_result.get("system_context_prompt_chars") or 0),
                 int(agent_result.get("channel_prompt_chars") or 0),
+                _wall_metrics["long_turn_elapsed"],
+                _wall_metrics["long_turn_tool_calls"],
+                _wall_metrics["long_turn_checkpoints"],
+                _wall_metrics["long_turn_thresholds"] or "none",
             )
 
             # Successful turn — clear any stuck-loop counter for this session.
@@ -16309,6 +16377,7 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+        _phase_metrics: Dict[str, float] = {}
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -16402,6 +16471,8 @@ class GatewayRunner:
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
+
+            _prep_started_at = time.monotonic()
 
             # session_key is now set via contextvars in _set_session_env()
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
@@ -17101,7 +17172,10 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
+                _agent_loop_started_at = time.monotonic()
+                _phase_metrics["gateway_prep_time"] = _agent_loop_started_at - _prep_started_at
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                _phase_metrics["agent_loop_time"] = time.monotonic() - _agent_loop_started_at
                 try:
                     _lt_signal = result.get("long_turn_signal") if isinstance(result, dict) else None
                     _turn_exit_reason = result.get("turn_exit_reason") if isinstance(result, dict) else None
@@ -17181,6 +17255,8 @@ class GatewayRunner:
                     "model": _resolved_model,
                     "context_length": _context_length,
                     "biff_operating_mode": _biff_mode.to_dict(),
+                    "long_turn": result.get("long_turn"),
+                    "phase_metrics": dict(_phase_metrics),
                     **_token_source_metrics,
                 }
             
@@ -17345,6 +17421,8 @@ class GatewayRunner:
                 "session_id": effective_session_id,
                 "biff_operating_mode": _biff_mode.to_dict(),
                 "response_previewed": result.get("response_previewed", False),
+                "long_turn": result.get("long_turn"),
+                "phase_metrics": dict(_phase_metrics),
                 **_token_source_metrics,
             }
         
