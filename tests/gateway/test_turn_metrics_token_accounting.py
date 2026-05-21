@@ -55,11 +55,16 @@ def test_turn_metrics_token_accounting_falls_back_when_counter_resets():
 
 def test_turn_wall_metrics_reports_phase_durations_and_long_turn_counts():
     metrics = _gateway_turn_wall_metrics(
-        wall_time=13.3456,
+        wall_time=14.3456,
         gateway_pre_agent_time=0.5,
         gateway_prep_time=1.2345,
         agent_loop_time=10.0,
-        gateway_run_agent_overhead_time=0.25,
+        gateway_run_agent_overhead_time=1.25,
+        gateway_agent_post_loop_time=1.0,
+        gateway_agent_token_metrics_time=0.1,
+        gateway_agent_media_scan_time=0.2,
+        gateway_agent_session_sync_time=0.3,
+        gateway_agent_title_dispatch_time=0.4,
         gateway_postprocess_time=1.1111,
         long_turn={
             "elapsed_seconds": 9.8765,
@@ -70,11 +75,17 @@ def test_turn_wall_metrics_reports_phase_durations_and_long_turn_counts():
     )
 
     assert metrics == {
-        "wall_time": 13.346,
+        "wall_time": 14.346,
         "gateway_pre_agent_time": 0.5,
         "gateway_prep_time": 1.234,
         "agent_loop_time": 10.0,
-        "gateway_run_agent_overhead_time": 0.25,
+        "gateway_run_agent_overhead_time": 1.25,
+        "gateway_agent_post_loop_time": 1.0,
+        "gateway_agent_token_metrics_time": 0.1,
+        "gateway_agent_media_scan_time": 0.2,
+        "gateway_agent_session_sync_time": 0.3,
+        "gateway_agent_title_dispatch_time": 0.4,
+        "gateway_run_agent_residual_time": 0.25,
         "gateway_postprocess_time": 1.111,
         "gateway_other_time": 0.251,
         "long_turn_elapsed": 9.877,

@@ -206,6 +206,11 @@ def _gateway_turn_wall_metrics(
     gateway_prep_time: Any,
     agent_loop_time: Any,
     gateway_run_agent_overhead_time: Any = 0.0,
+    gateway_agent_post_loop_time: Any = 0.0,
+    gateway_agent_token_metrics_time: Any = 0.0,
+    gateway_agent_media_scan_time: Any = 0.0,
+    gateway_agent_session_sync_time: Any = 0.0,
+    gateway_agent_title_dispatch_time: Any = 0.0,
     gateway_postprocess_time: Any,
     long_turn: Any = None,
 ) -> Dict[str, Any]:
@@ -216,8 +221,16 @@ def _gateway_turn_wall_metrics(
         "gateway_prep_time": _metric_seconds(gateway_prep_time),
         "agent_loop_time": _metric_seconds(agent_loop_time),
         "gateway_run_agent_overhead_time": _metric_seconds(gateway_run_agent_overhead_time),
+        "gateway_agent_post_loop_time": _metric_seconds(gateway_agent_post_loop_time),
+        "gateway_agent_token_metrics_time": _metric_seconds(gateway_agent_token_metrics_time),
+        "gateway_agent_media_scan_time": _metric_seconds(gateway_agent_media_scan_time),
+        "gateway_agent_session_sync_time": _metric_seconds(gateway_agent_session_sync_time),
+        "gateway_agent_title_dispatch_time": _metric_seconds(gateway_agent_title_dispatch_time),
         "gateway_postprocess_time": _metric_seconds(gateway_postprocess_time),
     }
+    metrics["gateway_run_agent_residual_time"] = _metric_seconds(
+        metrics["gateway_run_agent_overhead_time"] - metrics["gateway_agent_post_loop_time"]
+    )
     metrics["gateway_other_time"] = _metric_seconds(
         metrics["wall_time"]
         - metrics["gateway_pre_agent_time"]
@@ -8829,6 +8842,11 @@ class GatewayRunner:
                 gateway_prep_time=_phase.get("gateway_prep_time", 0.0),
                 agent_loop_time=_phase.get("agent_loop_time", 0.0),
                 gateway_run_agent_overhead_time=_gateway_run_agent_overhead_time,
+                gateway_agent_post_loop_time=_phase.get("gateway_agent_post_loop_time", 0.0),
+                gateway_agent_token_metrics_time=_phase.get("gateway_agent_token_metrics_time", 0.0),
+                gateway_agent_media_scan_time=_phase.get("gateway_agent_media_scan_time", 0.0),
+                gateway_agent_session_sync_time=_phase.get("gateway_agent_session_sync_time", 0.0),
+                gateway_agent_title_dispatch_time=_phase.get("gateway_agent_title_dispatch_time", 0.0),
                 gateway_postprocess_time=time.monotonic() - _agent_returned_at,
                 long_turn=agent_result.get("long_turn"),
             )
@@ -8838,7 +8856,7 @@ class GatewayRunner:
                 _response_time, _api_calls, _resp_len,
             )
             logger.info(
-                "turn_metrics: platform=%s chat=%s session=%s model=%s time=%.3fs wall_time=%.3fs gateway_pre_agent_time=%.3fs gateway_prep_time=%.3fs agent_loop_time=%.3fs gateway_run_agent_overhead_time=%.3fs gateway_postprocess_time=%.3fs gateway_other_time=%.3fs api_calls=%d input_tokens=%d output_tokens=%d last_prompt_tokens=%d context_length=%d response_chars=%d history_user_chars=%d history_assistant_chars=%d history_tool_output_chars_before_cap=%d history_tool_output_chars_after_cap=%d tool_output_chars_omitted=%d tool_outputs_capped_count=%d tool_schema_chars=%d system_context_prompt_chars=%d channel_prompt_chars=%d long_turn_elapsed=%.3fs long_turn_tool_calls=%d long_turn_checkpoints=%d long_turn_thresholds=%s",
+                "turn_metrics: platform=%s chat=%s session=%s model=%s time=%.3fs wall_time=%.3fs gateway_pre_agent_time=%.3fs gateway_prep_time=%.3fs agent_loop_time=%.3fs gateway_run_agent_overhead_time=%.3fs gateway_agent_post_loop_time=%.3fs gateway_agent_token_metrics_time=%.3fs gateway_agent_media_scan_time=%.3fs gateway_agent_session_sync_time=%.3fs gateway_agent_title_dispatch_time=%.3fs gateway_run_agent_residual_time=%.3fs gateway_postprocess_time=%.3fs gateway_other_time=%.3fs api_calls=%d input_tokens=%d output_tokens=%d last_prompt_tokens=%d context_length=%d response_chars=%d history_user_chars=%d history_assistant_chars=%d history_tool_output_chars_before_cap=%d history_tool_output_chars_after_cap=%d tool_output_chars_omitted=%d tool_outputs_capped_count=%d tool_schema_chars=%d system_context_prompt_chars=%d channel_prompt_chars=%d long_turn_elapsed=%.3fs long_turn_tool_calls=%d long_turn_checkpoints=%d long_turn_thresholds=%s",
                 _platform_name,
                 source.chat_id or "unknown",
                 session_entry.session_id,
@@ -8849,6 +8867,12 @@ class GatewayRunner:
                 _wall_metrics["gateway_prep_time"],
                 _wall_metrics["agent_loop_time"],
                 _wall_metrics["gateway_run_agent_overhead_time"],
+                _wall_metrics["gateway_agent_post_loop_time"],
+                _wall_metrics["gateway_agent_token_metrics_time"],
+                _wall_metrics["gateway_agent_media_scan_time"],
+                _wall_metrics["gateway_agent_session_sync_time"],
+                _wall_metrics["gateway_agent_title_dispatch_time"],
+                _wall_metrics["gateway_run_agent_residual_time"],
                 _wall_metrics["gateway_postprocess_time"],
                 _wall_metrics["gateway_other_time"],
                 _api_calls,
@@ -17274,7 +17298,8 @@ class GatewayRunner:
                 _agent_loop_started_at = time.monotonic()
                 _phase_metrics["gateway_prep_time"] = _agent_loop_started_at - _prep_started_at
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
-                _phase_metrics["agent_loop_time"] = time.monotonic() - _agent_loop_started_at
+                _agent_loop_finished_at = time.monotonic()
+                _phase_metrics["agent_loop_time"] = _agent_loop_finished_at - _agent_loop_started_at
                 try:
                     _lt_signal = result.get("long_turn_signal") if isinstance(result, dict) else None
                     _turn_exit_reason = result.get("turn_exit_reason") if isinstance(result, dict) else None
@@ -17317,6 +17342,7 @@ class GatewayRunner:
             # The agent counters are session-cumulative (especially for cached
             # gateway agents), so turn_metrics must use the delta from the
             # pre-run snapshot rather than the raw cumulative values.
+            _token_metrics_started_at = time.monotonic()
             _agent = agent_holder[0]
             _turn_metrics = _gateway_turn_token_metrics(
                 _agent,
@@ -17327,6 +17353,7 @@ class GatewayRunner:
                 "output_tokens": 0,
                 "context_length": 0,
             }
+            _phase_metrics["gateway_agent_token_metrics_time"] = time.monotonic() - _token_metrics_started_at
             _last_prompt_toks = _turn_metrics["last_prompt_tokens"]
             _input_toks = _turn_metrics["input_tokens"]
             _output_toks = _turn_metrics["output_tokens"]
@@ -17334,6 +17361,7 @@ class GatewayRunner:
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
+                _phase_metrics["gateway_agent_post_loop_time"] = time.monotonic() - _agent_loop_finished_at
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
                     "final_response": error_msg,
@@ -17369,6 +17397,7 @@ class GatewayRunner:
             # Uses path-based deduplication against _history_media_paths (collected
             # before run_conversation) instead of index slicing. This is safe even
             # when context compression shrinks the message list. (Fixes #160)
+            _media_scan_started_at = time.monotonic()
             if "MEDIA:" not in final_response:
                 media_tags = []
                 has_voice_directive = False
@@ -17400,11 +17429,13 @@ class GatewayRunner:
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
+            _phase_metrics["gateway_agent_media_scan_time"] = time.monotonic() - _media_scan_started_at
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
             # If so, update the session store entry so the NEXT message loads
             # the compressed transcript, not the stale pre-compression one.
+            _session_sync_started_at = time.monotonic()
             agent = agent_holder[0]
             _session_was_split = False
             if agent and session_key and hasattr(agent, 'session_id') and agent.session_id != session_id:
@@ -17457,8 +17488,10 @@ class GatewayRunner:
             # user/assistant pair — losing the compressed summary and tail.
             # Reset to 0 so the gateway writes ALL compressed messages.
             _effective_history_offset = 0 if _session_was_split else len(agent_history)
+            _phase_metrics["gateway_agent_session_sync_time"] = time.monotonic() - _session_sync_started_at
 
             # Auto-generate session title after first exchange (non-blocking)
+            _title_dispatch_started_at = time.monotonic()
             if final_response and self._session_db:
                 try:
                     from agent.title_generator import maybe_auto_title
@@ -17499,6 +17532,8 @@ class GatewayRunner:
                     )
                 except Exception:
                     pass
+            _phase_metrics["gateway_agent_title_dispatch_time"] = time.monotonic() - _title_dispatch_started_at
+            _phase_metrics["gateway_agent_post_loop_time"] = time.monotonic() - _agent_loop_finished_at
 
             return {
                 "final_response": final_response,
