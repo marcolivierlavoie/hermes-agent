@@ -19,6 +19,7 @@ DEFAULT_HYGIENE_MAX_MESSAGES = 240
 DEFAULT_HYGIENE_MAX_CONTENT_CHARS = 24_000
 DEFAULT_HYGIENE_MAX_TOOL_OUTPUT_CHARS = 4_000
 DEFAULT_MODEL_FACING_TOOL_OUTPUT_CHARS = 16_000
+DEFAULT_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS = 48_000
 DEFAULT_TOOL_PREVIEW_CHARS = 1_000
 
 BIFF_OPERATING_MODES: tuple[str, ...] = ("normal", "economy", "emergency", "evidence-only")
@@ -473,12 +474,48 @@ def _tool_output_marker(
     return marker, omitted_chars
 
 
+_EVIDENCE_PATH_RE = re.compile(r"(?:(?:~|/)[^\s\"'`<>|,;)]+)")
+
+
+def _summarize_historical_tool_output_marker(
+    raw: str,
+    *,
+    session_id: str,
+    message_index: int,
+    transcript_ref: str,
+) -> tuple[str, int]:
+    """Return a compact marker for older tool output beyond aggregate budget."""
+
+    digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+    first_line = next((line.strip() for line in raw.splitlines() if line.strip()), "")
+    summary = _redact_secret_like_values(first_line[:240])
+    paths = []
+    for match in _EVIDENCE_PATH_RE.finditer(raw):
+        path = match.group(0).rstrip(".:")
+        if path not in paths:
+            paths.append(path)
+        if len(paths) >= 8:
+            break
+    paths_line = ", ".join(paths) if paths else "none detected"
+    marker = (
+        "[Gateway model-facing historical tool output summarized]\n"
+        f"original_chars={len(raw)} omitted_chars={len(raw)} sha256={digest}\n"
+        f"session_id={session_id} message_index={message_index} transcript_ref={transcript_ref}\n"
+        f"summary={summary or '[no text summary available]'}\n"
+        f"evidence_paths={paths_line}\n"
+        "The full raw tool output remains stored in the session transcript/history; "
+        "retrieve it with session_id, message_index, transcript_ref, and sha256 before relying on omitted evidence."
+    )
+    return marker, len(raw)
+
+
 def cap_model_facing_tool_outputs(
     history: Iterable[Mapping[str, Any]],
     *,
     session_id: str,
     transcript_ref: str,
     max_tool_output_chars: int = DEFAULT_MODEL_FACING_TOOL_OUTPUT_CHARS,
+    max_total_tool_output_chars: int | None = DEFAULT_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS,
     preview_chars: int = DEFAULT_TOOL_PREVIEW_CHARS,
     max_message_content_chars: int | None = None,
 ) -> tuple[list[dict[str, Any]], ToolOutputCapStats]:
@@ -495,6 +532,23 @@ def cap_model_facing_tool_outputs(
     chars_before = 0
     chars_after = 0
     omitted_total = 0
+
+    # Prefer retaining recent tool evidence verbatim. Older tool outputs are
+    # summarized once the model-facing aggregate budget would be exceeded. This
+    # shapes only the prompt copy; transcripts/storage remain untouched.
+    keep_tool_indexes: set[int] = set()
+    total_budget = int(max_total_tool_output_chars or 0)
+    if total_budget > 0:
+        remaining = total_budget
+        for index in range(len(capped_history) - 1, -1, -1):
+            msg = capped_history[index]
+            if msg.get("role") not in ("tool", "function"):
+                continue
+            content = msg.get("content")
+            content_len = len(content) if isinstance(content, str) else _content_char_len(content)
+            if content_len <= max_tool_output_chars and content_len <= remaining:
+                keep_tool_indexes.add(index)
+                remaining -= content_len
 
     for index, msg in enumerate(capped_history):
         transcript_message_index = msg.pop("_transcript_message_index", index)
@@ -513,6 +567,19 @@ def cap_model_facing_tool_outputs(
         content = msg.get("content")
         if not isinstance(content, str):
             chars_after += _content_char_len(content)
+            continue
+        if total_budget > 0 and len(content) <= max_tool_output_chars and index not in keep_tool_indexes:
+            chars_before += len(content)
+            marker, omitted_chars = _summarize_historical_tool_output_marker(
+                content,
+                session_id=session_id,
+                message_index=transcript_message_index,
+                transcript_ref=transcript_ref,
+            )
+            msg["content"] = marker
+            capped_count += 1
+            chars_after += len(marker)
+            omitted_total += omitted_chars
             continue
         if len(content) <= max_tool_output_chars:
             chars_after += len(content)

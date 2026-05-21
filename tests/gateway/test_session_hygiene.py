@@ -225,6 +225,41 @@ class TestSessionHygieneCaps:
         assert "_transcript_message_index" not in capped[1]
         assert history[1]["_transcript_message_index"] == 8
 
+    def test_model_facing_tool_cap_enforces_aggregate_historical_tool_budget(self):
+        history = []
+        for i in range(8):
+            history.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"call_{i}"}]})
+            history.append({
+                "role": "tool",
+                "tool_call_id": f"call_{i}",
+                "content": f"tool {i} wrote /tmp/evidence-{i}.txt\n" + (str(i) * 10_000),
+            })
+
+        capped, stats = cap_model_facing_tool_outputs(
+            history,
+            session_id="sess-budget",
+            transcript_ref="/tmp/sess-budget.jsonl",
+            max_tool_output_chars=16_000,
+            max_total_tool_output_chars=25_000,
+            preview_chars=800,
+        )
+
+        tool_messages = [m for m in capped if m["role"] == "tool"]
+        assert sum(len(m["content"]) for m in tool_messages) <= 25_000
+        assert tool_messages[-1]["content"].startswith("tool 7 wrote")
+        assert tool_messages[-2]["content"].startswith("tool 6 wrote")
+        assert "[Gateway model-facing historical tool output summarized]" in tool_messages[0]["content"]
+        assert "session_id=sess-budget" in tool_messages[0]["content"]
+        assert "message_index=1" in tool_messages[0]["content"]
+        assert "transcript_ref=/tmp/sess-budget.jsonl" in tool_messages[0]["content"]
+        assert "sha256=" in tool_messages[0]["content"]
+        assert "omitted_chars=" in tool_messages[0]["content"]
+        assert "/tmp/evidence-0.txt" in tool_messages[0]["content"]
+        assert stats.tool_outputs_capped_count == 6
+        assert stats.tool_output_chars_before == 6 * (len("tool 0 wrote /tmp/evidence-0.txt\n") + 10_000)
+        assert stats.tool_output_chars_after == sum(len(m["content"]) for m in tool_messages)
+        assert stats.tool_output_chars_omitted > 0
+
     def test_token_source_metrics_include_tool_output_before_after_and_omitted(self):
         history = [
             {"role": "user", "content": "hello"},
