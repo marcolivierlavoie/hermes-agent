@@ -164,6 +164,24 @@ BIFF_CORE_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
     }
 )
 
+# Default Biff Discord schema profile v2: the smallest safe fixed allowlist
+# for Biff's common build/ops lane. It keeps the shell/file/code/skills/memory
+# surfaces needed to work Linear-backed BIFs (including Linear access via
+# terminal + credential helper), named-role delegation, and todo planning, while
+# omitting large or nice-to-have schemas. Operators can still select ``full``
+# via config or HERMES_BIFF_TOOL_SCHEMA_PROFILE for rollback/escalation.
+BIFF_DISCORD_V2_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
+    {
+        "terminal",
+        "file",
+        "memory",
+        "skills",
+        "todo",
+        "code_execution",
+        "delegation",
+    }
+)
+
 
 def _normalize_biff_tool_schema_profile(value: Any) -> str:
     raw = str(value or "").strip().lower().replace("_", "-")
@@ -178,14 +196,21 @@ def _normalize_biff_tool_schema_profile(value: Any) -> str:
         "lean": "core",
         "reduced": "core",
         "biff-core": "core",
+        "v2": "v2",
+        "profile-v2": "v2",
+        "discord-v2": "v2",
+        "biff-discord-v2": "v2",
+        "minimal": "v2",
+        "essentials": "v2",
     }
-    return aliases.get(raw, raw) if aliases.get(raw, raw) in {"full", "core"} else "full"
+    return aliases.get(raw, raw) if aliases.get(raw, raw) in {"full", "core", "v2"} else "full"
 
 
 def resolve_biff_tool_schema_profile(config: Mapping[str, Any] | None = None, platform_key: str | None = None) -> str:
     """Resolve Biff's tool-schema profile.
 
-    Default is ``full`` for compatibility.  ``core`` is opt-in via
+    Default is ``v2`` for Discord Biff turns and ``full`` elsewhere for
+    compatibility.  ``core``/``v2`` are selectable via
     HERMES_BIFF_TOOL_SCHEMA_PROFILE, biff.platforms.<platform>.tool_schema_profile,
     or biff.tool_schema_profile.
     """
@@ -203,6 +228,8 @@ def resolve_biff_tool_schema_profile(config: Mapping[str, Any] | None = None, pl
         profile_value = platform_cfg.get("tool_schema_profile") or platform_cfg.get("tools_profile")
     if profile_value is None and isinstance(biff_cfg, Mapping):
         profile_value = biff_cfg.get("tool_schema_profile") or biff_cfg.get("tools_profile")
+    if profile_value is None and str(platform_key or "").strip().lower() == "discord":
+        return "v2"
     return _normalize_biff_tool_schema_profile(profile_value)
 
 
@@ -211,16 +238,18 @@ def apply_biff_tool_schema_profile(
     platform_key: str | None,
     enabled_toolsets: Iterable[str] | None,
 ) -> list[str]:
-    """Apply Biff's opt-in fixed tool-schema narrowing.
+    """Apply Biff's fixed tool-schema narrowing.
 
-    The core profile only removes toolsets from the already-configured platform
-    selection; it never grants new toolsets.  Full-tool escalation is preserved
-    by the default/full profile and the HERMES_BIFF_TOOL_SCHEMA_PROFILE=full
+    The core/v2 profiles only remove toolsets from the already-configured
+    platform selection; they never grant new toolsets. Full-tool escalation is
+    preserved by the full profile and the HERMES_BIFF_TOOL_SCHEMA_PROFILE=full
     override.
     """
 
     original = [str(toolset) for toolset in (enabled_toolsets or []) if str(toolset).strip()]
     profile = resolve_biff_tool_schema_profile(config, platform_key)
+    if profile == "v2":
+        return sorted({toolset for toolset in original if toolset in BIFF_DISCORD_V2_TOOL_SCHEMA_TOOLSETS})
     if profile != "core":
         return sorted(dict.fromkeys(original))
     return sorted({toolset for toolset in original if toolset in BIFF_CORE_TOOL_SCHEMA_TOOLSETS})

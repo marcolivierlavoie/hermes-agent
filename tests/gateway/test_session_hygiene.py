@@ -29,6 +29,7 @@ from gateway.session_hygiene import (
     collect_token_source_metrics,
     filter_biff_mode_enabled_toolsets,
     resolve_biff_operating_mode,
+    resolve_biff_tool_schema_profile,
 )
 
 
@@ -600,13 +601,41 @@ class TestSessionHygieneCaps:
         assert stats.message_contents_capped_count == 1
         assert stats.tool_outputs_capped_count == 1
 
-    def test_biff_tool_schema_profile_defaults_to_full_toolsets(self, monkeypatch):
+    def test_biff_discord_tool_schema_profile_defaults_to_v2_allowlist(self, monkeypatch):
         monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
-        configured = ["terminal", "file", "memory", "browser", "cronjob", "messaging"]
+        configured = [
+            "terminal",
+            "file",
+            "memory",
+            "session_search",
+            "skills",
+            "todo",
+            "clarify",
+            "code_execution",
+            "delegation",
+            "web",
+            "vision",
+            "browser",
+            "cronjob",
+            "image_gen",
+            "messaging",
+            "tts",
+            "kanban",
+            "discord",
+        ]
 
-        assert apply_biff_tool_schema_profile({}, "discord", configured) == sorted(configured)
+        assert resolve_biff_tool_schema_profile({}, "discord") == "v2"
+        assert apply_biff_tool_schema_profile({}, "discord", configured) == [
+            "code_execution",
+            "delegation",
+            "file",
+            "memory",
+            "skills",
+            "terminal",
+            "todo",
+        ]
 
-    def test_biff_tool_schema_core_profile_keeps_bif_execution_core_only(self, monkeypatch):
+    def test_biff_tool_schema_profile_core_keeps_legacy_wider_core(self, monkeypatch):
         monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
         configured = [
             "terminal",
@@ -648,9 +677,87 @@ class TestSessionHygieneCaps:
     def test_biff_tool_schema_profile_env_full_preserves_escalation(self, monkeypatch):
         monkeypatch.setenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", "full")
         configured = ["terminal", "file", "browser", "cronjob", "messaging"]
-        cfg = {"biff": {"platforms": {"discord": {"tool_schema_profile": "core"}}}}
+        cfg = {"biff": {"platforms": {"discord": {"tool_schema_profile": "v2"}}}}
 
         assert apply_biff_tool_schema_profile(cfg, "discord", configured) == sorted(configured)
+
+    def test_biff_tool_schema_profile_non_discord_default_stays_full(self, monkeypatch):
+        monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
+        configured = ["terminal", "file", "browser", "cronjob", "messaging"]
+
+        assert resolve_biff_tool_schema_profile({}, "slack") == "full"
+        assert apply_biff_tool_schema_profile({}, "slack", configured) == sorted(configured)
+
+    def test_biff_tool_schema_profile_config_full_rolls_back_discord_default(self, monkeypatch):
+        monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
+        configured = ["terminal", "file", "browser", "cronjob", "messaging"]
+        cfg = {"biff": {"platforms": {"discord": {"tool_schema_profile": "full"}}}}
+
+        assert resolve_biff_tool_schema_profile(cfg, "discord") == "full"
+        assert apply_biff_tool_schema_profile(cfg, "discord", configured) == sorted(configured)
+
+    def test_biff_tool_schema_profile_env_core_preserves_legacy_profile(self, monkeypatch):
+        monkeypatch.setenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", "core")
+        configured = ["terminal", "file", "browser", "session_search", "skills", "clarify"]
+        cfg = {"biff": {"platforms": {"discord": {"tool_schema_profile": "v2"}}}}
+
+        assert resolve_biff_tool_schema_profile(cfg, "discord") == "core"
+        assert apply_biff_tool_schema_profile(cfg, "discord", configured) == [
+            "clarify",
+            "file",
+            "session_search",
+            "skills",
+            "terminal",
+        ]
+
+    def test_biff_discord_v2_reduces_model_facing_tools_and_schema_chars(self, monkeypatch):
+        monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import get_tool_definitions
+        import json
+
+        cfg = {"platform_toolsets": {"discord": ["hermes-discord"]}}
+        configured = sorted(_get_platform_tools(cfg, "discord"))
+        full_toolsets = apply_biff_tool_schema_profile(
+            {"biff": {"tool_schema_profile": "full"}, **cfg},
+            "discord",
+            configured,
+        )
+        default_toolsets = apply_biff_tool_schema_profile(cfg, "discord", configured)
+
+        full_tools = get_tool_definitions(full_toolsets, None, quiet_mode=True)
+        default_tools = get_tool_definitions(default_toolsets, None, quiet_mode=True)
+        full_chars = len(json.dumps(full_tools, sort_keys=True, separators=(",", ":")))
+        default_chars = len(json.dumps(default_tools, sort_keys=True, separators=(",", ":")))
+        default_names = {tool["function"]["name"] for tool in default_tools}
+
+        assert len(default_tools) < len(full_tools)
+        assert default_chars < full_chars
+        assert default_chars <= 30_000
+        assert full_chars - default_chars >= 10_000
+        assert {
+            "read_file",
+            "search_files",
+            "write_file",
+            "patch",
+            "terminal",
+            "process",
+            "execute_code",
+            "skill_view",
+            "skills_list",
+            "skill_manage",
+            "memory",
+            "delegate_task",
+            "todo",
+        }.issubset(default_names)
+        assert {
+            "cronjob",
+            "image_generate",
+            "send_message",
+            "session_search",
+            "text_to_speech",
+            "vision_analyze",
+        }.isdisjoint(default_names)
 
 class TestSessionHygieneThresholds:
     """Test that the threshold logic correctly identifies large sessions.
