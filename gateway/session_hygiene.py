@@ -534,7 +534,7 @@ def _adaptive_total_tool_output_budget(capped_candidate_count: int) -> int:
     """Return the default aggregate model-facing tool-output budget.
 
     Keep the historical 48k floor for ordinary turns. When a Discord/Biff
-    session has many historical tool outputs that all require summarization,
+    session has many historical tool outputs that require model-facing capping,
     fixed 48k markers become the prompt floor; step the default down while the
     marker algorithm still preserves newest retrieval handles first.
     """
@@ -644,9 +644,13 @@ def cap_model_facing_tool_outputs(
 
     if aggregate_budget_enabled and tool_entries:
         if max_total_tool_output_chars is None:
-            capped_candidate_count = sum(
+            large_candidate_count = sum(
                 1 for entry in tool_entries if len(entry["raw"]) > int(max_tool_output_chars or 0)
             )
+            raw_tool_output_total = sum(len(entry["raw"]) for entry in tool_entries)
+            capped_candidate_count = large_candidate_count
+            if raw_tool_output_total > DEFAULT_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS and len(tool_entries) >= 32:
+                capped_candidate_count = max(capped_candidate_count, len(tool_entries))
             total_budget = _adaptive_total_tool_output_budget(capped_candidate_count)
         # Reserve a compact retrieval marker for every string tool/function
         # message first. Then spend any surplus from newest to oldest to keep

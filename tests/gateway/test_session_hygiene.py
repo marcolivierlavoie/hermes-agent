@@ -481,6 +481,39 @@ class TestSessionHygieneCaps:
         assert stats.tool_outputs_capped_count > 0
         assert stats.tool_output_chars_after == total_tool_chars
 
+    def test_default_adaptive_budget_reduces_sixty_three_aggregate_capped_outputs_below_48k(self):
+        history = _make_tool_history(
+            63,
+            large_size=5_550,
+            call_prefix="call_live_smoke",
+            evidence_prefix="live-smoke-evidence",
+        )
+
+        capped, stats = cap_model_facing_tool_outputs(
+            history,
+            session_id="sess-live-smoke",
+            transcript_ref="/tmp/sess-live-smoke.jsonl",
+            max_tool_output_chars=16_000,
+            preview_chars=1_000,
+        )
+
+        tool_messages = [m for m in capped if m["role"] == "tool"]
+        total_tool_chars = _tool_content_chars(capped)
+        assert _tool_content_chars(history) > 350_000
+        assert total_tool_chars <= 24_000
+        assert total_tool_chars < 48_000
+        assert stats.tool_outputs_capped_count == 63
+        assert [m["role"] for m in capped] == [m["role"] for m in history]
+        assert all(capped[i]["tool_calls"] == history[i]["tool_calls"] for i in range(0, len(history), 2))
+        assert all(capped[i]["tool_call_id"] == history[i]["tool_call_id"] for i in range(1, len(history), 2))
+        assert "[Gateway model-facing historical tool output summarized]" in tool_messages[-1]["content"]
+        assert "session_id=sess-live-smoke" in tool_messages[-1]["content"]
+        assert "message_index=125" in tool_messages[-1]["content"]
+        assert "transcript_ref=/tmp/sess-live-smoke.jsonl" in tool_messages[-1]["content"]
+        assert "sha256=" in tool_messages[-1]["content"]
+        assert "/tmp/live-smoke-evidence-62.log" in tool_messages[-1]["content"]
+        assert stats.tool_output_chars_after == total_tool_chars
+
     def test_token_source_metrics_include_tool_output_before_after_and_omitted(self):
         history = [
             {"role": "user", "content": "hello"},
