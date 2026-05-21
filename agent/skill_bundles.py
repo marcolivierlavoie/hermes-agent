@@ -62,6 +62,55 @@ _BUNDLE_MULTI_HYPHEN = re.compile(r"-{2,}")
 _bundles_cache: Dict[str, Dict[str, Any]] = {}
 _bundles_cache_mtime: Optional[float] = None
 
+# Runtime-level deprecation map for Marco/Biff bundle names that existed as
+# broad category proposals before the canonical narrow /biff-* workflow set.
+# These are aliases only when the canonical target bundle exists in the active
+# HERMES_HOME, so generic installations do not get phantom commands.
+DEPRECATED_BIFF_BUNDLE_ALIASES: Dict[str, Dict[str, str]] = {
+    "biff-core-ops": {
+        "target": "biff-issue-execution",
+        "reason": (
+            "biff-core-ops was too broad; use a canonical workflow bundle "
+            "such as /biff-issue-execution, /biff-meeting-followup, or "
+            "/biff-memory-knowledge-governance instead."
+        ),
+    },
+    "biff-build-verify": {
+        "target": "biff-hermes-runtime-change",
+        "reason": (
+            "biff-build-verify is superseded; Forge/Vex are role routing, "
+            "while Hermes/Biff runtime changes use /biff-hermes-runtime-change."
+        ),
+    },
+    "biff-docs-briefs": {
+        "target": "biff-research-to-decision",
+        "reason": (
+            "biff-docs-briefs was category-like; use a concrete workflow "
+            "bundle such as /biff-research-to-decision."
+        ),
+    },
+    "biff-automation-integrations": {
+        "target": "biff-automation-ownership",
+        "reason": "biff-automation-integrations is superseded by /biff-automation-ownership.",
+    },
+    "biff-meetings-mail": {
+        "target": "biff-meeting-followup",
+        "reason": "biff-meetings-mail is superseded by /biff-meeting-followup.",
+    },
+    "biff-personal-home": {
+        "target": "biff-personal-logistics",
+        "reason": (
+            "biff-personal-home was too broad; personal errands/capture use "
+            "/biff-personal-logistics, while smart-home work should load "
+            "homeassistant or openhue directly."
+        ),
+    },
+    "biff-research-synthesis": {
+        "target": "biff-research-to-decision",
+        "reason": "biff-research-synthesis is superseded by /biff-research-to-decision.",
+    },
+}
+
 
 def _bundles_dir() -> Path:
     """Return the canonical bundles directory under HERMES_HOME.
@@ -80,6 +129,30 @@ def _slugify(name: str) -> str:
     cmd = _BUNDLE_INVALID_CHARS.sub("", cmd)
     cmd = _BUNDLE_MULTI_HYPHEN.sub("-", cmd).strip("-")
     return cmd
+
+
+def get_deprecated_bundle_alias(command: str) -> Optional[Dict[str, str]]:
+    """Return deprecation metadata for a Biff bundle alias, if active.
+
+    Alias activation is deliberately existing-bundles-only: the canonical
+    target must be installed in the current HERMES_HOME before the old name
+    resolves. That preserves generic Hermes behavior while giving Marco/Biff
+    a runtime bridge away from broad historical names.
+    """
+    slug = _slugify((command or "").lstrip("/"))
+    alias = DEPRECATED_BIFF_BUNDLE_ALIASES.get(slug)
+    if not alias:
+        return None
+    target_key = f"/{alias['target']}"
+    if target_key not in get_skill_bundles():
+        return None
+    return {
+        "alias": slug,
+        "alias_key": f"/{slug}",
+        "target": alias["target"],
+        "target_key": target_key,
+        "reason": alias["reason"],
+    }
 
 
 def _iter_bundle_files() -> List[Path]:
@@ -210,12 +283,19 @@ def resolve_bundle_command_key(command: str) -> Optional[str]:
 
     Hyphens and underscores are treated interchangeably to mirror the
     skill-command behavior (Telegram converts hyphens to underscores in
-    bot command names).
+    bot command names). Deprecated Biff bundle aliases resolve to their
+    canonical targets only when those targets exist in the active bundle set.
     """
     if not command:
         return None
-    cmd_key = f"/{command.replace('_', '-')}"
-    return cmd_key if cmd_key in get_skill_bundles() else None
+    slug = _slugify(command.lstrip("/"))
+    if not slug:
+        return None
+    cmd_key = f"/{slug}"
+    if cmd_key in get_skill_bundles():
+        return cmd_key
+    alias = get_deprecated_bundle_alias(slug)
+    return alias["target_key"] if alias else None
 
 
 def reload_bundles() -> Dict[str, Any]:
@@ -254,6 +334,7 @@ def build_bundle_invocation_message(
     cmd_key: str,
     user_instruction: str = "",
     task_id: str | None = None,
+    invoked_key: str | None = None,
 ) -> Optional[Tuple[str, List[str], List[str]]]:
     """Build the user message content for a bundle slash command invocation.
 
@@ -266,7 +347,13 @@ def build_bundle_invocation_message(
     ``-s`` CLI preloading.
     """
     bundles = get_skill_bundles()
-    info = bundles.get(cmd_key)
+    deprecation = get_deprecated_bundle_alias(invoked_key or cmd_key)
+    canonical_key = deprecation["target_key"] if deprecation else cmd_key
+    info = bundles.get(canonical_key)
+    if not info:
+        resolved_key = resolve_bundle_command_key(canonical_key)
+        info = bundles.get(resolved_key or "")
+        canonical_key = resolved_key or canonical_key
     if not info:
         return None
 
@@ -327,6 +414,16 @@ def build_bundle_invocation_message(
         f"Bundle: {bundle_name}",
         f"Skills loaded: {', '.join(loaded_names)}",
     ]
+    if deprecation:
+        header_lines.extend([
+            "",
+            (
+                f"Deprecated bundle alias: {deprecation['alias_key']} → "
+                f"{deprecation['target_key']}. Use {deprecation['target_key']} "
+                "for new invocations."
+            ),
+            f"Deprecation reason: {deprecation['reason']}",
+        ])
     if missing:
         header_lines.append(f"Skills missing (skipped): {', '.join(missing)}")
     if extra_instruction:
@@ -405,6 +502,6 @@ def delete_bundle(name: str) -> Path:
 
 
 def get_bundle(name: str) -> Optional[Dict[str, Any]]:
-    """Look up a bundle by name (slug-normalized)."""
-    slug = _slugify(name)
-    return get_skill_bundles().get(f"/{slug}")
+    """Look up a bundle by name (slug-normalized), including active aliases."""
+    key = resolve_bundle_command_key(name)
+    return get_skill_bundles().get(key or "")

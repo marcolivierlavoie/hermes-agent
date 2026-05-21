@@ -183,6 +183,31 @@ class TestResolveBundleCommandKey:
     def test_empty(self, bundles_env):
         assert resolve_bundle_command_key("") is None
 
+    def test_deprecated_biff_bundle_alias_resolves_to_canonical_target(self, bundles_env):
+        bundles_dir, _ = bundles_env
+        _make_bundle_yaml(bundles_dir, "biff-hermes-runtime-change", ["s1"])
+        scan_bundles()
+
+        assert (
+            resolve_bundle_command_key("biff-build-verify")
+            == "/biff-hermes-runtime-change"
+        )
+
+    def test_deprecated_biff_bundle_alias_is_existing_bundles_only(self, bundles_env):
+        scan_bundles()
+
+        assert resolve_bundle_command_key("biff-build-verify") is None
+
+    def test_get_bundle_resolves_deprecated_biff_alias(self, bundles_env):
+        bundles_dir, _ = bundles_env
+        _make_bundle_yaml(bundles_dir, "biff-hermes-runtime-change", ["s1"])
+        scan_bundles()
+
+        info = get_bundle("biff-build-verify")
+
+        assert info is not None
+        assert info["slug"] == "biff-hermes-runtime-change"
+
 
 class TestBuildBundleInvocationMessage:
     def test_loads_all_skills(self, bundles_env):
@@ -249,6 +274,24 @@ class TestBuildBundleInvocationMessage:
         assert result is not None
         msg, _, _ = result
         assert "Always check tests first." in msg
+
+    def test_deprecated_biff_alias_loads_target_with_deprecation_notice(self, bundles_env):
+        bundles_dir, skills_dir = bundles_env
+        _make_skill(skills_dir, "skill-a")
+        _make_bundle_yaml(bundles_dir, "biff-hermes-runtime-change", ["skill-a"])
+        scan_bundles()
+
+        result = build_bundle_invocation_message(
+            "/biff-hermes-runtime-change",
+            invoked_key="/biff-build-verify",
+        )
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["skill-a"]
+        assert missing == []
+        assert "Deprecated bundle alias: /biff-build-verify" in msg
+        assert "Use /biff-hermes-runtime-change" in msg
 
     def test_dedupes_skills(self, bundles_env):
         bundles_dir, skills_dir = bundles_env

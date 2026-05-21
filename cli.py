@@ -2448,8 +2448,11 @@ from agent.skill_commands import (
     build_preloaded_skills_prompt,
 )
 from agent.skill_bundles import (
+    DEPRECATED_BIFF_BUNDLE_ALIASES,
     get_skill_bundles,
     build_bundle_invocation_message,
+    get_deprecated_bundle_alias,
+    resolve_bundle_command_key,
 )
 
 _skill_commands = scan_skill_commands()
@@ -8159,14 +8162,20 @@ class HermesCLI:
                         _cprint(f"\033[1;31mPlugin command error: {e}{_RST}")
             # Skill bundles take precedence over individual skills — /<bundle>
             # loads multiple skills at once. Rescans cheaply when files change.
-            elif base_cmd in get_skill_bundles():
+            elif (bundle_key := resolve_bundle_command_key(base_cmd)):
                 user_instruction = cmd_original[len(base_cmd):].strip()
                 bundle_result = build_bundle_invocation_message(
-                    base_cmd, user_instruction, task_id=self.session_id
+                    bundle_key, user_instruction, task_id=self.session_id, invoked_key=base_cmd
                 )
                 if bundle_result:
                     msg, loaded_names, missing = bundle_result
-                    bundle_info = get_skill_bundles()[base_cmd]
+                    bundle_info = get_skill_bundles()[bundle_key]
+                    alias_info = get_deprecated_bundle_alias(base_cmd)
+                    if alias_info:
+                        print(
+                            f"\n⚠️  Bundle {alias_info['alias_key']} is deprecated; "
+                            f"loading {alias_info['target_key']} instead."
+                        )
                     print(
                         f"\n⚡ Loading bundle: {bundle_info['name']} "
                         f"({len(loaded_names)} skills)"
@@ -8200,7 +8209,17 @@ class HermesCLI:
                 # that execution-time resolution agrees with tab-completion.
                 from hermes_cli.commands import COMMANDS
                 typed_base = cmd_lower.split()[0]
-                all_known = set(COMMANDS) | set(_skill_commands) | set(get_skill_bundles())
+                deprecated_bundle_aliases = {
+                    f"/{slug}"
+                    for slug in DEPRECATED_BIFF_BUNDLE_ALIASES
+                    if get_deprecated_bundle_alias(slug)
+                }
+                all_known = (
+                    set(COMMANDS)
+                    | set(_skill_commands)
+                    | set(get_skill_bundles())
+                    | deprecated_bundle_aliases
+                )
                 matches = [c for c in all_known if c.startswith(typed_base)]
                 if len(matches) > 1:
                     # Prefer an exact match (typed the full command name)

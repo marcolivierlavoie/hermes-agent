@@ -7471,7 +7471,10 @@ class GatewayRunner:
                 if bundle_key is not None:
                     user_instruction = event.get_command_args().strip()
                     bundle_result = build_bundle_invocation_message(
-                        bundle_key, user_instruction, task_id=_quick_key
+                        bundle_key,
+                        user_instruction,
+                        task_id=_quick_key,
+                        invoked_key=f"/{command.replace('_', '-')}",
                     )
                     if bundle_result:
                         msg, _loaded, missing = bundle_result
