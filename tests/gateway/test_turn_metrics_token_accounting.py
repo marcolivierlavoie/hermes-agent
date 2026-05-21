@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from gateway.run import (
+    _biff_trivial_greeting_fast_response,
     _gateway_hygiene_needs_compress,
     _gateway_turn_token_metrics,
     _gateway_turn_wall_metrics,
@@ -120,3 +121,23 @@ def test_hygiene_token_threshold_overrides_actual_token_source():
 
     assert needs_compress is True
     assert reason == "token_threshold"
+
+
+def test_biff_trivial_greeting_fast_path_accepts_exact_discord_salutations():
+    assert (
+        _biff_trivial_greeting_fast_response(platform="discord", text="hi")
+        == "Hi Marco."
+    )
+    assert (
+        _biff_trivial_greeting_fast_response(platform=SimpleNamespace(value="discord"), text="Hello!")
+        == "Hi Marco."
+    )
+
+
+def test_biff_trivial_greeting_fast_path_rejects_nontrivial_or_non_discord_messages():
+    assert _biff_trivial_greeting_fast_response(platform="slack", text="hi") is None
+    assert _biff_trivial_greeting_fast_response(platform="discord", text="hi can you check 637") is None
+    assert _biff_trivial_greeting_fast_response(platform="discord", text="check 637") is None
+    assert _biff_trivial_greeting_fast_response(platform="discord", text="/help") is None
+    assert _biff_trivial_greeting_fast_response(platform="discord", text="<@123> hi") is None
+    assert _biff_trivial_greeting_fast_response(platform="discord", text="hi", enabled=False) is None

@@ -271,9 +271,25 @@ def _gateway_hygiene_needs_compress(
     return False, "below_threshold"
 
 
+_BIFF_TRIVIAL_GREETING_RE = re.compile(r"^(?:hi|hello|hey|yo|sup)[!.?\s]*$", re.IGNORECASE)
+
+
 def _gateway_platform_value(platform: Any) -> str:
     """Return a normalized gateway platform value for enums or raw strings."""
     return str(getattr(platform, "value", platform) or "").strip().lower()
+
+
+def _biff_trivial_greeting_fast_response(*, platform: Any, text: Any, enabled: bool = True) -> Optional[str]:
+    """Return a local response for exact low-value Discord greetings."""
+    if not enabled or _gateway_platform_value(platform) != "discord":
+        return None
+    raw = str(text or "")
+    stripped = raw.strip()
+    if not stripped or "\n" in stripped or "/" in stripped or "@" in stripped:
+        return None
+    if not _BIFF_TRIVIAL_GREETING_RE.fullmatch(stripped):
+        return None
+    return "Hi Marco."
 
 
 def _redact_gateway_user_facing_secrets(text: str) -> str:
@@ -8234,6 +8250,40 @@ class GatewayRunner:
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
+
+        _fast_greeting = _biff_trivial_greeting_fast_response(
+            platform=source.platform,
+            text=event.text,
+            enabled=(
+                os.getenv("HERMES_BIFF_TRIVIAL_GREETING_FAST_PATH", "1").lower()
+                not in {"0", "false", "no", "off"}
+                and getattr(event, "auto_skill", None) is None
+            ),
+        )
+        if _fast_greeting:
+            _fast_elapsed = time.monotonic() - _msg_start_monotonic
+            logger.info(
+                "biff_fast_path_metrics: platform=%s chat=%s session=%s kind=trivial_greeting time=%.3fs response_chars=%d",
+                _platform_name,
+                source.chat_id or "unknown",
+                session_entry.session_id,
+                _fast_elapsed,
+                len(_fast_greeting),
+            )
+            _ts = datetime.now().isoformat()
+            _user_entry = {"role": "user", "content": str(event.text or ""), "timestamp": _ts}
+            if event.message_id:
+                _user_entry["message_id"] = str(event.message_id)
+            try:
+                self.session_store.append_to_transcript(session_entry.session_id, _user_entry)
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {"role": "assistant", "content": _fast_greeting, "timestamp": _ts},
+                )
+                self.session_store.update_session(session_entry.session_key, last_prompt_tokens=0)
+            except Exception as _fast_err:
+                logger.debug("trivial greeting fast-path transcript write failed: %s", _fast_err)
+            return _fast_greeting
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
