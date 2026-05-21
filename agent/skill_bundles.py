@@ -61,6 +61,7 @@ _BUNDLE_MULTI_HYPHEN = re.compile(r"-{2,}")
 
 _bundles_cache: Dict[str, Dict[str, Any]] = {}
 _bundles_cache_mtime: Optional[float] = None
+_DEFAULT_SUMMARY_MAX_CHARS = 1200
 
 # Runtime-level deprecation map for Marco/Biff bundle names that existed as
 # broad category proposals before the canonical narrow /biff-* workflow set.
@@ -186,6 +187,88 @@ def _max_mtime(files: List[Path]) -> float:
     return max(mtimes) if mtimes else 0.0
 
 
+def _normalize_skill_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a bundle skill entry while preserving string defaults.
+
+    Historical bundle YAML used ``skills: [linear, ...]``. BIF-630 adds an
+    opt-in mapping form for bounded prompt loading without changing the old
+    behavior for plain strings.
+    """
+    if isinstance(entry, str):
+        name = entry.strip()
+        if not name:
+            return None
+        return {"name": name, "mode": "full"}
+
+    if not isinstance(entry, dict):
+        return None
+
+    name = str(entry.get("name") or entry.get("skill") or "").strip()
+    if not name:
+        return None
+
+    mode = str(entry.get("mode") or "full").strip().lower()
+    if mode not in {"full", "summary"}:
+        mode = "full"
+
+    normalized: Dict[str, Any] = {"name": name, "mode": mode}
+    if "max_chars" in entry:
+        try:
+            normalized["max_chars"] = max(1, int(entry["max_chars"]))
+        except (TypeError, ValueError):
+            pass
+    return normalized
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    """Return a bounded text prefix with a small truncation marker."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    marker = "\n\n[Truncated for bundle summary mode.]"
+    budget = max(1, max_chars - len(marker))
+    return text[:budget].rstrip() + marker
+
+
+def _skill_summary_content(loaded_skill: Dict[str, Any]) -> str:
+    """Extract summary-mode content, preferring body text over frontmatter."""
+    content = str(loaded_skill.get("content") or "").strip()
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) == 3:
+            content = parts[2].strip()
+    lines = content.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and lines[0].lstrip().startswith("#"):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _build_summary_skill_message(
+    loaded_skill: Dict[str, Any],
+    skill_name: str,
+    activation_note: str,
+    max_chars: int,
+) -> str:
+    """Format a compact bundle skill payload with an explicit escalation path."""
+    content = _truncate_text(_skill_summary_content(loaded_skill), max_chars)
+    description = str(loaded_skill.get("description") or "").strip()
+    parts = [
+        activation_note,
+        f"[Summary-loaded skill: {skill_name}. This bundle intentionally loaded a bounded excerpt to reduce Discord-turn latency and token cost.]",
+        (
+            f'If the task depends on details not present here, call skill_view(name="{skill_name}") '
+            "before acting."
+        ),
+    ]
+    if description:
+        parts.append(f"Description: {description}")
+    if content:
+        parts.extend(["", content])
+    return "\n".join(parts)
+
+
 def _load_bundle_file(path: Path) -> Optional[Dict[str, Any]]:
     """Parse a single bundle YAML file. Returns ``None`` on any error.
 
@@ -211,12 +294,15 @@ def _load_bundle_file(path: Path) -> Optional[Dict[str, Any]]:
         logger.warning("Bundle %s has no name; skipping", path)
         return None
 
-    skills = data.get("skills") or []
-    if not isinstance(skills, list) or not skills:
+    raw_skills = data.get("skills") or []
+    if not isinstance(raw_skills, list) or not raw_skills:
         logger.warning("Bundle %s has no skills list; skipping", path)
         return None
-    skills = [str(s).strip() for s in skills if str(s).strip()]
-    if not skills:
+    skill_entries = [
+        entry for entry in (_normalize_skill_entry(s) for s in raw_skills) if entry
+    ]
+    skills = [entry["name"] for entry in skill_entries]
+    if not skill_entries:
         logger.warning("Bundle %s has empty skills list; skipping", path)
         return None
 
@@ -233,6 +319,7 @@ def _load_bundle_file(path: Path) -> Optional[Dict[str, Any]]:
         "slug": slug,
         "description": description or f"Load {len(skills)} skills as a bundle",
         "skills": skills,
+        "skill_entries": skill_entries,
         "instruction": instruction,
         "path": str(path),
     }
@@ -367,11 +454,15 @@ def build_bundle_invocation_message(
     seen: set[str] = set()
 
     bundle_name = info["name"]
-    skills = info["skills"]
+    skill_entries = info.get("skill_entries") or [
+        {"name": str(skill_id).strip(), "mode": "full"}
+        for skill_id in info.get("skills", [])
+        if str(skill_id).strip()
+    ]
     extra_instruction = info.get("instruction") or ""
 
-    for skill_id in skills:
-        identifier = (skill_id or "").strip()
+    for skill_entry in skill_entries:
+        identifier = str(skill_entry.get("name") or "").strip()
         if not identifier or identifier in seen:
             continue
         seen.add(identifier)
@@ -391,14 +482,25 @@ def build_bundle_invocation_message(
         activation_note = (
             f'[Loaded as part of the "{bundle_name}" skill bundle.]'
         )
-        skill_blocks.append(
-            _build_skill_message(
-                loaded_skill,
-                skill_dir,
-                activation_note,
-                session_id=task_id,
+        if skill_entry.get("mode") == "summary":
+            max_chars = int(skill_entry.get("max_chars") or _DEFAULT_SUMMARY_MAX_CHARS)
+            skill_blocks.append(
+                _build_summary_skill_message(
+                    loaded_skill,
+                    skill_name,
+                    activation_note,
+                    max_chars=max_chars,
+                )
             )
-        )
+        else:
+            skill_blocks.append(
+                _build_skill_message(
+                    loaded_skill,
+                    skill_dir,
+                    activation_note,
+                    session_id=task_id,
+                )
+            )
         loaded_names.append(skill_name)
 
     if not skill_blocks:

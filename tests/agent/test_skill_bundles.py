@@ -293,6 +293,48 @@ class TestBuildBundleInvocationMessage:
         assert "Deprecated bundle alias: /biff-build-verify" in msg
         assert "Use /biff-hermes-runtime-change" in msg
 
+    def test_summary_mode_loads_bounded_skill_payload(self, bundles_env):
+        bundles_dir, skills_dir = bundles_env
+        long_body = "Visible start.\n" + ("too much detail\n" * 200) + "Invisible tail."
+        _make_skill(skills_dir, "long-skill", body=long_body)
+        (bundles_dir / "summary-combo.yaml").parent.mkdir(parents=True, exist_ok=True)
+        (bundles_dir / "summary-combo.yaml").write_text(
+            "name: summary-combo\n"
+            "skills:\n"
+            "  - name: long-skill\n"
+            "    mode: summary\n"
+            "    max_chars: 80\n"
+        )
+        scan_bundles()
+
+        result = build_bundle_invocation_message("/summary-combo")
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["long-skill"]
+        assert missing == []
+        assert "Visible start." in msg
+        assert "Invisible tail." not in msg
+        assert "Summary-loaded skill" in msg
+        assert 'skill_view(name="long-skill")' in msg
+        assert len(msg) < 2500
+
+    def test_plain_string_skill_entry_still_loads_full_payload(self, bundles_env):
+        bundles_dir, skills_dir = bundles_env
+        _make_skill(skills_dir, "full-skill", body="Visible start.\nInvisible tail.")
+        _make_bundle_yaml(bundles_dir, "full-combo", ["full-skill"])
+        scan_bundles()
+
+        result = build_bundle_invocation_message("/full-combo")
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["full-skill"]
+        assert missing == []
+        assert "Visible start." in msg
+        assert "Invisible tail." in msg
+        assert "Summary-loaded skill" not in msg
+
     def test_dedupes_skills(self, bundles_env):
         bundles_dir, skills_dir = bundles_env
         _make_skill(skills_dir, "skill-a")
