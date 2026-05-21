@@ -719,6 +719,18 @@ async def get_status():
     }
 
 
+@app.get("/api/security")
+async def get_security_posture():
+    """Return a safe, read-only Security/Trust posture summary."""
+    from hermes_cli.security_posture import build_security_posture
+
+    try:
+        return build_security_posture()
+    except Exception as exc:
+        _log.exception("Failed to build security posture")
+        raise HTTPException(status_code=500, detail=f"Security posture unavailable: {type(exc).__name__}")
+
+
 # ---------------------------------------------------------------------------
 # Gateway + update actions (invoked from the Status page).
 #

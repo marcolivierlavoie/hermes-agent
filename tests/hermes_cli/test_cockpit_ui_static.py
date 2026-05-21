@@ -377,6 +377,18 @@ def test_cockpit_ops_checks_section_surfaces_n8n_daily_checks_read_only():
     assert "Output summary" in page
 
 
+def test_cockpit_health_surfaces_compact_security_trust_card_read_only():
+    page = COCKPIT_PAGE.read_text(encoding="utf-8")
+
+    assert "function SecurityTrustCard" in page
+    assert 'data-testid="cockpit-security-trust-card"' in page
+    assert "Security / Trust" in page
+    assert "api.getSecurity().catch(() => null)" in page
+    assert "No credential values, secret paths, intrusive scans, arbitrary host scans, or mutations." in page
+    assert "IPs masked" in page
+    assert "raw telemetry" not in page.lower()
+
+
 def test_cockpit_home_prioritizes_now_attention_activity_and_local_chat():
     page = COCKPIT_PAGE.read_text(encoding="utf-8")
     lowered = page.lower()

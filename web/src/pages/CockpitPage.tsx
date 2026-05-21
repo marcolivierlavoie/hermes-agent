@@ -33,6 +33,7 @@ import {
   type CockpitSignal,
   type CockpitSignalsResponse,
   type CockpitTranscriptWindow,
+  type SecurityPostureResponse,
   type StatusResponse,
 } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
@@ -725,7 +726,46 @@ function automationBucketLabel(bucket: string): string {
   return safeText(bucket || "Observed");
 }
 
-function AutomationHealthPanel({ response, loading, error, onInvestigate }: { response: CockpitAutomationHealthResponse | null; loading: boolean; error: string | null; onInvestigate: (card: CockpitAutomationHealthCard) => void }) {
+function SecurityTrustCard({ posture }: { posture: SecurityPostureResponse | null }) {
+  const topFinding = posture?.findings?.[0];
+  const unapproved = Number(posture?.exposure?.unapproved_public_listeners ?? 0);
+  const publicListeners = Number(posture?.exposure?.public_listeners ?? 0);
+  const tone = unapproved > 0 ? "warning" : "success";
+  return (
+    <article className="rounded-3xl border border-[var(--cockpit-border)] bg-[var(--cockpit-panel)] p-4" data-testid="cockpit-security-trust-card">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone={tone} className="text-[10px] uppercase tracking-[0.18em]">Security / Trust</Badge>
+            <Badge tone="secondary" className="text-[10px] uppercase tracking-[0.18em]">read-only</Badge>
+            <Badge tone="secondary" className="text-[10px] uppercase tracking-[0.18em]">IPs masked</Badge>
+          </div>
+          <p className="mt-3 break-words text-sm font-semibold text-[var(--cockpit-text)]">{posture ? `${posture.label} · ${posture.score}/100` : "Security posture unavailable"}</p>
+          <p className="mt-2 break-words text-sm leading-6 text-[color-mix(in_srgb,var(--cockpit-text)_78%,transparent)]">{posture ? boundedCopy(posture.summary, 220) : "Safe local collectors did not return a posture summary yet."}</p>
+        </div>
+        <div className="grid min-w-[10rem] grid-cols-2 gap-2 text-xs">
+          <div className="rounded-2xl bg-[var(--cockpit-shell-raised)] p-3">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--cockpit-muted)]">Public</p>
+            <p className="mt-1 font-mono-ui text-[var(--cockpit-text)]">{publicListeners}</p>
+          </div>
+          <div className="rounded-2xl bg-[var(--cockpit-shell-raised)] p-3">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--cockpit-muted)]">Review</p>
+            <p className="mt-1 font-mono-ui text-[var(--cockpit-text)]">{unapproved}</p>
+          </div>
+        </div>
+      </div>
+      {topFinding && (
+        <div className="mt-3 rounded-2xl border border-[color-mix(in_srgb,var(--cockpit-warning)_28%,transparent)] bg-[var(--cockpit-warning-soft)] p-3 text-xs leading-5 text-[color-mix(in_srgb,var(--cockpit-warning)_86%,var(--cockpit-text)_14%)]">
+          <p className="font-semibold">Recommended: {safeText(topFinding.title)}</p>
+          <p className="mt-1">{boundedCopy(topFinding.recommendations?.[0] || topFinding.detail, 180)}</p>
+        </div>
+      )}
+      <p className="cockpit-meta mt-3 break-words text-[11px] text-[var(--cockpit-muted)]">{boundedCopy(posture?.note || "No credential values, secret paths, intrusive scans, arbitrary host scans, or mutations.", 220)}</p>
+    </article>
+  );
+}
+
+function AutomationHealthPanel({ response, loading, error, securityPosture, onInvestigate }: { response: CockpitAutomationHealthResponse | null; loading: boolean; error: string | null; securityPosture: SecurityPostureResponse | null; onInvestigate: (card: CockpitAutomationHealthCard) => void }) {
   const cards = response?.cards ?? [];
   const counts = response?.summary;
   const buckets: Array<{ key: "attention" | "healthy" | "stale_or_failing"; label: string; value: number }> = [
@@ -756,6 +796,8 @@ function AutomationHealthPanel({ response, loading, error, onInvestigate }: { re
           <Badge tone="secondary">mutation_enabled {String(response?.mutation_enabled ?? false)}</Badge>
           <Badge tone="secondary">Last checked/source</Badge>
         </div>
+
+        <SecurityTrustCard posture={securityPosture} />
 
         {loading && !response && <div className="flex min-h-40 items-center justify-center text-sm text-[var(--cockpit-muted)]"><Spinner className="mr-2 text-[var(--cockpit-active)]" /> Loading automation health…</div>}
         {!loading && error && <p className="rounded-3xl border border-[color-mix(in_srgb,var(--cockpit-risk)_30%,transparent)] bg-[var(--cockpit-risk-soft)] p-4 text-sm text-[color-mix(in_srgb,var(--cockpit-risk)_82%,var(--cockpit-text)_18%)]">Could not load automation health: {boundedCopy(error, 180)}</p>}
@@ -889,6 +931,7 @@ export default function CockpitPage({ standalone = false }: { standalone?: boole
   const [dailyOpsRadar, setDailyOpsRadar] = useState<CockpitDailyOpsRadarResponse | null>(null);
   const [selfWorkHandoff, setSelfWorkHandoff] = useState<CockpitSelfWorkHandoffResponse | null>(null);
   const [dashboardStatus, setDashboardStatus] = useState<StatusResponse | null>(null);
+  const [securityPosture, setSecurityPosture] = useState<SecurityPostureResponse | null>(null);
   const [automationHealthLoading, setAutomationHealthLoading] = useState(false);
   const [n8nChecksLoading, setN8nChecksLoading] = useState(false);
   const [automationHealthError, setAutomationHealthError] = useState<string | null>(null);
@@ -925,8 +968,9 @@ export default function CockpitPage({ standalone = false }: { standalone?: boole
       api.getCockpitDailyOpsRadar(),
       api.getCockpitSelfWorkHandoff(),
       api.getStatus(),
+      api.getSecurity().catch(() => null),
     ])
-      .then(([capabilities, laneResponse, signalResponse, agentActivityResponse, automationResponse, n8nResponse, radarResponse, handoffResponse, statusResponse]) => {
+      .then(([capabilities, laneResponse, signalResponse, agentActivityResponse, automationResponse, n8nResponse, radarResponse, handoffResponse, statusResponse, securityResponse]) => {
         setCapabilityReadOnly(Boolean(capabilities.read_only));
         setInputEnabled(Boolean(capabilities.input_enabled));
         setExternalSendEnabled(Boolean(capabilities.external_send_enabled));
@@ -940,6 +984,7 @@ export default function CockpitPage({ standalone = false }: { standalone?: boole
         setDailyOpsRadar(radarResponse);
         setSelfWorkHandoff(handoffResponse);
         setDashboardStatus(statusResponse);
+        setSecurityPosture(securityResponse);
         const firstSignalLane = categorySignals(signalResponse, "now")[0]?.lane_id;
         setSelectedLaneId((current) => {
           if (current && laneResponse.lanes.some((lane) => lane.lane_id === current)) return current;
@@ -1258,7 +1303,7 @@ export default function CockpitPage({ standalone = false }: { standalone?: boole
 
               {activeSection === "automation-health" && (
                 <section data-testid="cockpit-section-automation-health" className="grid gap-5">
-                  <AutomationHealthPanel response={automationHealth} loading={automationHealthLoading} error={automationHealthError} onInvestigate={handleInvestigateHealthCard} />
+                  <AutomationHealthPanel response={automationHealth} loading={automationHealthLoading} error={automationHealthError} securityPosture={securityPosture} onInvestigate={handleInvestigateHealthCard} />
                   <details className="group rounded-[2rem] border border-[var(--cockpit-border)] bg-[var(--cockpit-card)] p-4 shadow-[0_20px_70px_rgba(0,0,0,0.24)]" data-testid="cockpit-health-n8n-details">
                     <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold text-[var(--cockpit-text)]">
                       <span className="flex items-center gap-2"><Radar className="h-4 w-4 text-[var(--cockpit-active)]" /> Daily n8n checks</span>

@@ -63,6 +63,7 @@ async function getSessionToken(): Promise<string> {
 
 export const api = {
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+  getSecurity: () => fetchJSON<SecurityPostureResponse>("/api/security"),
   getSessions: (limit = 20, offset = 0) =>
     fetchJSON<PaginatedSessions>(`/api/sessions?limit=${limit}&offset=${offset}`),
   getSessionMessages: (id: string) =>
@@ -838,6 +839,46 @@ export interface CockpitAgentActivityResponse {
   total: number;
   counts: Record<string, number>;
   empty_state: string;
+}
+
+export interface SecurityFinding {
+  id: string;
+  severity: "low" | "medium" | "high" | "critical" | string;
+  title: string;
+  detail: string;
+  why: string;
+  items: string[];
+  recommendations: string[];
+  nextProbe: string;
+}
+
+export interface SecurityPostureResponse {
+  score: number;
+  label: string;
+  summary: string;
+  findings: SecurityFinding[];
+  compliance: Record<string, unknown>;
+  versions: Record<string, string>;
+  packageUpdates: Record<string, unknown>;
+  exposure: {
+    listeners_total?: number;
+    public_listeners?: number;
+    unapproved_public_listeners?: number;
+    allowed_public_ports?: string[];
+    listeners?: Array<Record<string, unknown>>;
+    [key: string]: unknown;
+  };
+  network: {
+    masked_ips?: boolean;
+    raw_paths_or_values?: boolean;
+    collector?: string;
+    available?: boolean;
+    error?: string | null;
+    [key: string]: unknown;
+  };
+  note: string;
+  generated_at?: number;
+  read_only?: boolean;
 }
 
 export interface PlatformStatus {
