@@ -60,6 +60,36 @@ def _make_large_history_tokens(target_tokens: int) -> list:
     return _make_history(n_msgs, content_size=content_size)
 
 
+def _make_tool_history(
+    n_messages: int,
+    *,
+    large_every: int = 1,
+    large_size: int = 20_000,
+    small_size: int = 2_000,
+    call_prefix: str = "call",
+    evidence_prefix: str = "evidence",
+) -> list[dict]:
+    """Build assistant/tool pairs with predictable large-output candidates."""
+
+    history = []
+    for i in range(n_messages):
+        is_large = i % large_every == 0
+        size = large_size if is_large else small_size
+        history.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"{call_prefix}_{i}"}]})
+        history.append(
+            {
+                "role": "tool",
+                "tool_call_id": f"{call_prefix}_{i}",
+                "content": f"tool {i} wrote /tmp/{evidence_prefix}-{i}.log\n" + (str(i % 10) * size),
+            }
+        )
+    return history
+
+
+def _tool_content_chars(history: list[dict]) -> int:
+    return sum(len(m["content"]) for m in history if m.get("role") == "tool")
+
+
 class HygieneCaptureAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
@@ -332,6 +362,122 @@ class TestSessionHygieneCaps:
         assert "transcript_ref=sqlite:sess-mixed" in tool_messages[0]["content"]
         assert "sha256=" in tool_messages[0]["content"]
         assert "/tmp/mixed-evidence-0.txt" in tool_messages[0]["content"]
+        assert stats.tool_outputs_capped_count > 0
+        assert stats.tool_output_chars_after == total_tool_chars
+
+    @pytest.mark.parametrize(
+        ("candidate_count", "expected_budget"),
+        [
+            (15, 48_000),
+            (16, 32_000),
+            (32, 24_000),
+            (64, 16_000),
+        ],
+    )
+    def test_default_aggregate_tool_budget_adapts_at_candidate_thresholds(self, candidate_count, expected_budget):
+        history = _make_tool_history(
+            candidate_count,
+            call_prefix="call_adaptive",
+            evidence_prefix="adaptive-evidence",
+        )
+
+        capped, stats = cap_model_facing_tool_outputs(
+            history,
+            session_id="sess-adaptive",
+            transcript_ref="/tmp/sess-adaptive.jsonl",
+            max_tool_output_chars=16_000,
+            preview_chars=1_000,
+        )
+
+        total_tool_chars = _tool_content_chars(capped)
+        assert total_tool_chars <= expected_budget
+        assert [m["role"] for m in capped] == [m["role"] for m in history]
+        assert capped[-2]["tool_calls"] == history[-2]["tool_calls"]
+        assert capped[-1]["tool_call_id"] == f"call_adaptive_{candidate_count - 1}"
+        assert stats.tool_outputs_capped_count == candidate_count
+        assert stats.tool_output_chars_after == total_tool_chars
+
+        explicit_capped, _ = cap_model_facing_tool_outputs(
+            history,
+            session_id="sess-adaptive-explicit",
+            transcript_ref="/tmp/sess-adaptive-explicit.jsonl",
+            max_tool_output_chars=16_000,
+            max_total_tool_output_chars=48_000,
+            preview_chars=1_000,
+        )
+        explicit_total = _tool_content_chars(explicit_capped)
+        if expected_budget < 48_000:
+            assert explicit_total > expected_budget
+        else:
+            assert total_tool_chars > 32_000
+
+        if candidate_count >= 64:
+            tool_messages = [m for m in capped if m["role"] == "tool"]
+            assert "[Gateway model-facing historical tool output summarized]" in tool_messages[-1]["content"]
+            assert "session_id=sess-adaptive" in tool_messages[-1]["content"]
+            assert f"message_index={candidate_count * 2 - 1}" in tool_messages[-1]["content"]
+            assert "transcript_ref=/tmp/sess-adaptive.jsonl" in tool_messages[-1]["content"]
+            assert "sha256=" in tool_messages[-1]["content"]
+            assert "omitted_chars=" in tool_messages[-1]["content"]
+            assert f"/tmp/adaptive-evidence-{candidate_count - 1}.log" in tool_messages[-1]["content"]
+
+    def test_explicit_aggregate_tool_budget_remains_non_adaptive_for_many_outputs(self):
+        history = _make_tool_history(72, call_prefix="call_explicit", evidence_prefix="explicit-evidence")
+
+        capped, stats = cap_model_facing_tool_outputs(
+            history,
+            session_id="sess-explicit",
+            transcript_ref="/tmp/sess-explicit.jsonl",
+            max_tool_output_chars=16_000,
+            max_total_tool_output_chars=48_000,
+            preview_chars=1_000,
+        )
+
+        total_tool_chars = _tool_content_chars(capped)
+        assert 16_000 < total_tool_chars <= 48_000
+        assert stats.tool_outputs_capped_count == 72
+        assert stats.tool_output_chars_after == total_tool_chars
+
+    @pytest.mark.parametrize("disabled_budget", [0, -1])
+    def test_explicit_non_positive_aggregate_budget_disables_aggregate_cap(self, disabled_budget):
+        history = _make_tool_history(8, call_prefix="call_disabled", evidence_prefix="disabled-evidence")
+
+        capped, stats = cap_model_facing_tool_outputs(
+            history,
+            session_id="sess-disabled",
+            transcript_ref="/tmp/sess-disabled.jsonl",
+            max_tool_output_chars=16_000,
+            max_total_tool_output_chars=disabled_budget,
+            preview_chars=1_000,
+        )
+
+        tool_messages = [m for m in capped if m["role"] == "tool"]
+        assert all("[Gateway model-facing tool output capped]" in m["content"] for m in tool_messages)
+        assert all("[Gateway model-facing historical tool output summarized]" not in m["content"] for m in tool_messages)
+        assert _tool_content_chars(capped) > 16_000
+        assert stats.tool_outputs_capped_count == 8
+        assert stats.tool_output_chars_after == _tool_content_chars(capped)
+
+    def test_default_adaptive_budget_counts_large_candidates_not_total_tool_messages(self):
+        history = _make_tool_history(
+            30,
+            large_every=3,
+            call_prefix="call_mixed_default",
+            evidence_prefix="mixed-default-evidence",
+        )
+
+        capped, stats = cap_model_facing_tool_outputs(
+            history,
+            session_id="sess-mixed-default",
+            transcript_ref="/tmp/sess-mixed-default.jsonl",
+            max_tool_output_chars=16_000,
+            preview_chars=1_000,
+        )
+
+        tool_messages = [m for m in capped if m["role"] == "tool"]
+        total_tool_chars = _tool_content_chars(capped)
+        assert 32_000 < total_tool_chars <= 48_000
+        assert tool_messages[-1]["content"].startswith("tool 29 wrote")
         assert stats.tool_outputs_capped_count > 0
         assert stats.tool_output_chars_after == total_tool_chars
 

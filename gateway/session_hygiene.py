@@ -20,6 +20,9 @@ DEFAULT_HYGIENE_MAX_CONTENT_CHARS = 24_000
 DEFAULT_HYGIENE_MAX_TOOL_OUTPUT_CHARS = 4_000
 DEFAULT_MODEL_FACING_TOOL_OUTPUT_CHARS = 16_000
 DEFAULT_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS = 48_000
+ADAPTIVE_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS_MANY = 32_000
+ADAPTIVE_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS_HEAVY = 24_000
+ADAPTIVE_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS_EXTREME = 16_000
 DEFAULT_TOOL_PREVIEW_CHARS = 1_000
 
 BIFF_OPERATING_MODES: tuple[str, ...] = ("normal", "economy", "emergency", "evidence-only")
@@ -527,13 +530,32 @@ def _fit_tool_output_marker_to_budget(marker: str, max_chars: int) -> str:
     return marker[: max_chars - len(suffix)] + suffix
 
 
+def _adaptive_total_tool_output_budget(capped_candidate_count: int) -> int:
+    """Return the default aggregate model-facing tool-output budget.
+
+    Keep the historical 48k floor for ordinary turns. When a Discord/Biff
+    session has many historical tool outputs that all require summarization,
+    fixed 48k markers become the prompt floor; step the default down while the
+    marker algorithm still preserves newest retrieval handles first.
+    """
+
+    count = int(capped_candidate_count or 0)
+    if count >= 64:
+        return ADAPTIVE_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS_EXTREME
+    if count >= 32:
+        return ADAPTIVE_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS_HEAVY
+    if count >= 16:
+        return ADAPTIVE_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS_MANY
+    return DEFAULT_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS
+
+
 def cap_model_facing_tool_outputs(
     history: Iterable[Mapping[str, Any]],
     *,
     session_id: str,
     transcript_ref: str,
     max_tool_output_chars: int = DEFAULT_MODEL_FACING_TOOL_OUTPUT_CHARS,
-    max_total_tool_output_chars: int | None = DEFAULT_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS,
+    max_total_tool_output_chars: int | None = None,
     preview_chars: int = DEFAULT_TOOL_PREVIEW_CHARS,
     max_message_content_chars: int | None = None,
 ) -> tuple[list[dict[str, Any]], ToolOutputCapStats]:
@@ -550,6 +572,7 @@ def cap_model_facing_tool_outputs(
     chars_before = 0
     chars_after = 0
     omitted_total = 0
+    aggregate_budget_enabled = max_total_tool_output_chars is None or int(max_total_tool_output_chars or 0) > 0
     total_budget = int(max_total_tool_output_chars or 0)
     tool_entries: list[dict[str, Any]] = []
 
@@ -573,7 +596,7 @@ def cap_model_facing_tool_outputs(
             chars_after += _content_char_len(content)
             continue
 
-        if total_budget <= 0:
+        if not aggregate_budget_enabled:
             if len(content) <= max_tool_output_chars:
                 chars_after += len(content)
                 continue
@@ -619,7 +642,12 @@ def cap_model_facing_tool_outputs(
             }
         )
 
-    if total_budget > 0 and tool_entries:
+    if aggregate_budget_enabled and tool_entries:
+        if max_total_tool_output_chars is None:
+            capped_candidate_count = sum(
+                1 for entry in tool_entries if len(entry["raw"]) > int(max_tool_output_chars or 0)
+            )
+            total_budget = _adaptive_total_tool_output_budget(capped_candidate_count)
         # Reserve a compact retrieval marker for every string tool/function
         # message first. Then spend any surplus from newest to oldest to keep
         # recent raw small outputs or richer head/tail previews. This makes the
@@ -628,10 +656,13 @@ def cap_model_facing_tool_outputs(
         final_by_entry: dict[int, tuple[str, int]] = {}
         if base_total > total_budget:
             remaining = total_budget
-            for entry_pos, entry in enumerate(tool_entries):
+            for entry_pos in range(len(tool_entries) - 1, -1, -1):
+                entry = tool_entries[entry_pos]
                 marker = _fit_tool_output_marker_to_budget(entry["summary"], remaining)
                 final_by_entry[entry_pos] = (marker, entry["summary_omitted"])
                 remaining -= len(marker)
+            for entry_pos in range(len(tool_entries)):
+                final_by_entry.setdefault(entry_pos, ("", tool_entries[entry_pos]["summary_omitted"]))
         else:
             surplus = total_budget - base_total
             for entry_pos, entry in enumerate(tool_entries):
