@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "default_mode": "dry_run",
+  "require_global_enable_env": "BIF669_WATCHDOG_REMEDIATION_ENABLE",
+  "require_allow_rule_flag": true,
+  "allowed_action_classes": [
+    "mac_launchd_restart"
+  ],
+  "blocked_action_classes": [
+    "host_reboot",
+    "guest_reboot",
+    "guest_restart",
+    "hard_power_cycle",
+    "wake_on_lan",
+    "network_change",
+    "dns_change",
+    "storage_change",
+    "snapshot_delete",
+    "backup_restore",
+    "credential_change",
+    "public_exposure_change"
+  ],
+  "rules": [
+    {
+      "id": "hermes_dashboard_down",
+      "description": "Runbook-backed restart of local Hermes dashboard launchd service after a down alert.",
+      "runbook": "/Users/marco/Library/Mobile Documents/iCloud~md~obsidian/Documents/SecondBrain/02-Areas/Hermes/Biff Homelab Recovery Runbooks - BIF-669.md#biff--hermes-launchd-services",
+      "action_class": "mac_launchd_restart",
+      "risk": "low",
+      "production": false,
+      "default_action": "dry_run",
+      "conditions": {
+        "event": "down",
+        "target": "hermes_dashboard"
+      },
+      "precheck": {
+        "type": "http_2xx",
+        "url": "http://127.0.0.1:9119/api/status",
+        "timeout_seconds": 5
+      },
+      "command": ["scripts/restart-hermes-dashboard.sh"],
+      "postcheck": {
+        "type": "http_2xx",
+        "url": "http://127.0.0.1:9119/api/status",
+        "timeout_seconds": 5
+      }
+    },
+    {
+      "id": "n8n_production_down",
+      "description": "Runbook-backed n8n production launchd restart. Production auto-remediation remains opt-in only.",
+      "runbook": "/Users/marco/Library/Mobile Documents/iCloud~md~obsidian/Documents/SecondBrain/02-Areas/Hermes/Biff Homelab Recovery Runbooks - BIF-669.md#n8n",
+      "action_class": "mac_launchd_restart",
+      "risk": "medium",
+      "production": true,
+      "default_action": "dry_run",
+      "conditions": {
+        "event": "down",
+        "target": "n8n_production"
+      },
+      "precheck": {
+        "type": "http_2xx",
+        "url": "http://127.0.0.1:5678/healthz",
+        "timeout_seconds": 5
+      },
+      "command": ["scripts/restart-n8n-production.sh"],
+      "postcheck": {
+        "type": "http_2xx",
+        "url": "http://127.0.0.1:5678/healthz",
+        "timeout_seconds": 5
+      }
+    },
+    {
+      "id": "hermes_gateway_down",
+      "description": "Runbook-backed Hermes gateway launchd restart. Opt-in because it can interrupt the current Biff chat turn.",
+      "runbook": "/Users/marco/Library/Mobile Documents/iCloud~md~obsidian/Documents/SecondBrain/02-Areas/Hermes/Biff Homelab Recovery Runbooks - BIF-669.md#biff--hermes-launchd-services",
+      "action_class": "mac_launchd_restart",
+      "risk": "medium",
+      "production": true,
+      "default_action": "dry_run",
+      "conditions": {
+        "event": "down",
+        "target": "hermes_gateway"
+      },
+      "precheck": {
+        "type": "none"
+      },
+      "command": ["scripts/restart-hermes-gateway.sh"],
+      "postcheck": {
+        "type": "launchd_running",
+        "label": "system/ai.hermes.gateway",
+        "timeout_seconds": 10
+      }
+    }
+  ]
+}
