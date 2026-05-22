@@ -5,6 +5,7 @@
   "require_allow_rule_flag": true,
   "allowed_action_classes": [
     "mac_launchd_restart",
+    "proxmox_adguard_dns_ct101_restart",
     "proxmox_uptimekuma_ct130_restart"
   ],
   "blocked_action_classes": [
@@ -113,6 +114,30 @@
       "postcheck": {
         "type": "http_2xx",
         "url": "https://biff.tail460c2.ts.net:3001/",
+        "timeout_seconds": 8
+      }
+    },
+    {
+      "id": "adguard_dns_down",
+      "description": "Runbook-backed restart of only Proxmox CT 101 (AdGuard/DNS). Production auto-remediation remains opt-in only and is not live-wired by default.",
+      "runbook": "/Users/marco/Library/Mobile Documents/iCloud~md~obsidian/Documents/SecondBrain/02-Areas/Hermes/Biff Homelab Recovery Runbooks - BIF-669.md#adguard--dns",
+      "action_class": "proxmox_adguard_dns_ct101_restart",
+      "risk": "medium",
+      "production": true,
+      "default_action": "dry_run",
+      "conditions": {
+        "event": "down",
+        "target": "adguard_dns_ct_101"
+      },
+      "precheck": {
+        "type": "http_2xx",
+        "url": "https://biff.tail460c2.ts.net:3000/",
+        "timeout_seconds": 8
+      },
+      "command": ["scripts/restart-adguard-dns-ct101.sh"],
+      "postcheck": {
+        "type": "http_2xx",
+        "url": "https://biff.tail460c2.ts.net:3000/",
         "timeout_seconds": 8
       }
     }

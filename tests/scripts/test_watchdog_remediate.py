@@ -125,6 +125,56 @@ def test_uptimekuma_ct130_helper_is_hardcoded_to_single_ct_and_host():
     assert "reboot now" not in text
 
 
+def test_adguard_dns_ct101_rule_is_gated_production_dry_run():
+    proc = run_remediate(
+        "--rule",
+        "adguard_dns_down",
+        "--event",
+        "down",
+        "--target",
+        "adguard_dns_ct_101",
+        "--execute",
+        "--allow-rule",
+        "adguard_dns_down",
+        env={"BIF669_WATCHDOG_REMEDIATION_ENABLE": "1"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["mode"] == "dry_run"
+    assert payload["action_class"] == "proxmox_adguard_dns_ct101_restart"
+    assert payload["production"] is True
+    assert payload["gates"] == {
+        "allow_rule_flag": True,
+        "execute_flag": True,
+        "global_enable_env": True,
+        "production_allowed": False,
+    }
+    assert payload["planned_command"] == ["scripts/restart-adguard-dns-ct101.sh"]
+
+
+def test_adguard_dns_ct101_helper_is_hardcoded_to_single_ct_and_host_with_smokes():
+    helper = REPO_ROOT / "scripts" / "restart-adguard-dns-ct101.sh"
+    text = helper.read_text()
+
+    assert 'readonly PROXMOX_HOST="root@192.168.1.248"' in text
+    assert 'readonly CT_ID="101"' in text
+    assert 'readonly ADGUARD_HTTP_URL="https://biff.tail460c2.ts.net:3000/"' in text
+    assert 'readonly ADGUARD_DNS_SERVER="192.168.1.162"' in text
+    assert 'pct reboot "$CT_ID"' in text
+    assert 'pct status "$CT_ID"' in text
+    assert "check_http_ready_once" in text
+    assert "check_dns_ready_once" in text
+    assert "wait_for_http_ready" in text
+    assert "wait_for_dns_ready" in text
+    assert "pct reboot $1" not in text
+    assert 'pct reboot "$1"' not in text
+    assert "pct reboot 130" not in text
+    assert "shutdown" not in text
+    assert "reboot now" not in text
+    assert "uci " not in text
+    assert "nmcli " not in text
+
+
 def test_blocked_action_class_in_rules_file_is_rejected(tmp_path):
     bad_rules = json.loads(RULES.read_text())
     bad_rules["rules"][0]["action_class"] = "hard_power_cycle"
