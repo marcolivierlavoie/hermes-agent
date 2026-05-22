@@ -3056,6 +3056,62 @@ class BasePlatformAdapter(ABC):
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
         self._start_session_processing(event, session_key)
+
+    async def handle_internal_message_now(
+        self,
+        event: MessageEvent,
+        *,
+        reason: str = "internal",
+        correlation_id: Optional[str] = None,
+    ) -> None:
+        """Process a trusted synthetic event without the user-message HOL guard.
+
+        ``handle_message`` intentionally serializes user turns by session: a
+        follow-up in the same chat is queued/merged behind the active adapter
+        task (or routed through the busy handler).  System-generated events such
+        as ``terminal(background=True, notify_on_complete=True)`` completions are
+        different: they are already rate/noise-controlled at the process watcher
+        layer and should not wait behind an unrelated active user turn in the
+        same Discord/Slack/Telegram session.
+
+        Use a namespaced adapter guard key so the normal response delivery
+        pipeline (typing hooks, media extraction, retries, post-delivery hooks)
+        is reused, while the synthetic event does not contend with or release
+        the real user-session guard.  The gateway runner still derives the
+        transcript/agent session from ``event.source``, so the notification is
+        delivered to the intended conversation context.
+        """
+        if not self._message_handler:
+            return
+        if not bool(getattr(event, "internal", False)):
+            logger.warning(
+                "[%s] Refusing immediate dispatch for non-internal event (reason=%s)",
+                self.name,
+                reason,
+            )
+            await self.handle_message(event)
+            return
+
+        base_session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        safe_reason = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", str(reason or "internal"))[:48]
+        safe_correlation = re.sub(
+            r"[^a-zA-Z0-9_.:-]+",
+            "-",
+            str(correlation_id or getattr(event, "message_id", None) or uuid.uuid4().hex),
+        )[:96]
+        synthetic_session_key = f"{base_session_key}:__internal__:{safe_reason}:{safe_correlation}"
+        logger.info(
+            "[%s] Immediate internal dispatch for %s (base_session=%s synthetic_session=%s)",
+            self.name,
+            safe_reason,
+            base_session_key,
+            synthetic_session_key,
+        )
+        self._start_session_processing(event, synthetic_session_key)
     
     @staticmethod
     def _get_human_delay() -> float:

@@ -51,7 +51,11 @@ def _build_runner(monkeypatch, tmp_path) -> GatewayRunner:
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     runner = GatewayRunner(GatewayConfig())
-    adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    adapter = SimpleNamespace(
+        send=AsyncMock(),
+        handle_message=AsyncMock(),
+        handle_internal_message_now=AsyncMock(),
+    )
     runner.adapters[Platform.DISCORD] = adapter
     return runner
 
@@ -93,8 +97,9 @@ async def test_notify_on_complete_sets_internal_flag(monkeypatch, tmp_path):
 
     await runner._run_process_watcher(_watcher_dict_with_notify())
 
-    assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
+    assert adapter.handle_internal_message_now.await_count == 1
+    assert adapter.handle_message.await_count == 0
+    event = adapter.handle_internal_message_now.await_args.args[0]
     assert isinstance(event, MessageEvent)
     assert event.internal is True, "Synthetic completion event must be marked internal"
 
@@ -224,8 +229,9 @@ async def test_notify_on_complete_preserves_user_identity(monkeypatch, tmp_path)
 
     await runner._run_process_watcher(watcher)
 
-    assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
+    assert adapter.handle_internal_message_now.await_count == 1
+    assert adapter.handle_message.await_count == 0
+    event = adapter.handle_internal_message_now.await_args.args[0]
     assert event.source.user_id == "user-42"
     assert event.source.user_name == "alice"
 
@@ -247,7 +253,11 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
     monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
 
     runner = GatewayRunner(GatewayConfig())
-    adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    adapter = SimpleNamespace(
+        send=AsyncMock(),
+        handle_message=AsyncMock(),
+        handle_internal_message_now=AsyncMock(),
+    )
     runner.adapters[Platform.TELEGRAM] = adapter
     runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
         origin=SessionSource(
@@ -272,8 +282,9 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
 
     await runner._run_process_watcher(watcher)
 
-    assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
+    assert adapter.handle_internal_message_now.await_count == 1
+    assert adapter.handle_message.await_count == 0
+    event = adapter.handle_internal_message_now.await_args.args[0]
     assert event.internal is True
     assert event.source.platform == Platform.TELEGRAM
     assert event.source.chat_id == "-100"
@@ -281,6 +292,51 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
     assert event.source.thread_id == "42"
     assert event.source.user_id == "user-42"
     assert event.source.user_name == "alice"
+
+
+@pytest.mark.asyncio
+async def test_active_internal_process_completion_sends_lightweight_notice(monkeypatch, tmp_path):
+    """Internal notify_on_complete should not queue behind an active runner session."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text("", encoding="utf-8")
+
+    runner = GatewayRunner(GatewayConfig())
+    adapter = SimpleNamespace(
+        send=AsyncMock(),
+        _send_with_retry=AsyncMock(),
+        _pending_messages={},
+    )
+    runner.adapters[Platform.DISCORD] = adapter  # type: ignore[assignment]
+    session_key = "agent:main:discord:dm:123"
+    runner._running_agents[session_key] = SimpleNamespace(
+        interrupt=lambda *_a, **_kw: None,
+        get_activity_summary=lambda: {"seconds_since_activity": 0},
+    )
+    runner._running_agents_ts[session_key] = gateway_run.time.time()
+
+    source = SessionSource(platform=Platform.DISCORD, chat_id="123", chat_type="dm")
+    event = MessageEvent(
+        text=(
+            "[IMPORTANT: Background process proc_1 completed (exit code 0).\n"
+            "Command: python noisy.py\n"
+            "Output:\nline 1\nline 2\n]"
+        ),
+        source=source,
+        internal=True,
+        message_id="proc_1",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    assert adapter._send_with_retry.await_count == 1
+    sent = adapter._send_with_retry.await_args.kwargs["content"]
+    assert "Background process `proc_1` completed" in sent
+    assert "line 1" not in sent
+    assert "line 2" not in sent
+    assert adapter._pending_messages == {}
 
 
 @pytest.mark.asyncio

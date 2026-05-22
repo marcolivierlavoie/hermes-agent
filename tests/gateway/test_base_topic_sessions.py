@@ -110,6 +110,58 @@ class TestBasePlatformTopicSessions:
         assert adapter.get_pending_message(build_session_key(pending_event.source)) == pending_event
 
     @pytest.mark.asyncio
+    async def test_internal_message_bypasses_active_session_queue(self, monkeypatch):
+        adapter = DummyTelegramAdapter()
+        adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
+
+        active_event = _make_event("-1001", "10", message_id="active")
+        base_key = build_session_key(active_event.source)
+        guard = asyncio.Event()
+        adapter._active_sessions[base_key] = guard
+
+        scheduled = []
+
+        class FakeTask:
+            def __init__(self, coro):
+                self.coro = coro
+
+            def add_done_callback(self, _callback):
+                return None
+
+            def done(self):
+                return False
+
+            def cancel(self):
+                return None
+
+        def fake_create_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return FakeTask(coro)
+
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+        internal_event = _make_event("-1001", "10", message_id="proc-1")
+        internal_event = MessageEvent(
+            text="[IMPORTANT: Background process proc-1 completed]",
+            source=internal_event.source,
+            message_id="proc-1",
+            internal=True,
+        )
+
+        await adapter.handle_internal_message_now(
+            internal_event,
+            reason="process_completion",
+            correlation_id="proc-1",
+        )
+
+        assert len(scheduled) == 1
+        assert adapter._pending_messages == {}
+        assert adapter._active_sessions[base_key] is guard
+        synthetic_keys = [k for k in adapter._active_sessions if ":__internal__:process_completion:proc-1" in k]
+        assert len(synthetic_keys) == 1
+
+    @pytest.mark.asyncio
     async def test_process_message_background_replies_in_same_topic(self):
         adapter = DummyTelegramAdapter()
         typing_calls = []

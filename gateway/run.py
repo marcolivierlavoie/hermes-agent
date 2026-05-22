@@ -1510,6 +1510,52 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     return None
 
 
+_PROCESS_COMPLETION_IMPORTANT_RE = re.compile(
+    r"^\[IMPORTANT: Background process (?P<session_id>\S+) completed "
+    r"\(exit code (?P<exit_code>[^)]+)\)\.\n"
+    r"Command: (?P<command>.*?)\n"
+    r"Output:\n(?P<output>.*)\]$",
+    re.DOTALL,
+)
+
+
+def _format_out_of_band_process_completion_notice(text: str) -> "str | None":
+    """Render a concise completion notice when an agent turn is already active.
+
+    notify_on_complete normally injects a synthetic agent turn so the model can
+    summarize process output. If the same chat already has an active turn, that
+    agent path is intentionally serialized by ``_running_agents`` and can wait
+    behind a long/streaming response. This formatter is the safe route-around:
+    deliver a small, non-agent notification immediately without dumping the raw
+    process log into chat.
+    """
+    match = _PROCESS_COMPLETION_IMPORTANT_RE.match(str(text or ""))
+    if not match:
+        return None
+
+    session_id = match.group("session_id") or "unknown"
+    exit_code = (match.group("exit_code") or "?").strip()
+    command = " ".join((match.group("command") or "").split())
+    output = match.group("output") or ""
+    command_preview = command[:240] + ("…" if len(command) > 240 else "")
+    output_lines = len(output.splitlines()) if output else 0
+    output_chars = len(output)
+    ok = exit_code in {"0", "0.0"}
+    icon = "✅" if ok else "⚠️"
+    status = "completed" if ok else "finished with an error"
+    lines = [
+        f"{icon} Background process `{session_id}` {status} (exit code {exit_code}).",
+        "I’m still working on another turn, so I’m sending this lightweight completion notice now instead of queueing it behind that response.",
+    ]
+    if command_preview:
+        lines.append(f"Command: `{command_preview}`")
+    if output_chars:
+        lines.append(
+            f"Output captured but not dumped here ({output_lines} lines, {output_chars} chars). Use the background/process log controls if you need the details."
+        )
+    return "\n".join(lines)
+
+
 # Module-level weak reference to the active GatewayRunner instance.
 # Used by tools (e.g. send_message) that need to route through a live
 # adapter for plugin platforms.  Set in GatewayRunner.__init__().
@@ -3096,7 +3142,79 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    async def _deliver_internal_process_completion_out_of_band(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        reason: str = "active_session",
+    ) -> bool:
+        """Deliver notify_on_complete promptly when the agent session is busy.
+
+        This avoids both adapter-level and runner-level head-of-line blocking
+        without starting a second agent against the same transcript/cache.
+        """
+        if not bool(getattr(event, "internal", False)):
+            return False
+        notice = _format_out_of_band_process_completion_notice(event.text or "")
+        if not notice:
+            return False
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter:
+            return False
+
+        reply_anchor = self._reply_anchor_for_event(event)
+        thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        queued_for = 0.0
+        try:
+            queued_for = max(0.0, (datetime.now() - event.timestamp).total_seconds())
+        except Exception:
+            queued_for = 0.0
+        send_started = time.monotonic()
+        try:
+            send_with_retry = getattr(adapter, "_send_with_retry", None)
+            if callable(send_with_retry):
+                send_result = send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=notice,
+                    reply_to=(
+                        reply_anchor
+                        if event.source.platform == Platform.TELEGRAM
+                        and event.source.chat_type == "dm"
+                        and event.source.thread_id
+                        else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                    ),
+                    metadata=thread_meta,
+                )
+            else:
+                send_result = adapter.send(event.source.chat_id, notice, metadata=thread_meta)
+            if inspect.isawaitable(send_result):
+                await send_result
+        except Exception as exc:
+            logger.warning(
+                "Process completion out-of-band delivery failed for session %s: %s",
+                session_key,
+                exc,
+            )
+            return False
+        logger.info(
+            "process_completion_metrics: session=%s dispatch=out_of_band_%s queue_wait_time=%.3fs send_time=%.3fs response_chars=%d",
+            session_key,
+            reason,
+            queued_for,
+            time.monotonic() - send_started,
+            len(notice),
+        )
+        return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        if await self._deliver_internal_process_completion_out_of_band(
+            event,
+            session_key,
+            reason="adapter_busy",
+        ):
+            return True
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -7014,6 +7132,13 @@ class GatewayRunner:
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
+            if await self._deliver_internal_process_completion_out_of_band(
+                event,
+                _quick_key,
+                reason="running_agent",
+            ):
+                return None
+
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
 
@@ -15075,13 +15200,25 @@ class GatewayRunner:
                                 message_id=message_id,
                             )
                             logger.info(
-                                "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
+                                "Process %s finished — immediate agent notification dispatch for session %s chat=%s thread=%s",
                                 session_id,
                                 session_key,
                                 source.chat_id,
                                 source.thread_id,
                             )
-                            await adapter.handle_message(synth_event)
+                            immediate_dispatch = getattr(adapter, "handle_internal_message_now", None)
+                            if callable(immediate_dispatch):
+                                await immediate_dispatch(
+                                    synth_event,
+                                    reason="process_completion",
+                                    correlation_id=session_id,
+                                )
+                            else:
+                                logger.debug(
+                                    "Adapter %s has no immediate internal dispatch; falling back to handle_message",
+                                    getattr(adapter, "name", type(adapter).__name__),
+                                )
+                                await adapter.handle_message(synth_event)
                         except Exception as e:
                             logger.error("Agent notify injection error: %s", e)
                     break
@@ -18146,7 +18283,12 @@ class GatewayRunner:
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                 )
-                return _preserve_queued_followup_history_offset(result, followup_result)
+                if isinstance(followup_result, dict) and isinstance(result, dict):
+                    response = _preserve_queued_followup_history_offset(result, followup_result)
+                elif isinstance(followup_result, dict):
+                    response = followup_result
+                else:
+                    response = result or {}
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
