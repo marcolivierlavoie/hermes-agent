@@ -3079,6 +3079,23 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
         auth_store = _load_auth_store()
     state = _load_provider_state(auth_store, "openai-codex")
     if not state:
+        cli_tokens = _import_codex_cli_tokens()
+        if cli_tokens:
+            state = {
+                "tokens": cli_tokens,
+                "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "auth_mode": "chatgpt",
+            }
+            _save_provider_state(auth_store, "openai-codex", state)
+            _save_auth_store(auth_store)
+        else:
+            raise AuthError(
+                "No Codex credentials stored. Run `hermes auth` to authenticate.",
+                provider="openai-codex",
+                code="codex_auth_missing",
+                relogin_required=True,
+            )
+    if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
             provider="openai-codex",
@@ -3096,19 +3113,49 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
     if not isinstance(access_token, str) or not access_token.strip():
-        raise AuthError(
-            "Codex auth is missing access_token. Run `hermes auth` to re-authenticate.",
-            provider="openai-codex",
-            code="codex_auth_missing_access_token",
-            relogin_required=True,
-        )
+        cli_tokens = _import_codex_cli_tokens()
+        cli_access = cli_tokens.get("access_token") if isinstance(cli_tokens, dict) else None
+        cli_refresh = cli_tokens.get("refresh_token") if isinstance(cli_tokens, dict) else None
+        if isinstance(cli_access, str) and cli_access.strip() and isinstance(cli_refresh, str) and cli_refresh.strip():
+            tokens = dict(cli_tokens)
+            state["tokens"] = tokens
+            state["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            state["auth_mode"] = "chatgpt"
+            state.pop("last_auth_error", None)
+            _save_provider_state(auth_store, "openai-codex", state)
+            _save_auth_store(auth_store)
+            access_token = tokens.get("access_token")
+            refresh_token = tokens.get("refresh_token")
+        else:
+            raise AuthError(
+                "Codex auth is missing access_token. Run `hermes auth` to re-authenticate.",
+                provider="openai-codex",
+                code="codex_auth_missing_access_token",
+                relogin_required=True,
+            )
     if not isinstance(refresh_token, str) or not refresh_token.strip():
-        raise AuthError(
-            "Codex auth is missing refresh_token. Run `hermes auth` to re-authenticate.",
-            provider="openai-codex",
-            code="codex_auth_missing_refresh_token",
-            relogin_required=True,
-        )
+        cli_tokens = _import_codex_cli_tokens()
+        cli_refresh = cli_tokens.get("refresh_token") if isinstance(cli_tokens, dict) else None
+        if isinstance(cli_refresh, str) and cli_refresh.strip():
+            tokens = dict(tokens)
+            tokens["refresh_token"] = cli_refresh
+            cli_access = cli_tokens.get("access_token")
+            if isinstance(cli_access, str) and cli_access.strip():
+                tokens["access_token"] = cli_access
+            state["tokens"] = tokens
+            state["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            state["auth_mode"] = "chatgpt"
+            state.pop("last_auth_error", None)
+            _save_provider_state(auth_store, "openai-codex", state)
+            _save_auth_store(auth_store)
+            refresh_token = tokens.get("refresh_token")
+        else:
+            raise AuthError(
+                "Codex auth is missing refresh_token. Run `hermes auth` to re-authenticate.",
+                provider="openai-codex",
+                code="codex_auth_missing_refresh_token",
+                relogin_required=True,
+            )
     return {
         "tokens": tokens,
         "last_refresh": state.get("last_refresh"),
