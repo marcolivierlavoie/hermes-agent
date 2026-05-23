@@ -3,6 +3,7 @@ import { ArrowLeft, CheckCircle2, HelpCircle, Moon, RotateCcw, ShieldCheck, Skip
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Card, CardContent } from "@/components/ui/card";
+import { selectRitualSuggestions } from "@/lib/ritualSuggestionProvider";
 import { cn } from "@/lib/utils";
 
 const STORAGE_KEY = "biff.daily_distortion_ritual.v1";
@@ -30,32 +31,6 @@ const EXPLANATIONS = [
   "Pick a cue that is easy to notice in real time. You can use a suggestion as-is, edit it, or write a custom cue.",
   "Keep the reset tiny: pause, name the pattern, then do one grounding move or next-right action.",
 ] as const;
-
-const THINKING_PATTERNS = [
-  "mind-reading",
-  "catastrophizing",
-  "all-or-nothing thinking",
-  "should-ing",
-  "discounting positives",
-] as const;
-
-const CUE_SUGGESTIONS: Record<string, string[]> = {
-  "mind-reading": ["I am assuming what someone thinks before asking", "I start treating silence as evidence", "I replay a message looking for hidden meaning"],
-  catastrophizing: ["My mind jumps straight to the worst outcome", "I feel urgency before I have facts", "I use always/never language about what will happen"],
-  "all-or-nothing thinking": ["I call the day a win or a failure", "One imperfect moment starts feeling like the whole story", "I notice only two options"],
-  "should-ing": ["My sentence starts with I should or I have to", "I turn a preference into a rule", "I feel guilty before checking what matters"],
-  "discounting positives": ["I explain away something that went well", "A compliment or win feels like it does not count", "I skip over evidence that I am trying"],
-  default: ["My body gets tight before I have the facts", "I hear a familiar harsh phrase", "The loop repeats more than twice"],
-};
-
-const RESET_SUGGESTIONS: Record<string, string[]> = {
-  "mind-reading": ["Pause; name mind-reading; ask for one real fact or one clean question", "Hand on chest; say maybe, not proven; wait for evidence"],
-  catastrophizing: ["Pause; name catastrophizing; ask what is the next safe step", "Exhale longer than inhale; write the most likely outcome"],
-  "all-or-nothing thinking": ["Pause; name all-or-nothing; find the 10% middle", "Say both/and once, then choose one small next move"],
-  "should-ing": ["Pause; name should-ing; swap should for I choose or I prefer", "Ask whose rule this is, then pick the kind next step"],
-  "discounting positives": ["Pause; name discounting positives; count one thing that still counts", "Put one real receipt beside the worry before moving on"],
-  default: ["Pause; name the pattern; take one slow breath; choose one next-right action", "Feet on floor; label the loop; return to one controllable step"],
-};
 
 type RitualAnswer = {
   questionIndex: number;
@@ -149,32 +124,8 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(date);
 }
 
-function answerFor(state: RitualState, questionIndex: number): string {
-  return state.answers.find((answer) => answer.questionIndex === questionIndex && !answer.skipped)?.answer?.trim() ?? "";
-}
-
-function normalizePattern(value: string): string {
-  const lower = value.toLowerCase();
-  return THINKING_PATTERNS.find((pattern) => lower.includes(pattern)) ?? "default";
-}
-
-function selectedPatternLabel(state: RitualState): string {
-  const answer = answerFor(state, 4);
-  const pattern = normalizePattern(answer);
-  return pattern === "default" ? answer || "the selected pattern" : pattern;
-}
-
 function suggestionOptions(state: RitualState): string[] {
-  if (state.questionIndex === 4) return [...THINKING_PATTERNS];
-  if (state.questionIndex === 5) return CUE_SUGGESTIONS[normalizePattern(answerFor(state, 4))] ?? CUE_SUGGESTIONS.default;
-  if (state.questionIndex === 6) {
-    const pattern = normalizePattern(answerFor(state, 4));
-    const cue = answerFor(state, 5);
-    const base = RESET_SUGGESTIONS[pattern] ?? RESET_SUGGESTIONS.default;
-    if (!cue) return base;
-    return [`Pause; name ${selectedPatternLabel(state)}; reset when I notice: ${cue}`, ...base];
-  }
-  return [];
+  return selectRitualSuggestions({ questionIndex: state.questionIndex, answers: state.answers }).suggestions;
 }
 
 export default function RitualPage() {
