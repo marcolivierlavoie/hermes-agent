@@ -35,7 +35,7 @@ def run_helper(args: list[str], *, cache_dir: Path, lookup: Path) -> subprocess.
     )
 
 
-def test_allowlisted_key_uses_cache_before_infisical(tmp_path: Path):
+def test_migrated_key_uses_infisical_before_cache(tmp_path: Path):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     (cache_dir / "n8n_api_key.secret").write_text("from-cache", encoding="utf-8")
@@ -51,8 +51,7 @@ def test_allowlisted_key_uses_cache_before_infisical(tmp_path: Path):
     result = run_helper(["n8n_api_key"], cache_dir=cache_dir, lookup=lookup)
 
     assert result.returncode == 0
-    assert result.stdout == "from-cache"
-    assert "from-infisical" not in result.stdout
+    assert result.stdout == "from-infisical"
     assert result.stderr == ""
 
 
@@ -102,6 +101,28 @@ def test_check_mode_reports_infisical_source_without_secret_value(tmp_path: Path
     assert result.stderr == ""
 
 
+def test_newly_migrated_keys_report_infisical_source_without_secret_value(tmp_path: Path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    lookup = write_fake_lookup(
+        tmp_path,
+        """
+        import sys
+        if '--emit-secret-value' in sys.argv:
+            sys.stdout.write('secret-that-must-not-appear')
+        sys.exit(0)
+        """,
+    )
+
+    for key in ["linear_api_key", "discord_bot_token", "kuma_username", "kuma_password", "nas_username", "nas_password"]:
+        result = run_helper(["--check", key], cache_dir=cache_dir, lookup=lookup)
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == f"{key}: available source=infisical"
+        assert "secret-that-must-not-appear" not in result.stdout
+        assert result.stderr == ""
+
+
 def test_non_allowlisted_alias_does_not_use_infisical(tmp_path: Path):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -115,7 +136,7 @@ def test_non_allowlisted_alias_does_not_use_infisical(tmp_path: Path):
         """,
     )
 
-    result = run_helper(["--check", "govee_token"], cache_dir=cache_dir, lookup=lookup)
+    result = run_helper(["--check", "openai_api_key"], cache_dir=cache_dir, lookup=lookup)
 
     assert result.returncode != 0
     assert not invoked.exists()
