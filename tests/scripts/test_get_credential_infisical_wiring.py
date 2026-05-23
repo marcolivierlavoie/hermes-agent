@@ -114,7 +114,14 @@ def test_newly_migrated_keys_report_infisical_source_without_secret_value(tmp_pa
         """,
     )
 
-    for key in ["linear_api_key", "discord_bot_token", "kuma_username", "kuma_password", "nas_username", "nas_password"]:
+    for key in [
+        "linear_api_key", "discord_bot_token", "kuma_username", "kuma_password",
+        "nas_username", "nas_password", "openai_api_key", "unifi_username",
+        "unifi_password", "github_token", "ha_ssh_password", "DB_POSTGRESDB_HOST",
+        "DB_POSTGRESDB_DATABASE", "DB_POSTGRESDB_USER", "DB_POSTGRESDB_PASSWORD",
+        "N8N_ENCRYPTION_KEY", "postgres_n8n_password", "proxmox_workpc_username",
+        "proxmox_workpc_password",
+    ]:
         result = run_helper(["--check", key], cache_dir=cache_dir, lookup=lookup)
 
         assert result.returncode == 0
@@ -136,7 +143,7 @@ def test_non_allowlisted_alias_does_not_use_infisical(tmp_path: Path):
         """,
     )
 
-    result = run_helper(["--check", "openai_api_key"], cache_dir=cache_dir, lookup=lookup)
+    result = run_helper(["--check", "mac_password"], cache_dir=cache_dir, lookup=lookup)
 
     assert result.returncode != 0
     assert not invoked.exists()
