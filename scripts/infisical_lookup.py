@@ -174,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BIF-670 safe Infisical lookup adapter")
     parser.add_argument("name", nargs="?", help="single secret name to check/retrieve; value is not printed unless --emit-secret-value is set")
     parser.add_argument("--check", "--status", action="store_true", help="check CLI/config status without retrieving a secret")
-    parser.add_argument("--env", default=os.environ.get("INFISICAL_ENV", "dev"), help="Infisical environment slug/name")
+    parser.add_argument("--env", default=os.environ.get("INFISICAL_ENV", "prod"), help="Infisical environment slug/name")
     parser.add_argument("--path", default=os.environ.get("INFISICAL_SECRET_PATH", "/"), help="Infisical secret folder path")
     parser.add_argument("--cache-dir", default=os.environ.get("INFISICAL_CACHE_DIR"), help="optional read-only local secure cache directory")
     parser.add_argument("--timeout", type=float, default=15.0, help="infisical CLI timeout in seconds")
