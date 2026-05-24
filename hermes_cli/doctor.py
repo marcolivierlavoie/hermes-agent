@@ -334,10 +334,35 @@ def _build_apikey_providers_list() -> list:
     return _static
 
 
+def _run_gateway_runtime_doctor() -> None:
+    """Check Biff gateway cwd/venv/import policy and exit non-zero on drift."""
+    from gateway.runtime_policy import collect_gateway_runtime_diagnostics, gateway_runtime_policy_violations
+
+    diag = collect_gateway_runtime_diagnostics()
+    violations = gateway_runtime_policy_violations(diag)
+    _section("Biff Gateway Runtime")
+    check_info(f"canonical runtime: {diag.get('canonical_runtime_dir')}")
+    check_info(f"canonical venv: {diag.get('canonical_venv')}")
+    check_info(f"cwd: {diag.get('cwd')}")
+    check_info(f"python: {diag.get('sys_executable')}")
+    check_info(f"VIRTUAL_ENV: {diag.get('virtual_env')}")
+    for module_name, origin in (diag.get("module_origins") or {}).items():
+        check_info(f"{module_name}: {origin}")
+    if violations:
+        for violation in violations:
+            check_fail("Gateway runtime policy", violation)
+        sys.exit(1)
+    check_ok("Gateway runtime policy", "(cwd, venv, and Biff imports align)")
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
     ack_target = getattr(args, 'ack', None)
+
+    if getattr(args, "gateway_runtime", False):
+        _run_gateway_runtime_doctor()
+        return
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability
     # checks (like cronjob management) should see the same context as `hermes`.

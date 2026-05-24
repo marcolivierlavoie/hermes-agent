@@ -18521,6 +18521,34 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
+    # and gateway.log (INFO+, gateway-component records only).
+    # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
+    from hermes_logging import setup_logging
+    setup_logging(hermes_home=_hermes_home, mode="gateway")
+
+    # Validate the Biff runtime path before any destructive --replace action.
+    # A split-brain candidate should not be allowed to kill the healthy gateway
+    # and then fail to start.
+    try:
+        from gateway.runtime_policy import (
+            collect_gateway_runtime_diagnostics,
+            format_gateway_runtime_diagnostics,
+            gateway_runtime_policy_violations,
+        )
+
+        _runtime_diag = collect_gateway_runtime_diagnostics()
+        _runtime_violations = gateway_runtime_policy_violations(_runtime_diag)
+        logger.info("biff_runtime_diagnostic: %s", format_gateway_runtime_diagnostics(_runtime_diag))
+        if _runtime_violations:
+            logger.error("biff_runtime_policy_violation: %s", "; ".join(_runtime_violations))
+            if os.getenv("HERMES_BIFF_RUNTIME_POLICY", "").strip().lower() in {"1", "true", "enforce", "strict"}:
+                return False
+    except Exception as _runtime_exc:
+        logger.exception("biff_runtime_diagnostic_failed: %s", _runtime_exc)
+        if os.getenv("HERMES_BIFF_RUNTIME_POLICY", "").strip().lower() in {"1", "true", "enforce", "strict"}:
+            return False
+
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
     # The PID file is scoped to HERMES_HOME, so future multi-profile

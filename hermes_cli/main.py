@@ -11061,6 +11061,11 @@ def main():
             "doctor` first to see active advisories and their IDs."
         ),
     )
+    doctor_parser.add_argument(
+        "--gateway-runtime",
+        action="store_true",
+        help="Check Biff gateway cwd/venv/import policy and return non-zero on split-brain runtime drift",
+    )
     doctor_parser.set_defaults(func=cmd_doctor)
 
     # =========================================================================
