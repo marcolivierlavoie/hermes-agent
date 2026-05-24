@@ -24,6 +24,10 @@ ADAPTIVE_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS_MANY = 32_000
 ADAPTIVE_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS_HEAVY = 24_000
 ADAPTIVE_MODEL_FACING_TOTAL_TOOL_OUTPUT_CHARS_EXTREME = 16_000
 DEFAULT_TOOL_PREVIEW_CHARS = 1_000
+DEFAULT_BIFF_DISCORD_PROMPT_BUDGET_TOKENS = 10_000
+MIN_BIFF_DISCORD_PROMPT_BUDGET_TOKENS = 6_000
+MAX_BIFF_DISCORD_PROMPT_BUDGET_TOKENS = 40_000
+CHARS_PER_TOKEN_ESTIMATE = 4
 
 BIFF_OPERATING_MODES: tuple[str, ...] = ("normal", "economy", "emergency", "evidence-only")
 
@@ -115,6 +119,23 @@ def resolve_biff_operating_mode(config: Mapping[str, Any] | None = None, platfor
     return _BIFF_MODE_SPECS[normalize_biff_operating_mode(mode_value)]
 
 
+def biff_discord_quick_check_budget_prompt(settings: Mapping[str, Any] | None = None) -> str:
+    """Return the active Discord live-budget routing contract for the system prompt."""
+
+    cfg = settings if isinstance(settings, Mapping) else {}
+    max_tools = cfg.get("max_tool_calls")
+    timeout = cfg.get("terminal_timeout")
+    route = cfg.get("route_action") or "default"
+    return (
+        "[System note: Discord live tool-budget contract is active. "
+        f"Route={route}; max live tool calls={max_tools if max_tools is not None else 'unlimited'}; "
+        f"terminal timeout cap={timeout if timeout is not None else 'default'}s. "
+        "For ordinary Discord turns, do at most 1-2 narrow quick-check tool calls, prefer direct source-of-truth queries, and shape outputs before they enter context. "
+        "If the request needs multi-step verification, broad searching, or several systems, answer concisely with the first decisive status and create/use a Kanban/background/continuation handle rather than exhausting the live turn. "
+        "Never claim done/fixed/deployed until visible evidence is checked; label partial results as awaiting verification.]"
+    )
+
+
 def biff_operating_mode_prompt(mode: BiffOperatingMode) -> str:
     if mode.name == "normal":
         return ""
@@ -122,11 +143,15 @@ def biff_operating_mode_prompt(mode: BiffOperatingMode) -> str:
         f"[System note: Active Biff operating mode is {mode.label}. "
         "Do not change provider, model, account, persona, memory behavior, safety gates, or source-of-truth policy. "
         "Be more concise and avoid accidental context/tool/history bloat. "
+        "For explicit work requests, complete the bounded deliverable in the current turn when safe; do not stop at an acknowledgement, do not pretend unfinished work is done, and do not ask Marco to type continue unless a real external blocker remains. "
+        "For direct questions, answer from current context and hot context when possible; if you are unsure, say what you believe and identify the smallest useful verification step. "
+        "Prefer rg over grep, always scope shell searches to a specific directory/file set, and avoid whole-repo recursive searches in chat. "
+        "Use Kanban/background work only for genuinely broad work or when Marco explicitly asks for background execution; do not use it as a way to avoid finishing normal implementation, verification, or cleanup tasks. "
     )
     if mode.name == "economy":
-        return base + "Use tools only when they materially improve correctness; prefer bounded reads and focused evidence.]"
+        return base + "Use tools when they materially improve correctness; prefer bounded reads, short terminal timeouts, focused evidence, and a clear final done/blocked status.]"
     if mode.name == "emergency":
-        return base + "Prioritize the smallest safe action that answers the ask; defer nice-to-have exploration.]"
+        return base + "Prioritize the smallest safe action that completes or unblocks the ask; defer only nice-to-have exploration.]"
     return base + "Evidence-only: gather/check evidence and summarize. Tool access is restricted to read-only evidence toolsets unless explicit current-turn approval is added by the gateway.]"
 
 
@@ -143,9 +168,10 @@ BIFF_EVIDENCE_ONLY_SAFE_TOOLSETS: frozenset[str] = frozenset(
 # conservative subset of normal Discord/Biff work: it preserves persona/memory
 # (memory, session_search), BIF implementation capability (terminal/file),
 # structured planning and persona instructions (todo/skills), clarification,
-# bounded code/delegation, and read-only evidence surfaces.  It excludes large
-# nice-to-have or higher-risk fixed schemas (browser, cronjob, image/tts,
-# messaging, kanban) unless the operator explicitly selects the full profile.
+# bounded code/delegation, kanban orchestration, and read-only evidence
+# surfaces.  It excludes large nice-to-have or higher-risk fixed schemas
+# (browser, cronjob, image/tts, messaging) unless the operator explicitly
+# selects the full profile.
 BIFF_CORE_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
     {
         "terminal",
@@ -157,6 +183,7 @@ BIFF_CORE_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
         "clarify",
         "code_execution",
         "delegation",
+        "kanban",
         "web",
         "search",
         "vision",
@@ -166,7 +193,7 @@ BIFF_CORE_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
 
 # Default Biff Discord schema profile v2: the smallest safe fixed allowlist
 # for Biff's common build/ops lane. It keeps the shell/file/code/skills/memory
-# surfaces needed to work Linear-backed BIFs (including Linear access via
+# surfaces needed to work Kanban-backed Biff OS tasks (including explicit Linear access via
 # terminal + credential helper), named-role delegation, and todo planning, while
 # omitting large or nice-to-have schemas. Operators can still select ``full``
 # via config or HERMES_BIFF_TOOL_SCHEMA_PROFILE for rollback/escalation.
@@ -179,8 +206,505 @@ BIFF_DISCORD_V2_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
         "todo",
         "code_execution",
         "delegation",
+        "kanban",
     }
 )
+
+# Discord profile v3 is the skill-bundle-era default. It keeps direct build/fix
+# capability and memory, but drops high-cost always-on schemas that are better
+# escalated explicitly for a specific task: delegation, ad hoc code execution,
+# and skill editing.
+BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
+    {
+        "terminal",
+        "file",
+        "memory",
+        "skills-read",
+        "todo",
+        "kanban",
+    }
+)
+
+BIFF_TURN_TOOLSET_PROFILES: dict[str, frozenset[str]] = {
+    "none": frozenset(),
+    "status": frozenset({"terminal", "file", "kanban"}),
+    "kanban": frozenset({"kanban", "terminal"}),
+    "web": frozenset({"web", "search", "browser", "terminal", "file"}),
+    "base": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
+    "specialist": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
+    "command": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
+}
+
+BIFF_BUNDLE_TOOLSET_ESCALATIONS: dict[str, frozenset[str]] = {
+    "biff-hermes-runtime-change": frozenset({"code_execution", "delegation", "skills", "web", "vision"}),
+    "biff-issue-execution": frozenset({"code_execution", "delegation", "skills", "web", "vision"}),
+    "biff-research-to-decision": frozenset({"browser", "session_search", "web", "vision"}),
+    "biff-memory-knowledge-governance": frozenset({"session_search", "skills", "web"}),
+    "biff-automation-ownership": frozenset({"code_execution", "cronjob", "delegation", "web"}),
+    "biff-personal-logistics": frozenset({"browser", "web", "vision"}),
+}
+
+_BUNDLE_INVOCATION_RE = re.compile(r'user has invoked the "([^"]+)" skill bundle', re.IGNORECASE)
+
+
+def extract_biff_bundle_key(message: Any) -> str | None:
+    """Return the selected Biff bundle key embedded in an invocation message."""
+
+    match = _BUNDLE_INVOCATION_RE.search(str(message or ""))
+    if not match:
+        return None
+    key = match.group(1).strip().lstrip("/")
+    return key or None
+
+
+def _biff_platform_cfg(config: Mapping[str, Any] | None, platform_key: str | None) -> Mapping[str, Any]:
+    cfg = config if isinstance(config, Mapping) else {}
+    biff_cfg = cfg.get("biff") if isinstance(cfg.get("biff"), Mapping) else {}
+    platforms = biff_cfg.get("platforms") if isinstance(biff_cfg.get("platforms"), Mapping) else {}
+    platform_cfg = platforms.get(platform_key) if isinstance(platforms.get(platform_key), Mapping) else {}
+    return platform_cfg
+
+
+def _first_platform_value(platform_cfg: Mapping[str, Any], keys: Iterable[str], default: Any) -> Any:
+    for key in keys:
+        if key in platform_cfg:
+            return platform_cfg.get(key)
+    return default
+
+
+def resolve_biff_live_tool_guardrail_settings(
+    config: Mapping[str, Any] | None,
+    platform_key: str | None,
+    *,
+    message: Any = None,
+) -> dict[str, Any]:
+    """Resolve live Discord tool guardrails for ordinary chat vs delivery work.
+
+    The regular Discord lane stays intentionally small so casual answers do not
+    sprawl.  Selected Biff bundles, especially Forge runtime work, need enough
+    room to complete build/restart/verification steps before reporting done.
+    """
+
+    bundle_key = extract_biff_bundle_key(message)
+    is_forge_direct = bundle_key == "biff-hermes-runtime-change"
+    is_issue_execution = bundle_key == "biff-issue-execution"
+    platform_cfg = _biff_platform_cfg(config, platform_key)
+    route_action = None
+    route_runtime = None
+    if not bundle_key and str(platform_key or "").strip().lower() == "discord":
+        try:
+            from agent.biff_intent_router import plan_biff_turn
+
+            route_plan = plan_biff_turn(message, command=False)
+            route_action = route_plan.action
+            route_runtime = route_plan.runtime
+        except Exception:
+            route_action = None
+            route_runtime = None
+
+    if is_forge_direct:
+        timeout_default = 60
+    elif is_issue_execution:
+        timeout_default = 45
+    elif route_action in {"forge_direct", "ranger_direct", "quill_direct", "vex_direct"}:
+        timeout_default = 45
+    elif route_action == "kanban_status":
+        timeout_default = 20
+    elif route_action == "route_bundle":
+        timeout_default = 45
+    elif route_action in {"quick_web", "one_tool"}:
+        timeout_default = 20
+    else:
+        timeout_default = 15
+    if is_forge_direct:
+        timeout_keys = ("forge_chat_terminal_timeout",)
+    elif is_issue_execution:
+        timeout_keys = ("issue_execution_chat_terminal_timeout",)
+    elif route_action == "forge_direct":
+        timeout_keys = ("forge_direct_chat_terminal_timeout",)
+    elif route_action == "ranger_direct":
+        timeout_keys = ("ranger_direct_chat_terminal_timeout", "kanban_chat_terminal_timeout")
+    elif route_action == "quill_direct":
+        timeout_keys = ("quill_direct_chat_terminal_timeout", "route_bundle_chat_terminal_timeout", "chat_terminal_timeout")
+    elif route_action == "vex_direct":
+        timeout_keys = ("vex_direct_chat_terminal_timeout", "route_bundle_chat_terminal_timeout", "chat_terminal_timeout")
+    elif route_action == "kanban_status":
+        timeout_keys = ("kanban_chat_terminal_timeout", "one_tool_chat_terminal_timeout")
+    elif route_action == "route_bundle":
+        timeout_keys = ("route_bundle_chat_terminal_timeout", "chat_terminal_timeout")
+    elif route_action == "quick_web":
+        timeout_keys = ("quick_web_chat_terminal_timeout",)
+    elif route_action == "one_tool":
+        timeout_keys = ("one_tool_chat_terminal_timeout",)
+    elif route_action == "answer_now":
+        timeout_keys = ("answer_chat_terminal_timeout",)
+    else:
+        timeout_keys = ("chat_terminal_timeout",)
+    timeout_raw = _first_platform_value(platform_cfg, timeout_keys, timeout_default)
+    try:
+        terminal_timeout = max(5, min(180, int(timeout_raw)))
+    except Exception:
+        terminal_timeout = timeout_default
+
+    if is_forge_direct:
+        tool_keys = ("forge_chat_max_tool_calls",)
+    elif is_issue_execution:
+        tool_keys = ("issue_execution_chat_max_tool_calls",)
+    elif route_action == "forge_direct":
+        tool_keys = ("forge_direct_chat_max_tool_calls",)
+    elif route_action == "ranger_direct":
+        tool_keys = ("ranger_direct_chat_max_tool_calls", "kanban_chat_max_tool_calls")
+    elif route_action == "quill_direct":
+        tool_keys = ("quill_direct_chat_max_tool_calls", "route_bundle_chat_max_tool_calls")
+    elif route_action == "vex_direct":
+        tool_keys = ("vex_direct_chat_max_tool_calls", "route_bundle_chat_max_tool_calls")
+    elif route_action == "kanban_status":
+        tool_keys = ("kanban_chat_max_tool_calls", "one_tool_chat_max_tool_calls")
+    elif route_action == "route_bundle":
+        tool_keys = ("route_bundle_chat_max_tool_calls", "bundle_chat_max_tool_calls")
+    elif route_action == "quick_web":
+        tool_keys = ("quick_web_chat_max_tool_calls",)
+    elif route_action == "one_tool":
+        tool_keys = ("one_tool_chat_max_tool_calls",)
+    elif route_action == "answer_now":
+        tool_keys = ("answer_chat_max_tool_calls",)
+    else:
+        tool_keys = ("bundle_chat_max_tool_calls",) if bundle_key else ("chat_max_tool_calls",)
+    if is_forge_direct:
+        tool_default = 80
+    elif is_issue_execution:
+        tool_default = 60
+    elif bundle_key:
+        tool_default = 20
+    elif route_action == "background":
+        tool_default = 1
+    elif route_action == "forge_direct":
+        tool_default = 24
+    elif route_action == "ranger_direct":
+        tool_default = 24
+    elif route_action == "quill_direct":
+        tool_default = 24
+    elif route_action == "vex_direct":
+        tool_default = 24
+    elif route_action == "kanban_status":
+        tool_default = 3
+    elif route_action == "route_bundle":
+        tool_default = 36
+    elif route_action == "quick_web":
+        tool_default = 4
+    elif route_action == "one_tool":
+        tool_default = 2
+    elif route_action == "answer_now":
+        tool_default = 1
+    else:
+        tool_default = 4
+    if route_action == "route_bundle" and route_runtime == "continuation":
+        tool_default = 16
+    tool_raw = _first_platform_value(platform_cfg, tool_keys, tool_default)
+    if str(tool_raw).strip().lower() in {"0", "none", "off", "false", "unlimited"}:
+        max_tool_calls = None
+    else:
+        try:
+            max_tool_calls = max(1, min(120, int(tool_raw)))
+        except Exception:
+            max_tool_calls = tool_default
+
+    return {
+        "bundle_key": bundle_key,
+        "route_action": route_action,
+        "terminal_timeout": terminal_timeout,
+        "max_tool_calls": max_tool_calls,
+    }
+
+
+def resolve_biff_live_max_iterations(
+    config: Mapping[str, Any] | None,
+    platform_key: str | None,
+    *,
+    message: Any = None,
+    base_max_iterations: int = 90,
+) -> int:
+    """Resolve the live Discord iteration cap without starving delivery work."""
+
+    if str(platform_key or "").strip().lower() != "discord":
+        return int(base_max_iterations)
+
+    bundle_key = extract_biff_bundle_key(message)
+    is_forge_direct = bundle_key == "biff-hermes-runtime-change"
+    is_issue_execution = bundle_key == "biff-issue-execution"
+    platform_cfg = _biff_platform_cfg(config, platform_key)
+    route_action = None
+    if not bundle_key:
+        try:
+            from agent.biff_intent_router import route_biff_live_intent
+
+            route_action = route_biff_live_intent(message, command=False).action
+        except Exception:
+            route_action = None
+    if is_forge_direct:
+        iterations_key = "forge_chat_max_iterations"
+    elif is_issue_execution:
+        iterations_key = "issue_execution_chat_max_iterations"
+    elif route_action == "forge_direct":
+        iterations_key = "forge_direct_chat_max_iterations"
+    elif route_action == "ranger_direct":
+        iterations_key = "ranger_direct_chat_max_iterations"
+    elif route_action == "quill_direct":
+        iterations_key = "quill_direct_chat_max_iterations"
+    elif route_action == "vex_direct":
+        iterations_key = "vex_direct_chat_max_iterations"
+    elif route_action == "kanban_status":
+        iterations_key = "kanban_chat_max_iterations"
+    elif route_action == "route_bundle":
+        iterations_key = "route_bundle_chat_max_iterations"
+    elif route_action == "quick_web":
+        iterations_key = "quick_web_chat_max_iterations"
+    elif route_action == "one_tool":
+        iterations_key = "one_tool_chat_max_iterations"
+    elif route_action == "answer_now":
+        iterations_key = "answer_chat_max_iterations"
+    else:
+        iterations_key = "bundle_chat_max_iterations" if bundle_key else "chat_max_iterations"
+    if is_forge_direct:
+        iterations_default = 72
+    elif is_issue_execution:
+        iterations_default = 60
+    elif bundle_key:
+        iterations_default = 36
+    elif route_action == "forge_direct":
+        iterations_default = 24
+    elif route_action == "ranger_direct":
+        iterations_default = 24
+    elif route_action == "quill_direct":
+        iterations_default = 24
+    elif route_action == "vex_direct":
+        iterations_default = 24
+    elif route_action == "kanban_status":
+        iterations_default = 5
+    elif route_action == "route_bundle":
+        iterations_default = 48
+    elif route_action == "quick_web":
+        iterations_default = 6
+    elif route_action == "one_tool":
+        iterations_default = 3
+    elif route_action == "answer_now":
+        iterations_default = 2
+    else:
+        iterations_default = 4
+    iterations_raw = platform_cfg.get(iterations_key, iterations_default)
+    try:
+        live_cap = max(2, min(120, int(iterations_raw)))
+    except Exception:
+        live_cap = iterations_default
+    return min(int(base_max_iterations), live_cap)
+
+
+def biff_bundle_tool_widening_enabled(
+    config: Mapping[str, Any] | None,
+    platform_key: str | None,
+) -> bool:
+    if str(platform_key or "").strip().lower() != "discord":
+        return False
+    env = os.getenv("HERMES_BIFF_BUNDLE_TOOL_WIDENING")
+    if env is not None:
+        return env.strip().lower() not in {"0", "false", "no", "off"}
+    platform_cfg = _biff_platform_cfg(config, platform_key)
+    return str(platform_cfg.get("bundle_tool_widening", "true")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def biff_prompt_budget_enabled(config: Mapping[str, Any] | None, platform_key: str | None) -> bool:
+    """Return whether ordinary Discord turns should use a live prompt budget."""
+
+    if str(platform_key or "").strip().lower() != "discord":
+        return False
+    env = os.getenv("HERMES_BIFF_PROMPT_BUDGET")
+    if env is not None:
+        return env.strip().lower() not in {"0", "false", "no", "off"}
+    platform_cfg = _biff_platform_cfg(config, platform_key)
+    return str(platform_cfg.get("prompt_budget", "true")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def resolve_biff_prompt_budget_tokens(
+    config: Mapping[str, Any] | None,
+    platform_key: str | None,
+) -> int:
+    """Resolve the target prompt budget for ordinary Discord live turns."""
+
+    raw: Any = os.getenv("HERMES_BIFF_PROMPT_BUDGET_TOKENS")
+    if raw is None:
+        platform_cfg = _biff_platform_cfg(config, platform_key)
+        raw = platform_cfg.get("prompt_budget_tokens")
+    try:
+        value = int(raw or DEFAULT_BIFF_DISCORD_PROMPT_BUDGET_TOKENS)
+    except Exception:
+        value = DEFAULT_BIFF_DISCORD_PROMPT_BUDGET_TOKENS
+    return max(
+        MIN_BIFF_DISCORD_PROMPT_BUDGET_TOKENS,
+        min(MAX_BIFF_DISCORD_PROMPT_BUDGET_TOKENS, value),
+    )
+
+
+def should_apply_biff_prompt_budget(
+    config: Mapping[str, Any] | None,
+    platform_key: str | None,
+    *,
+    message: Any = None,
+) -> bool:
+    """Apply the compact budget only to ordinary live turns.
+
+    Explicit or auto-selected skill bundles intentionally widen context/tools
+    for specialist work, so they keep the existing model-facing history after
+    tool-output caps.
+    """
+
+    if not biff_prompt_budget_enabled(config, platform_key):
+        return False
+    return extract_biff_bundle_key(message) is None
+
+
+def widen_biff_toolsets_for_bundle(
+    config: Mapping[str, Any] | None,
+    platform_key: str | None,
+    enabled_toolsets: Iterable[str] | None,
+    configured_toolsets: Iterable[str] | None,
+    *,
+    message: Any = None,
+    bundle_key: str | None = None,
+) -> list[str]:
+    """Add narrowly-scoped specialist toolsets for the selected Biff bundle.
+
+    The v3 Discord profile keeps live chat fast by default.  When bundle
+    auto-selection already knows the task is implementation, research, memory,
+    or automation work, this restores only the matching specialist surfaces.
+    It never grants a toolset that is not configured for the platform.
+    """
+
+    current = {str(t) for t in (enabled_toolsets or []) if str(t).strip()}
+    configured = {str(t) for t in (configured_toolsets or []) if str(t).strip()}
+    if not biff_bundle_tool_widening_enabled(config, platform_key):
+        return sorted(current)
+
+    key = (bundle_key or extract_biff_bundle_key(message) or "").strip().lstrip("/")
+    additions = BIFF_BUNDLE_TOOLSET_ESCALATIONS.get(key)
+    if not additions:
+        return sorted(current)
+
+    widened = set(current)
+    for toolset in additions:
+        if toolset in configured:
+            widened.add(toolset)
+    if "skills" in widened:
+        widened.discard("skills-read")
+    return sorted(widened)
+
+
+SLOW_WORK_KANBAN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(archive|migrate|import|export|backfill|sync)\b.*\b(stories|issues|linear|obsidian|docs?|history|references?)\b", re.IGNORECASE),
+    re.compile(r"\b(search|scan|check|inspect|audit)\b.*\b(all|every|entire|whole)\b.*\b(repo|repository|codebase|workspace|obsidian|mnemosyne|linear|stories|references?)\b", re.IGNORECASE),
+    re.compile(r"\b(run|fix|execute|work on|implement)\b.*\b(all|entire|whole|backlog|queue|board)\b", re.IGNORECASE),
+    re.compile(r"\b(long|large|big|multi[-\s]?step|background)\b.*\b(task|work|migration|audit|cleanup|refactor)\b", re.IGNORECASE),
+)
+
+FAST_CHAT_ALLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(status|state|why|what|when|where|should|can|could|do i|is it)\b", re.IGNORECASE),
+    re.compile(r"^\s*/", re.IGNORECASE),
+)
+
+
+@dataclass(frozen=True)
+class SlowWorkDeflection:
+    title: str
+    body: str
+    assignee: str
+    priority: int = 1
+
+
+def maybe_build_slow_work_deflection(
+    text: Any,
+    *,
+    platform_key: str | None,
+    command: bool = False,
+) -> SlowWorkDeflection | None:
+    """Return a Kanban task spec when a Discord prompt should not block chat."""
+
+    if command or str(platform_key or "").strip().lower() != "discord":
+        return None
+    prompt = str(text or "").strip()
+    if len(prompt) < 40:
+        return None
+    if any(pattern.search(prompt) for pattern in FAST_CHAT_ALLOW_PATTERNS):
+        return None
+    if not any(pattern.search(prompt) for pattern in SLOW_WORK_KANBAN_PATTERNS):
+        return None
+
+    compact = re.sub(r"\s+", " ", prompt)
+    title = compact[:96].rstrip(" .,;:")
+    if len(compact) > len(title):
+        title = title[:92].rstrip(" .,;:") + "..."
+    body = (
+        "Created automatically from a live Discord request because it looks like "
+        "slow background work. Keep Discord responsive: gather context, perform "
+        "the work in Kanban, update the task with plain-language progress, and "
+        "report the result back when done.\n\n"
+        f"Original request:\n{prompt}"
+    )
+    return SlowWorkDeflection(title=title, body=body, assignee="ranger", priority=1)
+
+
+def plain_language_activity_summary(activity: Mapping[str, Any] | None) -> str:
+    """Turn low-level agent activity into a user-facing progress phrase."""
+
+    activity = activity if isinstance(activity, Mapping) else {}
+    tool = str(activity.get("current_tool") or "").strip().lower()
+    desc = str(activity.get("last_activity_desc") or "").strip().lower()
+    source = f"{tool} {desc}"
+    if any(needle in source for needle in ("npm run build", "vite build", "tsc", "webpack", "build")):
+        return "rebuilding the app"
+    if any(needle in source for needle in ("pytest", "npm test", "pnpm test", "unit test", "regression")):
+        return "checking that the change works"
+    if any(needle in source for needle in ("curl", "localhost", "127.0.0.1", "dashboard", "browser")):
+        return "checking the dashboard"
+    if any(needle in source for needle in ("launchctl", "service", "gateway", "restart", "process")):
+        return "checking the running services"
+    if any(needle in source for needle in ("kanban", "story", "card", "board")):
+        return "updating the work board"
+    if any(needle in source for needle in ("patch", "write_file", "edit", "save")):
+        return "editing the relevant files"
+    if any(needle in source for needle in ("read_file", "search_files", "rg ", "grep", "find")):
+        return "finding the relevant files"
+    checks = (
+        (("terminal", "shell", "command"), "checking the system"),
+        (("read", "file", "search"), "looking up the right context"),
+        (("write", "patch", "edit"), "applying changes"),
+        (("test", "verify"), "checking that the change works"),
+        (("web", "http"), "checking external information"),
+        (("memory", "mnemosyne", "obsidian"), "checking memory and notes"),
+        (("delegate", "subagent", "ranger", "forge", "vex", "quill"), "coordinating a specialist"),
+    )
+    for needles, phrase in checks:
+        if any(needle in source for needle in needles):
+            return phrase
+    return "working through the request"
+
+
+def render_plain_language_heartbeat(
+    *,
+    elapsed_seconds: float,
+    activity: Mapping[str, Any] | None = None,
+) -> str:
+    elapsed_mins = max(1, int(float(elapsed_seconds or 0) // 60))
+    summary = plain_language_activity_summary(activity)
+    return f"Still working: {summary}. ({elapsed_mins} min elapsed)"
 
 
 def _normalize_biff_tool_schema_profile(value: Any) -> str:
@@ -192,25 +716,29 @@ def _normalize_biff_tool_schema_profile(value: Any) -> str:
         "all": "full",
         "wide": "full",
         "core": "core",
-        "narrow": "core",
-        "lean": "core",
-        "reduced": "core",
+        "narrow": "v3",
+        "lean": "v3",
+        "reduced": "v3",
         "biff-core": "core",
         "v2": "v2",
         "profile-v2": "v2",
         "discord-v2": "v2",
         "biff-discord-v2": "v2",
-        "minimal": "v2",
-        "essentials": "v2",
+        "v3": "v3",
+        "profile-v3": "v3",
+        "discord-v3": "v3",
+        "biff-discord-v3": "v3",
+        "minimal": "v3",
+        "essentials": "v3",
     }
-    return aliases.get(raw, raw) if aliases.get(raw, raw) in {"full", "core", "v2"} else "full"
+    return aliases.get(raw, raw) if aliases.get(raw, raw) in {"full", "core", "v2", "v3"} else "full"
 
 
 def resolve_biff_tool_schema_profile(config: Mapping[str, Any] | None = None, platform_key: str | None = None) -> str:
     """Resolve Biff's tool-schema profile.
 
-    Default is ``v2`` for Discord Biff turns and ``full`` elsewhere for
-    compatibility.  ``core``/``v2`` are selectable via
+    Default is ``v3`` for Discord Biff turns and ``full`` elsewhere for
+    compatibility.  ``core``/``v2``/``v3`` are selectable via
     HERMES_BIFF_TOOL_SCHEMA_PROFILE, biff.platforms.<platform>.tool_schema_profile,
     or biff.tool_schema_profile.
     """
@@ -229,7 +757,7 @@ def resolve_biff_tool_schema_profile(config: Mapping[str, Any] | None = None, pl
     if profile_value is None and isinstance(biff_cfg, Mapping):
         profile_value = biff_cfg.get("tool_schema_profile") or biff_cfg.get("tools_profile")
     if profile_value is None and str(platform_key or "").strip().lower() == "discord":
-        return "v2"
+        return "v3"
     return _normalize_biff_tool_schema_profile(profile_value)
 
 
@@ -248,11 +776,58 @@ def apply_biff_tool_schema_profile(
 
     original = [str(toolset) for toolset in (enabled_toolsets or []) if str(toolset).strip()]
     profile = resolve_biff_tool_schema_profile(config, platform_key)
+    if profile == "v3":
+        narrowed = {toolset for toolset in original if toolset in BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS}
+        if "skills" in original:
+            narrowed.add("skills-read")
+        return sorted(narrowed)
     if profile == "v2":
         return sorted({toolset for toolset in original if toolset in BIFF_DISCORD_V2_TOOL_SCHEMA_TOOLSETS})
     if profile != "core":
         return sorted(dict.fromkeys(original))
     return sorted({toolset for toolset in original if toolset in BIFF_CORE_TOOL_SCHEMA_TOOLSETS})
+
+
+def apply_biff_turn_toolset_plan(
+    config: Mapping[str, Any] | None,
+    platform_key: str | None,
+    enabled_toolsets: Iterable[str] | None,
+    *,
+    message: Any = None,
+    configured_toolsets: Iterable[str] | None = None,
+) -> list[str]:
+    """Apply the canonical Biff turn planner to toolset exposure.
+
+    This is the second stage after the platform's fixed tool-schema profile:
+    first classify the turn, then expose only the runtime surfaces that the
+    classification actually needs.  Specialist bundle widening still happens
+    after this, so Forge/Quill/Ranger/Vex keep their required tools without
+    making casual Discord turns carry those schemas.
+    """
+
+    original = [str(toolset) for toolset in (enabled_toolsets or []) if str(toolset).strip()]
+    configured = {str(toolset) for toolset in (configured_toolsets or original) if str(toolset).strip()}
+    if str(platform_key or "").strip().lower() != "discord":
+        return sorted(dict.fromkeys(original))
+    if extract_biff_bundle_key(message):
+        return sorted(dict.fromkeys(original))
+    try:
+        from agent.biff_intent_router import plan_biff_turn
+
+        plan = plan_biff_turn(message, command=False)
+        allowed = BIFF_TURN_TOOLSET_PROFILES.get(plan.toolset_profile)
+    except Exception:
+        allowed = None
+    if allowed is None:
+        return sorted(dict.fromkeys(original))
+    selected = {toolset for toolset in original if toolset in allowed}
+    # Web/status/board plans may need a narrow toolset that the base v3 profile
+    # intentionally removed. Grant only the planner-approved toolsets and only
+    # when the platform actually configured them.
+    for toolset in allowed:
+        if toolset in configured:
+            selected.add(toolset)
+    return sorted(selected)
 
 
 def filter_biff_mode_enabled_toolsets(mode: BiffOperatingMode, enabled_toolsets: Iterable[str] | None) -> list[str]:
@@ -309,7 +884,26 @@ class ToolOutputCapStats:
         return self.tool_outputs_capped_count > 0 or self.message_contents_capped_count > 0
 
 
+@dataclass(frozen=True)
+class BiffPromptBudgetStats:
+    applied: bool = False
+    budget_tokens: int = DEFAULT_BIFF_DISCORD_PROMPT_BUDGET_TOKENS
+    budget_chars: int = DEFAULT_BIFF_DISCORD_PROMPT_BUDGET_TOKENS * CHARS_PER_TOKEN_ESTIMATE
+    original_messages: int = 0
+    kept_messages: int = 0
+    omitted_messages: int = 0
+    original_chars: int = 0
+    kept_chars: int = 0
+    overhead_chars: int = 0
+    reason: str = "within_budget"
+
+
 SESSION_QUOTA_THRESHOLDS: tuple[int, ...] = (40_000, 70_000, 100_000, 130_000)
+DISCORD_SLOWDOWN_GUARD_MIN_MODE = "emergency"
+DISCORD_SLOWDOWN_GUARD_USER_CHARS = 50_000
+DISCORD_SLOWDOWN_GUARD_ASSISTANT_CHARS = 50_000
+DISCORD_SLOWDOWN_GUARD_TOOL_CHARS = 250_000
+DISCORD_SLOWDOWN_GUARD_HISTORY_MESSAGES = 160
 
 
 @dataclass(frozen=True)
@@ -398,6 +992,75 @@ def build_session_quota_recommendation(
         dedupe_key=dedupe_key,
         text=f"Session quota {level.replace('_', ' ')} ({token_label} prompt tokens): {guidance}",
     )
+
+
+def apply_discord_slowdown_guard(
+    mode: BiffOperatingMode,
+    history: Iterable[Mapping[str, Any]] | None,
+    *,
+    platform_key: str | None,
+    message: Any = None,
+    enabled: bool = True,
+) -> tuple[BiffOperatingMode, dict[str, Any] | None]:
+    """Tighten the current Discord turn when active transcript context is bloated.
+
+    This is intentionally model-facing only. It does not mutate transcripts,
+    session files, or Mnemosyne memory. The goal is to prevent a long-running
+    Discord work session from dragging a huge assistant/tool transcript into
+    every future turn.
+    """
+
+    if (
+        not enabled
+        or str(platform_key or "").strip().lower() != "discord"
+        or mode.name in {"emergency", "evidence-only"}
+    ):
+        return mode, None
+
+    bundle_key = extract_biff_bundle_key(message)
+    if bundle_key in {"biff-issue-execution", "biff-hermes-runtime-change", "forge-direct-engineering"}:
+        return mode, None
+
+    messages = list(history or [])
+    user_chars = 0
+    assistant_chars = 0
+    tool_chars = 0
+    for msg in messages:
+        if not isinstance(msg, Mapping):
+            continue
+        role = str(msg.get("role") or "").lower()
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        if role == "user":
+            user_chars += len(content)
+        elif role == "assistant":
+            assistant_chars += len(content)
+        elif role in {"tool", "function"}:
+            tool_chars += len(content)
+
+    reasons: list[str] = []
+    if len(messages) >= DISCORD_SLOWDOWN_GUARD_HISTORY_MESSAGES:
+        reasons.append("history_messages")
+    if user_chars >= DISCORD_SLOWDOWN_GUARD_USER_CHARS:
+        reasons.append("user_chars")
+    if assistant_chars >= DISCORD_SLOWDOWN_GUARD_ASSISTANT_CHARS:
+        reasons.append("assistant_chars")
+    if tool_chars >= DISCORD_SLOWDOWN_GUARD_TOOL_CHARS:
+        reasons.append("tool_chars")
+    if not reasons:
+        return mode, None
+
+    guarded = _BIFF_MODE_SPECS[DISCORD_SLOWDOWN_GUARD_MIN_MODE]
+    return guarded, {
+        "from_mode": mode.name,
+        "to_mode": guarded.name,
+        "reasons": reasons,
+        "history_messages": len(messages),
+        "user_chars": user_chars,
+        "assistant_chars": assistant_chars,
+        "tool_chars": tool_chars,
+    }
 
 
 def _truncate_text(value: Any, max_chars: int) -> tuple[Any, bool]:
@@ -723,6 +1386,168 @@ def cap_model_facing_tool_outputs(
         tool_output_chars_after=chars_after,
         tool_output_chars_omitted=omitted_total,
         message_contents_capped_count=message_capped_count,
+    )
+
+
+def _message_model_chars(message: Mapping[str, Any]) -> int:
+    try:
+        return len(json.dumps(message, ensure_ascii=False, default=str))
+    except Exception:
+        return len(str(dict(message)))
+
+
+def _history_model_chars(history: Iterable[Mapping[str, Any]]) -> int:
+    return sum(_message_model_chars(msg) for msg in history if isinstance(msg, Mapping))
+
+
+def _copy_budget_message(message: Mapping[str, Any]) -> dict[str, Any]:
+    clean = copy.deepcopy(dict(message))
+    clean.pop("_transcript_message_index", None)
+    return clean
+
+
+def _append_budget_group(
+    groups: list[list[dict[str, Any]]],
+    group: list[dict[str, Any]],
+) -> None:
+    if group:
+        groups.append(group)
+
+
+def _group_agent_history_for_budget(history: Iterable[Mapping[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group assistant tool calls with their tool results to preserve API shape."""
+
+    items = [_copy_budget_message(msg) for msg in history if isinstance(msg, Mapping)]
+    groups: list[list[dict[str, Any]]] = []
+    index = 0
+    while index < len(items):
+        msg = items[index]
+        role = str(msg.get("role") or "").lower()
+        if role == "assistant" and msg.get("tool_calls"):
+            group = [msg]
+            index += 1
+            while index < len(items) and str(items[index].get("role") or "").lower() in {"tool", "function"}:
+                group.append(items[index])
+                index += 1
+            _append_budget_group(groups, group)
+            continue
+        if role in {"tool", "function"}:
+            # Orphan tool messages are invalid without their assistant call.
+            index += 1
+            continue
+        _append_budget_group(groups, [msg])
+        index += 1
+    return groups
+
+
+def _truncate_budget_text_message(message: Mapping[str, Any], max_chars: int) -> dict[str, Any] | None:
+    if max_chars <= 120:
+        return None
+    if str(message.get("role") or "").lower() not in {"user", "assistant"}:
+        return None
+    content = message.get("content")
+    if not isinstance(content, str) or not content:
+        return None
+    suffix = "\n\n[...older message shortened for the live Discord prompt budget; full transcript is preserved...]"
+    keep = max(0, max_chars - len(suffix) - 80)
+    if keep <= 0:
+        return None
+    trimmed = _copy_budget_message(message)
+    trimmed["content"] = content[-keep:] + suffix
+    return trimmed
+
+
+def apply_biff_prompt_budget(
+    history: Iterable[Mapping[str, Any]],
+    *,
+    budget_tokens: int = DEFAULT_BIFF_DISCORD_PROMPT_BUDGET_TOKENS,
+    system_context_prompt: Any = "",
+    channel_prompt: Any = "",
+    tool_schema_chars: int = 0,
+) -> tuple[list[dict[str, Any]], BiffPromptBudgetStats]:
+    """Return a smaller model-facing history for ordinary Discord live turns.
+
+    This function never mutates the saved transcript. It keeps newest context,
+    preserves assistant/tool-call grouping, and adds a short note when older
+    model-facing history is omitted. Durable continuity still comes from the
+    hot context capsule, Mnemosyne, Obsidian, Kanban, and the raw transcript.
+    """
+
+    try:
+        resolved_budget_tokens = int(budget_tokens or DEFAULT_BIFF_DISCORD_PROMPT_BUDGET_TOKENS)
+    except Exception:
+        resolved_budget_tokens = DEFAULT_BIFF_DISCORD_PROMPT_BUDGET_TOKENS
+    budget_tokens = max(
+        MIN_BIFF_DISCORD_PROMPT_BUDGET_TOKENS,
+        min(MAX_BIFF_DISCORD_PROMPT_BUDGET_TOKENS, resolved_budget_tokens),
+    )
+    budget_chars = budget_tokens * CHARS_PER_TOKEN_ESTIMATE
+    items = [_copy_budget_message(msg) for msg in history if isinstance(msg, Mapping)]
+    overhead_chars = (
+        _content_char_len(system_context_prompt)
+        + _content_char_len(channel_prompt)
+        + int(tool_schema_chars or 0)
+    )
+    original_chars = _history_model_chars(items) + overhead_chars
+    if original_chars <= budget_chars:
+        return items, BiffPromptBudgetStats(
+            budget_tokens=budget_tokens,
+            budget_chars=budget_chars,
+            original_messages=len(items),
+            kept_messages=len(items),
+            original_chars=original_chars,
+            kept_chars=original_chars,
+            overhead_chars=overhead_chars,
+        )
+
+    notice = {
+        "role": "user",
+        "content": (
+            "[System note: Older Discord history was trimmed from this live prompt "
+            "for speed. Full transcript, Kanban, Obsidian, and Mnemosyne memory "
+            "remain available when needed.]"
+        ),
+    }
+    notice_chars = _message_model_chars(notice)
+    history_budget = max(0, budget_chars - overhead_chars - notice_chars)
+    kept_reversed: list[list[dict[str, Any]]] = []
+    kept_chars = 0
+    omitted_messages = 0
+    groups = _group_agent_history_for_budget(items)
+    for group in reversed(groups):
+        group_chars = _history_model_chars(group)
+        if kept_chars + group_chars <= history_budget:
+            kept_reversed.append(group)
+            kept_chars += group_chars
+            continue
+        remaining = history_budget - kept_chars
+        if remaining > 120 and len(group) == 1:
+            trimmed = _truncate_budget_text_message(group[0], remaining)
+            if trimmed is not None:
+                kept_reversed.append([trimmed])
+                kept_chars += _message_model_chars(trimmed)
+                continue
+        omitted_messages += len(group)
+
+    kept: list[dict[str, Any]] = []
+    for group in reversed(kept_reversed):
+        kept.extend(group)
+    if omitted_messages or len(kept) < len(items):
+        kept.insert(0, notice)
+
+    final_chars = _history_model_chars(kept) + overhead_chars
+    omitted = max(0, len(items) - len(kept) + 1) if kept and kept[0] is notice else max(0, len(items) - len(kept))
+    return kept, BiffPromptBudgetStats(
+        applied=True,
+        budget_tokens=budget_tokens,
+        budget_chars=budget_chars,
+        original_messages=len(items),
+        kept_messages=len(kept),
+        omitted_messages=omitted,
+        original_chars=original_chars,
+        kept_chars=final_chars,
+        overhead_chars=overhead_chars,
+        reason="over_budget",
     )
 
 

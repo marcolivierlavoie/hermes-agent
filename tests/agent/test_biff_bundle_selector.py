@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from agent.biff_bundle_selector import (
+    is_direct_question_without_action,
     select_biff_bundle_for_prompt,
     should_attempt_biff_bundle_auto_selection,
 )
@@ -41,10 +42,6 @@ def bundles():
             "/biff-meeting-followup",
         ),
         (
-            "Should this correction go to Mnemosyne memory, Obsidian, Linear, or nowhere?",
-            "/biff-memory-knowledge-governance",
-        ),
-        (
             "Add a reminder and update the grocery shopping list for this weekend.",
             "/biff-personal-logistics",
         ),
@@ -68,6 +65,51 @@ def test_returns_none_for_low_signal_prompt(bundles):
     selection = select_biff_bundle_for_prompt("Hey Biff, quick question for you", bundles)
 
     assert selection is None
+
+
+def test_direct_questions_stay_on_lean_chat_path(bundles):
+    assert is_direct_question_without_action("Should this correction go to Mnemosyne memory or Obsidian?")
+
+    selection = select_biff_bundle_for_prompt(
+        "Should this correction go to Mnemosyne memory, Obsidian, Linear, or nowhere?",
+        bundles,
+    )
+
+    assert selection is None
+
+
+def test_action_questions_can_still_select_bundle(bundles):
+    assert not is_direct_question_without_action("Can you check Mnemosyne and update Obsidian if needed?")
+
+    selection = select_biff_bundle_for_prompt(
+        "Can you check Mnemosyne and update Obsidian if needed?",
+        bundles,
+    )
+
+    assert selection is not None
+    assert selection.command_key == "/biff-memory-knowledge-governance"
+
+
+def test_follow_up_work_requests_select_issue_execution_bundle(bundles):
+    for prompt in (
+        "Continue",
+        "Do what you have to do",
+        "Now continue and don't stop until done",
+        "COMPLETE 1306",
+        "finish 1306. Dont stop until you're done.",
+        "We'll create the card, document it and give me the number",
+    ):
+        selection = select_biff_bundle_for_prompt(prompt, bundles)
+
+        assert selection is not None
+        assert selection.command_key == "/biff-issue-execution"
+
+
+def test_explicit_ranger_task_correction_selects_issue_execution_bundle(bundles):
+    selection = select_biff_bundle_for_prompt("this is a task for ranger, not forge", bundles)
+
+    assert selection is not None
+    assert selection.command_key == "/biff-issue-execution"
 
 
 def test_explicit_slash_commands_take_precedence_over_auto_selection(bundles):

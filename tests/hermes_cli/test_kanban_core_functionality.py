@@ -2202,7 +2202,8 @@ def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch):
     assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr}"
     import json as _json
     out = _json.loads(r.stdout)
-    assert out["status"] == "ready"
+    assert out["status"] == "triage"
+    # Manual/user-created CLI cards default to captured triage until promoted.
     # DB file exists now.
     assert (home / "kanban.db").exists()
 
@@ -3351,14 +3352,12 @@ def test_legacy_migration_both_columns_already_present(tmp_path):
 # Gateway-embedded dispatcher: config, CLI warnings, daemon deprecation stub
 # ---------------------------------------------------------------------------
 
-def test_config_default_dispatch_in_gateway_is_true():
-    """Default config must enable gateway-embedded dispatch out of the box.
-    Flipping this default to false is a user-visible behaviour change and
-    should require a conscious migration."""
+def test_config_default_dispatch_in_gateway_is_false():
+    """Default config must keep gateway-embedded dispatch opt-in."""
     from hermes_cli.config import DEFAULT_CONFIG
     kanban = DEFAULT_CONFIG.get("kanban", {})
-    assert kanban.get("dispatch_in_gateway") is True, (
-        "kanban.dispatch_in_gateway default should be True; got "
+    assert kanban.get("dispatch_in_gateway") is False, (
+        "kanban.dispatch_in_gateway default should be False; got "
         f"{kanban.get('dispatch_in_gateway')!r}"
     )
     interval = kanban.get("dispatch_interval_seconds")

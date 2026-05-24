@@ -73,6 +73,9 @@ class LongTurnState:
     session_id: str
     task_id: str
     turn_id: str
+    user_request: str | None = None
+    source_of_truth_paths: list[str] = field(default_factory=list)
+    next_command: str | None = None
     started_at: float = field(default_factory=time.time)
     api_calls: int = 0
     tool_calls: int = 0

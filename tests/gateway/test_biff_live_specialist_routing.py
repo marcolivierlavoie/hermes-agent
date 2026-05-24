@@ -1,0 +1,182 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform
+from gateway.platforms.base import MessageEvent
+from gateway.run import GatewayRunner, _specialist_direct_toolsets
+from gateway.session import SessionSource
+
+
+def _runner_with_mocked_handoff(monkeypatch):
+    runner = GatewayRunner(GatewayConfig())
+    runner.adapters[Platform.DISCORD] = SimpleNamespace(send=AsyncMock())
+    monkeypatch.setattr(runner, "_is_user_authorized", lambda source: True)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "test", "base_url": "https://example.invalid", "provider": "test"},
+    )
+    handoff = AsyncMock()
+    monkeypatch.setattr(runner, "_run_specialist_direct_background_task", handoff)
+    return runner, handoff
+
+
+def _discord_event(
+    text: str,
+    message_id: str = "user-msg",
+    *,
+    reply_to_text: str | None = None,
+    reply_to_message_id: str | None = None,
+) -> MessageEvent:
+    return MessageEvent(
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1503821368045863027",
+            chat_type="group",
+            user_id="230102435539058688",
+            user_name="marcolivier2112",
+        ),
+        text=text,
+        message_id=message_id,
+        reply_to_text=reply_to_text,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_discord_user_kanban_admin_message_hands_off_to_ranger(monkeypatch):
+    """Live-style regression: Marco-style Kanban admin should name Ranger."""
+
+    runner, handoff = _runner_with_mocked_handoff(monkeypatch)
+    event = _discord_event("Have Ranger create a Kanban story for proper routing and move it to todo.", "user-msg-1")
+
+    response = await runner._handle_message(event)
+
+    assert response is not None
+    assert "Ranger" in response
+    assert "Forge" not in response
+    assert handoff.call_count == 1
+    assert handoff.call_args.args[0] == "ranger"
+
+
+@pytest.mark.asyncio
+async def test_discord_user_engineering_message_hands_off_to_forge(monkeypatch):
+    """Live-style guardrail: code/runtime work still belongs to Forge."""
+
+    runner, handoff = _runner_with_mocked_handoff(monkeypatch)
+    event = _discord_event("Use Forge to delete Cockpit from the Hermes dashboard sidebar and verify it is gone.", "user-msg-2")
+
+    response = await runner._handle_message(event)
+
+    assert response is not None
+    assert "Forge" in response
+    assert "Ranger" not in response
+    assert handoff.call_count == 1
+    assert handoff.call_args.args[0] == "forge"
+
+
+@pytest.mark.asyncio
+async def test_discord_direct_specialist_handoff_includes_replied_to_context(monkeypatch):
+    """Regression: short "this" follow-ups must not lose Discord reply context."""
+
+    runner, handoff = _runner_with_mocked_handoff(monkeypatch)
+    event = _discord_event(
+        "what do you suggest we do to fix this",
+        "user-msg-reply",
+        reply_to_message_id="quoted-msg",
+        reply_to_text="Gateway error: NameError: name 'max_iterations' is not defined",
+    )
+
+    response = await runner._handle_message(event)
+
+    assert response is not None
+    assert "Forge" in response
+    assert handoff.call_count == 1
+    assert handoff.call_args.args[0] == "forge"
+    handoff_prompt = handoff.call_args.args[1]
+    assert "Replying to" in handoff_prompt
+    assert "NameError: name 'max_iterations' is not defined" in handoff_prompt
+    assert "what do you suggest we do to fix this" in handoff_prompt
+
+
+@pytest.mark.asyncio
+async def test_discord_user_qa_message_hands_off_to_vex(monkeypatch):
+    """Live-style guardrail: QA/validation work belongs to Vex."""
+
+    runner, handoff = _runner_with_mocked_handoff(monkeypatch)
+    event = _discord_event("Have Vex QA the dashboard change and verify the live UI actually works.", "user-msg-3")
+
+    response = await runner._handle_message(event)
+
+    assert response is not None
+    assert "Vex" in response
+    assert "Forge" not in response
+    assert handoff.call_count == 1
+    assert handoff.call_args.args[0] == "vex"
+
+
+@pytest.mark.asyncio
+async def test_discord_user_docs_research_message_hands_off_to_quill(monkeypatch):
+    """Live-style guardrail: documentation/research work belongs to Quill."""
+
+    runner, handoff = _runner_with_mocked_handoff(monkeypatch)
+    event = _discord_event("Have Quill research and document the Biff routing contract in Obsidian.", "user-msg-4")
+
+    response = await runner._handle_message(event)
+
+    assert response is not None
+    assert "Quill" in response
+    assert "Forge" not in response
+    assert handoff.call_count == 1
+    assert handoff.call_args.args[0] == "quill"
+
+
+def test_specialist_direct_toolsets_are_role_specific_and_not_starved():
+    forge = set(_specialist_direct_toolsets("forge").split(","))
+    ranger = set(_specialist_direct_toolsets("ranger").split(","))
+    quill = set(_specialist_direct_toolsets("quill").split(","))
+    vex = set(_specialist_direct_toolsets("vex").split(","))
+
+    assert forge == {
+        "terminal",
+        "file",
+        "web",
+        "browser",
+        "vision",
+        "skills",
+        "memory",
+        "todo",
+        "session_search",
+        "code_execution",
+        "kanban",
+    }
+    assert ranger == {"file", "skills", "memory", "todo", "session_search", "kanban"}
+    assert quill == {
+        "file",
+        "web",
+        "browser",
+        "vision",
+        "skills",
+        "memory",
+        "todo",
+        "session_search",
+        "kanban",
+    }
+    assert vex == {
+        "terminal",
+        "file",
+        "web",
+        "browser",
+        "vision",
+        "skills",
+        "memory",
+        "todo",
+        "session_search",
+        "code_execution",
+        "kanban",
+    }
+
+    excluded_by_default = {"delegation", "cronjob", "messaging", "discord", "discord_admin", "homeassistant", "computer_use"}
+    for role_toolsets in (forge, ranger, quill, vex):
+        assert role_toolsets.isdisjoint(excluded_by_default)

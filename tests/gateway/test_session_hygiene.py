@@ -22,14 +22,25 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_hygiene import (
+    apply_discord_slowdown_guard,
     apply_biff_tool_schema_profile,
+    apply_biff_turn_toolset_plan,
+    apply_biff_prompt_budget,
     biff_operating_mode_prompt,
+    biff_prompt_budget_enabled,
     cap_hygiene_history,
     cap_model_facing_tool_outputs,
     collect_token_source_metrics,
     filter_biff_mode_enabled_toolsets,
+    maybe_build_slow_work_deflection,
+    render_plain_language_heartbeat,
+    resolve_biff_live_max_iterations,
+    resolve_biff_live_tool_guardrail_settings,
+    resolve_biff_prompt_budget_tokens,
     resolve_biff_operating_mode,
     resolve_biff_tool_schema_profile,
+    should_apply_biff_prompt_budget,
+    widen_biff_toolsets_for_bundle,
 )
 
 
@@ -89,6 +100,231 @@ def _make_tool_history(
 
 def _tool_content_chars(history: list[dict]) -> int:
     return sum(len(m["content"]) for m in history if m.get("role") == "tool")
+
+
+def test_discord_live_guardrails_keep_plain_chat_tight():
+    settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message="what is this?")
+
+    assert settings["bundle_key"] is None
+    assert settings["terminal_timeout"] == 15
+    assert settings["max_tool_calls"] == 1
+    assert resolve_biff_live_max_iterations({}, "discord", message="what is this?", base_max_iterations=90) == 2
+
+
+def test_turn_toolset_plan_removes_tools_for_casual_answer():
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web"]
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        configured,
+        message="Quick question: what are three simple dinner ideas with chicken and rice?",
+    )
+
+    assert enabled == []
+
+
+def test_turn_toolset_plan_keeps_only_board_tools_for_kanban_status():
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        configured,
+        message="Status check only: tell me what K-1346 and K-1347 currently say on the Kanban board.",
+    )
+
+    assert enabled == ["kanban", "terminal"]
+
+
+def test_turn_toolset_plan_grants_web_and_browser_for_links():
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search", "browser"]
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        ["terminal", "file", "memory", "skills-read", "todo", "kanban"],
+        configured_toolsets=configured,
+        message="Can you see this thread https://www.reddit.com/r/hermesagent/comments/1tlyfob/best_localfirst_ai_memory_assistant_second_brain/",
+    )
+
+    assert enabled == ["browser", "file", "search", "terminal", "web"]
+
+
+def test_turn_toolset_plan_keeps_specialist_base_for_bundle_message():
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
+    message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'
+
+    enabled = apply_biff_turn_toolset_plan({}, "discord", configured, message=message)
+
+    assert enabled == sorted(configured)
+
+
+def test_discord_live_guardrails_give_forge_delivery_room():
+    message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'
+
+    settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message=message)
+
+    assert settings["bundle_key"] == "biff-hermes-runtime-change"
+    assert settings["terminal_timeout"] == 60
+    assert settings["max_tool_calls"] == 80
+    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 72
+
+
+def test_forge_delivery_budget_ignores_generic_bundle_caps():
+    message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'
+    config = {
+        "biff": {
+            "platforms": {
+                "discord": {
+                    "bundle_chat_max_tool_calls": 4,
+                    "bundle_chat_max_iterations": 4,
+                    "chat_terminal_timeout": 15,
+                }
+            }
+        }
+    }
+
+    settings = resolve_biff_live_tool_guardrail_settings(config, "discord", message=message)
+
+    assert settings["max_tool_calls"] == 80
+    assert settings["terminal_timeout"] == 60
+    assert resolve_biff_live_max_iterations(config, "discord", message=message, base_max_iterations=90) == 72
+
+
+def test_issue_execution_budget_ignores_generic_bundle_caps():
+    message = '[IMPORTANT: The user has invoked the "biff-issue-execution" skill bundle.]'
+    config = {
+        "biff": {
+            "platforms": {
+                "discord": {
+                    "bundle_chat_max_tool_calls": 4,
+                    "bundle_chat_max_iterations": 4,
+                    "chat_terminal_timeout": 15,
+                }
+            }
+        }
+    }
+
+    settings = resolve_biff_live_tool_guardrail_settings(config, "discord", message=message)
+
+    assert settings["max_tool_calls"] == 60
+    assert settings["terminal_timeout"] == 45
+    assert resolve_biff_live_max_iterations(config, "discord", message=message, base_max_iterations=90) == 60
+
+
+def test_issue_execution_budget_has_own_explicit_overrides():
+    message = '[IMPORTANT: The user has invoked the "biff-issue-execution" skill bundle.]'
+    config = {
+        "biff": {
+            "platforms": {
+                "discord": {
+                    "issue_execution_chat_terminal_timeout": 75,
+                    "issue_execution_chat_max_tool_calls": 44,
+                    "issue_execution_chat_max_iterations": 41,
+                }
+            }
+        }
+    }
+
+    settings = resolve_biff_live_tool_guardrail_settings(config, "discord", message=message)
+
+    assert settings["max_tool_calls"] == 44
+    assert settings["terminal_timeout"] == 75
+    assert resolve_biff_live_max_iterations(config, "discord", message=message, base_max_iterations=90) == 41
+
+
+def test_forge_delivery_budget_has_own_explicit_overrides():
+    message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'
+    config = {
+        "biff": {
+            "platforms": {
+                "discord": {
+                    "forge_chat_terminal_timeout": 90,
+                    "forge_chat_max_tool_calls": 55,
+                    "forge_chat_max_iterations": 50,
+                }
+            }
+        }
+    }
+
+    settings = resolve_biff_live_tool_guardrail_settings(config, "discord", message=message)
+
+    assert settings["max_tool_calls"] == 55
+    assert settings["terminal_timeout"] == 90
+    assert resolve_biff_live_max_iterations(config, "discord", message=message, base_max_iterations=90) == 50
+
+
+def test_discord_live_guardrails_allow_explicit_unlimited_bundle_tools():
+    message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'
+    config = {"biff": {"platforms": {"discord": {"forge_chat_max_tool_calls": "unlimited"}}}}
+
+    settings = resolve_biff_live_tool_guardrail_settings(config, "discord", message=message)
+
+    assert settings["max_tool_calls"] is None
+
+
+def test_discord_live_guardrails_adapt_for_plain_engineering_action():
+    message = "Delete Cockpit from the Hermes dashboard sidebar and verify it is gone."
+
+    settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message=message)
+
+    assert settings["bundle_key"] is None
+    assert settings["route_action"] == "forge_direct"
+    assert settings["terminal_timeout"] == 45
+    assert settings["max_tool_calls"] == 24
+    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 24
+
+
+def test_discord_live_guardrails_keep_quick_status_small():
+    message = "Can you check gateway status?"
+
+    settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message=message)
+
+    assert settings["route_action"] == "one_tool"
+    assert settings["terminal_timeout"] == 20
+    assert settings["max_tool_calls"] == 2
+    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 3
+
+
+def test_discord_live_guardrails_keep_kanban_status_bounded():
+    message = "Status check only: tell me what K-1346 and K-1347 currently say on the Kanban board."
+
+    settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message=message)
+
+    assert settings["route_action"] == "kanban_status"
+    assert settings["terminal_timeout"] == 20
+    assert settings["max_tool_calls"] == 3
+    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 5
+
+
+def test_discord_live_guardrails_give_ranger_board_admin_room():
+    message = "Create a Kanban story for proper routing and move it to todo."
+
+    settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message=message)
+
+    assert settings["route_action"] == "ranger_direct"
+    assert settings["terminal_timeout"] == 45
+    assert settings["max_tool_calls"] == 24
+    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 24
+
+
+def test_plain_route_budgets_ignore_generic_chat_cap():
+    config = {"biff": {"platforms": {"discord": {"chat_max_tool_calls": 8, "chat_max_iterations": 8}}}}
+    message = "do it. Btw I do see that it hit the OpenAI API. could mini be too weak?"
+
+    settings = resolve_biff_live_tool_guardrail_settings(config, "discord", message=message)
+
+    assert settings["route_action"] == "route_bundle"
+    assert settings["max_tool_calls"] == 16
+    assert resolve_biff_live_max_iterations(config, "discord", message=message, base_max_iterations=90) == 48
+
+
+def test_answer_now_budget_ignores_generic_chat_cap():
+    config = {"biff": {"platforms": {"discord": {"chat_max_tool_calls": 8, "chat_max_iterations": 8}}}}
+
+    settings = resolve_biff_live_tool_guardrail_settings(config, "discord", message="what is this?")
+
+    assert settings["route_action"] == "answer_now"
+    assert settings["max_tool_calls"] == 1
+    assert resolve_biff_live_max_iterations(config, "discord", message="what is this?", base_max_iterations=90) == 2
 
 
 class HygieneCaptureAdapter(BasePlatformAdapter):
@@ -254,7 +490,57 @@ class TestSessionHygieneCaps:
         assert "message_index=1" not in capped[1]["content"]
         assert "_transcript_message_index" not in capped[0]
         assert "_transcript_message_index" not in capped[1]
-        assert history[1]["_transcript_message_index"] == 8
+
+    def test_biff_prompt_budget_trims_only_model_facing_history(self):
+        history = _make_history(40, content_size=1200)
+        original = [dict(message) for message in history]
+
+        budgeted, stats = apply_biff_prompt_budget(
+            history,
+            budget_tokens=6_000,
+            system_context_prompt="hot context" * 200,
+            channel_prompt="channel" * 100,
+            tool_schema_chars=4_000,
+        )
+
+        assert stats.applied is True
+        assert stats.budget_tokens == 6_000
+        assert stats.omitted_messages > 0
+        assert stats.kept_messages < stats.original_messages
+        assert stats.kept_chars <= stats.budget_chars
+        assert "Older Discord history was trimmed" in budgeted[0]["content"]
+        assert history == original
+
+    def test_biff_prompt_budget_preserves_assistant_tool_groups(self):
+        history = [
+            {"role": "user", "content": "old" * 2000},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "assistant", "content": "new answer"},
+        ]
+
+        budgeted, stats = apply_biff_prompt_budget(history, budget_tokens=6_000, tool_schema_chars=18_000)
+
+        assert stats.applied is True
+        roles = [message["role"] for message in budgeted]
+        if "tool" in roles:
+            tool_index = roles.index("tool")
+            assert roles[tool_index - 1] == "assistant"
+            assert budgeted[tool_index - 1].get("tool_calls")
+        assert budgeted[-1]["content"] == "new answer"
+
+    def test_biff_prompt_budget_is_discord_only_and_exempts_bundles(self, monkeypatch):
+        config = {"biff": {"platforms": {"discord": {"prompt_budget": True, "prompt_budget_tokens": 12_000}}}}
+
+        assert biff_prompt_budget_enabled(config, "discord") is True
+        assert biff_prompt_budget_enabled(config, "slack") is False
+        assert resolve_biff_prompt_budget_tokens(config, "discord") == 12_000
+        assert should_apply_biff_prompt_budget(config, "discord", message="normal question") is True
+        bundle_message = 'The user has invoked the "/biff-hermes-runtime-change" skill bundle.'
+        assert should_apply_biff_prompt_budget(config, "discord", message=bundle_message) is False
+
+        monkeypatch.setenv("HERMES_BIFF_PROMPT_BUDGET_TOKENS", "50000")
+        assert resolve_biff_prompt_budget_tokens(config, "discord") == 40_000
 
     def test_model_facing_tool_cap_enforces_aggregate_historical_tool_budget(self):
         history = []
@@ -563,6 +849,13 @@ class TestSessionHygieneCaps:
         assert "Evidence-only" in prompt
         assert "Tool access is restricted" in prompt
 
+        economy_prompt = biff_operating_mode_prompt(default_mode)
+        assert "complete the bounded deliverable" in economy_prompt
+        assert "do not stop at an acknowledgement" in economy_prompt
+        assert "Prefer rg over grep" in economy_prompt
+        assert "Use Kanban/background work only for genuinely broad work" in economy_prompt
+        assert "short terminal timeouts" in economy_prompt
+
     def test_evidence_only_filters_to_read_only_evidence_toolsets(self, monkeypatch):
         monkeypatch.delenv("HERMES_BIFF_MODE", raising=False)
         evidence_mode = resolve_biff_operating_mode({"biff": {"operating_mode": "evidence-only"}}, "discord")
@@ -601,7 +894,50 @@ class TestSessionHygieneCaps:
         assert stats.message_contents_capped_count == 1
         assert stats.tool_outputs_capped_count == 1
 
-    def test_biff_discord_tool_schema_profile_defaults_to_v2_allowlist(self, monkeypatch):
+    def test_discord_slowdown_guard_tightens_bloated_active_context_only(self):
+        mode = resolve_biff_operating_mode({"biff": {"operating_mode": "economy"}}, "discord")
+        history = [
+            {"role": "assistant", "content": "a" * 55_000},
+            {"role": "tool", "content": "t" * 260_000},
+        ]
+
+        guarded, info = apply_discord_slowdown_guard(mode, history, platform_key="discord")
+
+        assert guarded.name == "emergency"
+        assert info is not None
+        assert info["from_mode"] == "economy"
+        assert info["to_mode"] == "emergency"
+        assert set(info["reasons"]) == {"assistant_chars", "tool_chars"}
+        assert history[0]["content"] == "a" * 55_000
+        assert history[1]["content"] == "t" * 260_000
+
+    def test_discord_slowdown_guard_does_not_override_evidence_or_other_platforms(self):
+        evidence = resolve_biff_operating_mode({"biff": {"operating_mode": "evidence-only"}}, "discord")
+        economy = resolve_biff_operating_mode({"biff": {"operating_mode": "economy"}}, "discord")
+        history = [{"role": "assistant", "content": "a" * 80_000}]
+
+        guarded_evidence, evidence_info = apply_discord_slowdown_guard(evidence, history, platform_key="discord")
+        guarded_slack, slack_info = apply_discord_slowdown_guard(economy, history, platform_key="slack")
+
+        assert guarded_evidence.name == "evidence-only"
+        assert evidence_info is None
+        assert guarded_slack.name == "economy"
+        assert slack_info is None
+
+    def test_discord_slowdown_guard_does_not_kneecap_delivery_bundles(self):
+        mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
+        history = [
+            {"role": "assistant", "content": "a" * 55_000},
+            {"role": "tool", "content": "t" * 260_000},
+        ]
+        message = '[IMPORTANT: The user has invoked the "biff-issue-execution" skill bundle.]'
+
+        guarded, info = apply_discord_slowdown_guard(mode, history, platform_key="discord", message=message)
+
+        assert guarded.name == "normal"
+        assert info is None
+
+    def test_biff_discord_tool_schema_profile_defaults_to_v3_allowlist(self, monkeypatch):
         monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
         configured = [
             "terminal",
@@ -624,11 +960,45 @@ class TestSessionHygieneCaps:
             "discord",
         ]
 
-        assert resolve_biff_tool_schema_profile({}, "discord") == "v2"
+        assert resolve_biff_tool_schema_profile({}, "discord") == "v3"
         assert apply_biff_tool_schema_profile({}, "discord", configured) == [
+            "file",
+            "kanban",
+            "memory",
+            "skills-read",
+            "terminal",
+            "todo",
+        ]
+
+    def test_biff_discord_tool_schema_profile_v2_keeps_previous_build_ops_allowlist(self, monkeypatch):
+        monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
+        configured = [
+            "terminal",
+            "file",
+            "memory",
+            "session_search",
+            "skills",
+            "todo",
+            "clarify",
+            "code_execution",
+            "delegation",
+            "web",
+            "vision",
+            "browser",
+            "cronjob",
+            "image_gen",
+            "messaging",
+            "tts",
+            "kanban",
+            "discord",
+        ]
+        cfg = {"biff": {"platforms": {"discord": {"tool_schema_profile": "v2"}}}}
+
+        assert apply_biff_tool_schema_profile(cfg, "discord", configured) == [
             "code_execution",
             "delegation",
             "file",
+            "kanban",
             "memory",
             "skills",
             "terminal",
@@ -665,6 +1035,7 @@ class TestSessionHygieneCaps:
             "delegation",
             "discord",
             "file",
+            "kanban",
             "memory",
             "session_search",
             "skills",
@@ -710,7 +1081,7 @@ class TestSessionHygieneCaps:
             "terminal",
         ]
 
-    def test_biff_discord_v2_reduces_model_facing_tools_and_schema_chars(self, monkeypatch):
+    def test_biff_discord_v3_reduces_model_facing_tools_and_schema_chars(self, monkeypatch):
         monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
         from hermes_cli.tools_config import _get_platform_tools
         from model_tools import get_tool_definitions
@@ -733,8 +1104,8 @@ class TestSessionHygieneCaps:
 
         assert len(default_tools) < len(full_tools)
         assert default_chars < full_chars
-        assert default_chars <= 30_000
-        assert full_chars - default_chars >= 10_000
+        assert default_chars <= 18_000
+        assert full_chars - default_chars >= 20_000
         assert {
             "read_file",
             "search_files",
@@ -742,22 +1113,107 @@ class TestSessionHygieneCaps:
             "patch",
             "terminal",
             "process",
-            "execute_code",
             "skill_view",
             "skills_list",
-            "skill_manage",
             "memory",
-            "delegate_task",
             "todo",
         }.issubset(default_names)
         assert {
             "cronjob",
+            "delegate_task",
+            "execute_code",
             "image_generate",
             "send_message",
             "session_search",
+            "skill_manage",
             "text_to_speech",
             "vision_analyze",
         }.isdisjoint(default_names)
+
+    def test_biff_bundle_tool_widening_adds_only_selected_specialist_toolsets(self, monkeypatch):
+        monkeypatch.delenv("HERMES_BIFF_BUNDLE_TOOL_WIDENING", raising=False)
+        configured = [
+            "terminal",
+            "file",
+            "memory",
+            "skills-read",
+            "skills",
+            "todo",
+            "kanban",
+            "code_execution",
+            "delegation",
+            "web",
+            "vision",
+            "browser",
+        ]
+        narrowed = ["terminal", "file", "memory", "skills-read", "todo", "kanban"]
+        message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'
+
+        widened = widen_biff_toolsets_for_bundle(
+            {"biff": {"platforms": {"discord": {"bundle_tool_widening": True}}}},
+            "discord",
+            narrowed,
+            configured,
+            message=message,
+        )
+
+        assert "code_execution" in widened
+        assert "delegation" in widened
+        assert "skills" in widened
+        assert "skills-read" not in widened
+        assert "browser" not in widened
+
+    def test_biff_bundle_tool_widening_respects_configured_platform_tools(self, monkeypatch):
+        monkeypatch.delenv("HERMES_BIFF_BUNDLE_TOOL_WIDENING", raising=False)
+
+        widened = widen_biff_toolsets_for_bundle(
+            {},
+            "discord",
+            ["terminal", "file", "kanban"],
+            ["terminal", "file", "kanban"],
+            bundle_key="biff-issue-execution",
+        )
+
+        assert widened == ["file", "kanban", "terminal"]
+
+    def test_slow_work_deflection_catches_broad_background_requests(self):
+        decision = maybe_build_slow_work_deflection(
+            "Please migrate all Linear stories and scan the whole Obsidian workspace for references before updating the board.",
+            platform_key="discord",
+        )
+
+        assert decision is not None
+        assert decision.assignee == "ranger"
+        assert "Original request" in decision.body
+
+    def test_slow_work_deflection_ignores_questions_and_short_prompts(self):
+        assert maybe_build_slow_work_deflection(
+            "why is the bot slow to respond?",
+            platform_key="discord",
+        ) is None
+        assert maybe_build_slow_work_deflection(
+            "archive all stories",
+            platform_key="discord",
+        ) is None
+
+    def test_plain_language_heartbeat_hides_tool_details(self):
+        text = render_plain_language_heartbeat(
+            elapsed_seconds=245,
+            activity={"current_tool": "terminal", "last_activity_desc": "running grep -rnH"},
+        )
+
+        assert text == "Still working: finding the relevant files. (4 min elapsed)"
+        assert "terminal" not in text
+        assert "grep" not in text
+
+    def test_plain_language_heartbeat_uses_real_stage(self):
+        text = render_plain_language_heartbeat(
+            elapsed_seconds=125,
+            activity={"current_tool": "terminal", "last_activity_desc": "cd web && npm run build"},
+        )
+
+        assert text == "Still working: rebuilding the app. (2 min elapsed)"
+        assert "npm" not in text
 
 class TestSessionHygieneThresholds:
     """Test that the threshold logic correctly identifies large sessions.

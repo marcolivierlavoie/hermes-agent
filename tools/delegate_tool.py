@@ -1441,11 +1441,15 @@ def _run_single_child(
     _stale_count = [0]
 
     def _heartbeat_loop():
-        while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+        while not _heartbeat_stop.is_set():
             if parent_agent is None:
+                if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                    break
                 continue
             touch = getattr(parent_agent, "_touch_activity", None)
             if not touch:
+                if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                    break
                 continue
             # Pull detail from the child's own activity tracker
             desc = f"delegate_task: subagent {task_index} working"
@@ -1508,6 +1512,8 @@ def _run_single_child(
                 touch(desc)
             except Exception:
                 pass
+            if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                break
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
 
@@ -1541,6 +1547,12 @@ def _run_single_child(
 
     try:
         _heartbeat_thread.start()
+        try:
+            touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
+            if touch:
+                touch(f"delegate_task: subagent {task_index} starting")
+        except Exception:
+            pass
         if child_progress_cb:
             try:
                 child_progress_cb("subagent.start", preview=goal)
@@ -1585,7 +1597,19 @@ def _run_single_child(
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
+            touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
+            if touch:
+                touch(f"delegate_task: subagent {task_index} running")
+        except Exception:
+            pass
+        try:
             result = _child_future.result(timeout=child_timeout)
+            try:
+                touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
+                if touch:
+                    touch(f"delegate_task: subagent {task_index} completed")
+            except Exception:
+                pass
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:

@@ -656,6 +656,7 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    display_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -671,6 +672,7 @@ class Task:
                 skills_value = None
         return cls(
             id=row["id"],
+            display_id=row["display_id"] if "display_id" in keys else None,
             title=row["title"],
             body=row["body"],
             assignee=row["assignee"],
@@ -808,6 +810,7 @@ class Event:
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
     id                   TEXT PRIMARY KEY,
+    display_id           TEXT,
     title                TEXT NOT NULL,
     body                 TEXT,
     assignee             TEXT,
@@ -865,7 +868,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id           TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id);
+CREATE TABLE IF NOT EXISTS kanban_sequences (
+    name       TEXT PRIMARY KEY,
+    next_value INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
@@ -937,13 +943,10 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_tenant          ON tasks(tenant);
-CREATE INDEX IF NOT EXISTS idx_tasks_idempotency     ON tasks(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_events_run            ON task_events(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
@@ -1073,6 +1076,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     Called by ``init_db`` so opening an old DB is always safe.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "display_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "display_id", "display_id TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_display_id "
+        "ON tasks(display_id)"
+    )
+    _ensure_display_ids(conn)
+
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
@@ -1083,10 +1095,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency "
-            "ON tasks(idempotency_key)"
-        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_tenant "
+        "ON tasks(tenant)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency "
+        "ON tasks(idempotency_key)"
+    )
 
     # Refresh after early additive migrations above. Some existing DBs were
     # partially migrated in older releases and can already contain the later
@@ -1170,24 +1186,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # created from within an agent loop that propagated
         # ``HERMES_SESSION_ID`` (e.g. ACP). NULL on legacy rows and on any
         # creation path that doesn't set the env var (CLI, dashboard).
-        # Index keeps per-session list queries cheap.
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_session_id "
-            "ON tasks(session_id)"
-        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id "
+        "ON tasks(session_id)"
+    )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_run "
-            "ON task_events(run_id, id)"
-        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_run "
+        "ON task_events(run_id, id)"
+    )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -1294,6 +1309,113 @@ def write_txn(conn: sqlite3.Connection):
 # ID generation
 # ---------------------------------------------------------------------------
 
+_DISPLAY_ID_PREFIX = "K"
+_DISPLAY_ID_RE = re.compile(r"^K-?0*(\d+)$", re.IGNORECASE)
+_DISPLAY_ID_SEQUENCE = "task_display_id"
+
+
+def format_display_id(n: int) -> str:
+    """Return the canonical human-facing Kanban id for a sequence number."""
+    return f"{_DISPLAY_ID_PREFIX}-{int(n):04d}"
+
+
+def normalize_display_id(value: Optional[str]) -> Optional[str]:
+    """Normalize K-style task references such as K-1, k001, or K-001."""
+    if not value:
+        return None
+    m = _DISPLAY_ID_RE.match(str(value).strip())
+    if not m:
+        return None
+    return format_display_id(int(m.group(1)))
+
+
+def _display_id_number(value: Optional[str]) -> Optional[int]:
+    normed = normalize_display_id(value)
+    if not normed:
+        return None
+    return int(normed.split("-", 1)[1])
+
+
+def _ensure_sequence_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_sequences (
+            name       TEXT PRIMARY KEY,
+            next_value INTEGER NOT NULL
+        )
+        """
+    )
+
+
+def _ensure_display_ids(conn: sqlite3.Connection) -> None:
+    """Backfill and seed human-facing task ids for existing boards."""
+    _ensure_sequence_table(conn)
+    max_seen = 0
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    order_by = "created_at ASC, id ASC" if "created_at" in cols else "id ASC"
+    rows = conn.execute(
+        f"SELECT id, display_id FROM tasks ORDER BY {order_by}"
+    ).fetchall()
+    used = {r["display_id"] for r in rows if r["display_id"]}
+    for r in rows:
+        n = _display_id_number(r["display_id"])
+        if n is not None:
+            max_seen = max(max_seen, n)
+            continue
+        next_n = max_seen + 1
+        display_id = format_display_id(next_n)
+        while display_id in used:
+            next_n += 1
+            display_id = format_display_id(next_n)
+        conn.execute(
+            "UPDATE tasks SET display_id = ? WHERE id = ?",
+            (display_id, r["id"]),
+        )
+        used.add(display_id)
+        max_seen = next_n
+    conn.execute(
+        """
+        INSERT INTO kanban_sequences (name, next_value)
+        VALUES (?, ?)
+        ON CONFLICT(name) DO UPDATE SET next_value = MAX(next_value, excluded.next_value)
+        """,
+        (_DISPLAY_ID_SEQUENCE, max_seen + 1),
+    )
+
+
+def _next_display_id(conn: sqlite3.Connection) -> str:
+    _ensure_sequence_table(conn)
+    row = conn.execute(
+        "SELECT next_value FROM kanban_sequences WHERE name = ?",
+        (_DISPLAY_ID_SEQUENCE,),
+    ).fetchone()
+    if row is None:
+        _ensure_display_ids(conn)
+        row = conn.execute(
+            "SELECT next_value FROM kanban_sequences WHERE name = ?",
+            (_DISPLAY_ID_SEQUENCE,),
+        ).fetchone()
+    next_value = int(row["next_value"]) if row else 1
+    display_id = format_display_id(next_value)
+    conn.execute(
+        """
+        INSERT INTO kanban_sequences (name, next_value)
+        VALUES (?, ?)
+        ON CONFLICT(name) DO UPDATE SET next_value = excluded.next_value
+        """,
+        (_DISPLAY_ID_SEQUENCE, next_value + 1),
+    )
+    return display_id
+
+
+def _task_display_id(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT display_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return row["display_id"] if row and row["display_id"] else None
+
+
 def _new_task_id() -> str:
     """Generate a short, URL-safe task id.
 
@@ -1392,7 +1514,13 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
-    parents = tuple(p for p in parents if p)
+    resolved_parents: list[str] = []
+    for p in parents:
+        if not p:
+            continue
+        resolved = resolve_task_id(conn, str(p))
+        resolved_parents.append(resolved or str(p))
+    parents = tuple(resolved_parents)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -1470,6 +1598,7 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                display_id = _next_display_id(conn)
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -1505,14 +1634,15 @@ def create_task(
                 conn.execute(
                     """
                     INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
+                        id, display_id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
                         skills, max_retries, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
+                        display_id,
                         title.strip(),
                         body,
                         assignee,
@@ -1571,8 +1701,35 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
     return [p for p in parents if p not in present]
 
 
+def resolve_task_id(conn: sqlite3.Connection, task_ref: str) -> Optional[str]:
+    """Resolve an internal task id or human display id to the internal id."""
+    task_ref = str(task_ref or "").strip()
+    if not task_ref:
+        return None
+    row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_ref,)).fetchone()
+    if row:
+        return row["id"]
+    display_id = normalize_display_id(task_ref)
+    if display_id:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE display_id = ?",
+            (display_id,),
+        ).fetchone()
+        if row:
+            return row["id"]
+    return None
+
+
+def _coerce_task_id(conn: sqlite3.Connection, task_ref: str) -> str:
+    """Return the internal id for a task reference when it can be resolved."""
+    return resolve_task_id(conn, task_ref) or task_ref
+
+
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    resolved = resolve_task_id(conn, task_id)
+    if not resolved:
+        return None
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (resolved,)).fetchone()
     return Task.from_row(row) if row else None
 
 
@@ -1648,6 +1805,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
     """
+    task_id = _coerce_task_id(conn, task_id)
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
@@ -1754,6 +1912,7 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    task_id = _coerce_task_id(conn, task_id)
     rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
         (task_id,),
@@ -1762,6 +1921,7 @@ def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
 
 
 def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    task_id = _coerce_task_id(conn, task_id)
     rows = conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
         (task_id,),
@@ -1791,6 +1951,7 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 def add_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str
 ) -> int:
+    task_id = _coerce_task_id(conn, task_id)
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -1811,6 +1972,7 @@ def add_comment(
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
+    task_id = _coerce_task_id(conn, task_id)
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
         (task_id,),
@@ -1828,6 +1990,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
+    task_id = _coerce_task_id(conn, task_id)
     rows = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC",
         (task_id,),
@@ -2050,6 +2213,7 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    task_id = _coerce_task_id(conn, task_id)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -2641,6 +2805,7 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    task_id = _coerce_task_id(conn, task_id)
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -3208,13 +3373,14 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant FROM tasks WHERE id = ?", (task_id,)
+            "SELECT id, display_id, status, tenant FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if root_row is None:
             return None
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        root_ref = root_row["display_id"] or task_id
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -3222,16 +3388,18 @@ def decompose_triage_task(
         # promotes parent-free children to 'ready'.
         for idx, child in enumerate(children):
             new_id = _new_task_id()
+            display_id = _next_display_id(conn)
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
             conn.execute(
                 "INSERT INTO tasks "
-                "(id, title, body, assignee, status, workspace_kind, "
+                "(id, display_id, title, body, assignee, status, workspace_kind, "
                 " tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', 'scratch', ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, 'todo', 'scratch', ?, ?, ?)",
                 (
                     new_id,
+                    display_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
@@ -3242,7 +3410,7 @@ def decompose_triage_task(
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {"by": author or "decomposer", "from_decompose_of": root_ref},
             )
             child_ids.append(new_id)
 
@@ -3258,7 +3426,10 @@ def decompose_triage_task(
                 )
                 _append_event(
                     conn, child_id, "linked",
-                    {"parent": parent_id, "child": child_id},
+                    {
+                        "parent": _task_display_id(conn, parent_id) or parent_id,
+                        "child": _task_display_id(conn, child_id) or child_id,
+                    },
                 )
 
         # Link the ROOT task as a child of every leaf child — i.e. the
@@ -3293,7 +3464,7 @@ def decompose_triage_task(
                     task_id,
                     author.strip(),
                     "Decomposed into "
-                    + ", ".join(child_ids)
+                    + ", ".join(_task_display_id(conn, cid) or cid for cid in child_ids)
                     + ". Root will wake when all children complete.",
                     now,
                 ),
@@ -3301,7 +3472,7 @@ def decompose_triage_task(
         _append_event(
             conn, task_id, "decomposed",
             {
-                "child_ids": child_ids,
+                "child_ids": [_task_display_id(conn, cid) or cid for cid in child_ids],
                 "root_assignee": root_assignee,
             },
         )
@@ -5416,7 +5587,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
 
     lines: list[str] = []
-    lines.append(f"# Kanban task {task.id}: {task.title}")
+    task_ref = task.display_id or task.id
+    lines.append(f"# Kanban task {task_ref}: {task.title}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
@@ -5503,7 +5675,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             if not wrote_header:
                 lines.append("## Parent task results")
                 wrote_header = True
-            lines.append(f"### {pid}")
+            parent_ref = pt.display_id or pid
+            lines.append(f"### {parent_ref}")
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
@@ -5530,7 +5703,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # section above isn't duplicated. Safe on assignee=None (skipped).
     if task.assignee:
         role_rows = conn.execute(
-            "SELECT t.id, t.title, r.summary, r.ended_at "
+            "SELECT t.id, t.display_id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
             "WHERE r.profile = ? AND r.task_id != ? "
             "  AND r.outcome = 'completed' "
@@ -5545,7 +5718,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 )
                 s = (row["summary"] or "").strip().splitlines()
                 first = s[0][:200] if s else "(no summary)"
-                lines.append(f"- {row['id']} — {row['title']} ({ts}): {first}")
+                row_ref = row["display_id"] or row["id"]
+                lines.append(f"- {row_ref} — {row['title']} ({ts}): {first}")
             lines.append("")
 
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
@@ -5671,6 +5845,16 @@ def task_age(task: Task) -> dict:
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
 
+def _notify_task_id(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the internal task id for notification subscription lookups.
+
+    Notification events are stored under internal ``t_...`` ids.  User-facing
+    command paths may pass K-style display ids, so normalize them before any
+    subscription row is inserted, queried, or removed.
+    """
+    return resolve_task_id(conn, task_id) or task_id
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -5683,6 +5867,7 @@ def add_notify_sub(
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    task_id = _notify_task_id(conn, task_id)
     now = int(time.time())
     with write_txn(conn):
         conn.execute(
@@ -5711,6 +5896,7 @@ def list_notify_subs(
     conn: sqlite3.Connection, task_id: Optional[str] = None,
 ) -> list[dict]:
     if task_id is not None:
+        task_id = _notify_task_id(conn, task_id)
         rows = conn.execute(
             "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
         ).fetchall()
@@ -5727,6 +5913,7 @@ def remove_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
+    task_id = _notify_task_id(conn, task_id)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
@@ -5751,6 +5938,7 @@ def unseen_events_for_sub(
     cursor is NOT advanced here; call :func:`advance_notify_cursor` after
     the gateway has successfully delivered the notifications.
     """
+    task_id = _notify_task_id(conn, task_id)
     row = conn.execute(
         "SELECT last_event_id FROM kanban_notify_subs "
         "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -5809,6 +5997,7 @@ def claim_unseen_events_for_sub(
     failed before any terminal unsubscribe removed the row.
     """
     with write_txn(conn):
+        task_id = _notify_task_id(conn, task_id)
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -5846,6 +6035,7 @@ def advance_notify_cursor(
     new_cursor: int,
 ) -> None:
     with write_txn(conn):
+        task_id = _notify_task_id(conn, task_id)
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -5870,6 +6060,7 @@ def rewind_notify_cursor(
     clobbering newer progress.
     """
     with write_txn(conn):
+        task_id = _notify_task_id(conn, task_id)
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
@@ -6074,6 +6265,7 @@ def list_runs(
     if state_type is not None:
         if state_type not in ("status", "outcome"):
             raise ValueError("state_type must be 'status' or 'outcome'")
+    task_id = _coerce_task_id(conn, task_id)
     q = "SELECT * FROM task_runs WHERE task_id = ?"
     params: list[Any] = [task_id]
     if not include_active:
@@ -6105,6 +6297,7 @@ def active_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
 
 def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     """Return the most recent run regardless of outcome (active or closed)."""
+    task_id = _coerce_task_id(conn, task_id)
     row = conn.execute(
         "SELECT * FROM task_runs WHERE task_id = ? "
         "ORDER BY started_at DESC, id DESC LIMIT 1",
@@ -6126,6 +6319,7 @@ def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     Picks the most recent run by ``ended_at`` (falling back to ``id``
     for ties or unfinished rows). Returns None if no run has a summary.
     """
+    task_id = _coerce_task_id(conn, task_id)
     row = conn.execute(
         "SELECT summary FROM task_runs "
         "WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "

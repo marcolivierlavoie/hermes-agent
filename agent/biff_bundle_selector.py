@@ -23,7 +23,35 @@ class BiffBundleSelection:
 
 
 _BIF_ISSUE_RE = re.compile(r"\bBIF-\d+\b", re.IGNORECASE)
+_STORY_ID_RE = re.compile(
+    r"\b(?:BIF-\d+|K-\d+|t_[0-9a-f]{6,}|#?\d{3,6})\b",
+    re.IGNORECASE,
+)
+_KANBAN_WORK_RE = re.compile(
+    r"\b(?:story|card|kanban|issue|ticket|task|backlog|board)\b",
+    re.IGNORECASE,
+)
 _URL_RE = re.compile(r"https?://|\barxiv\.org\b|\byoutu(?:be\.com|\.be)\b", re.IGNORECASE)
+_QUESTION_START_RE = re.compile(
+    r"^\s*(?:what|why|how|when|where|who|should|can|could|would|will|do|does|did|is|are|am)\b",
+    re.IGNORECASE,
+)
+_CASUAL_RECIPE_QUESTION_RE = re.compile(
+    r"\b(?:dinner|recipe|meal|cook|food|lunch|breakfast)\b",
+    re.IGNORECASE,
+)
+_ACTION_RE = re.compile(
+    r"\b(?:implement|fix|change|patch|create|write|save|remember|forget|add|update|archive|migrate|sync|run|continue|finish|close|check|investigate|debug|verify|test|deploy|configure|install|delete|remove|make|build|execute|proceed|ship|work on|get it done|let me know|do what you have to do|don'?t stop until done)\b",
+    re.IGNORECASE,
+)
+_FOLLOW_UP_WORK_RE = re.compile(
+    r"\b(?:continue|keep going|go ahead|do it|do what you have to do|don'?t stop until done|get it done|finish(?: it)?|complete|close|work on something else)\b",
+    re.IGNORECASE,
+)
+_KANBAN_ACTION_RE = re.compile(
+    r"\b(?:create|add|write|document|spec|specify|finish|complete|close|execute|work on|update|archive|triage)\b",
+    re.IGNORECASE,
+)
 
 # Ordered for deterministic tie-breaks. More specific workflow bundles come
 # before broader governance/logistics options.
@@ -93,6 +121,18 @@ def should_attempt_biff_bundle_auto_selection(command: str | None) -> bool:
     return not (command or "").strip()
 
 
+def is_direct_question_without_action(text: str) -> bool:
+    """Return True for questions that should stay on Biff's lean chat path."""
+
+    body = " ".join(str(text or "").strip().split())
+    if not body:
+        return False
+    looks_question = "?" in body or bool(_QUESTION_START_RE.search(body))
+    if looks_question and _CASUAL_RECIPE_QUESTION_RE.search(body):
+        return True
+    return bool(looks_question and not _ACTION_RE.search(body))
+
+
 def select_biff_bundle_for_prompt(
     text: str,
     bundles: Mapping[str, Mapping[str, Any]],
@@ -109,6 +149,8 @@ def select_biff_bundle_for_prompt(
     """
     body = " ".join(str(text or "").strip().split())
     if not body:
+        return None
+    if is_direct_question_without_action(body):
         return None
 
     available: dict[str, tuple[str, Mapping[str, Any]]] = {}
@@ -131,6 +173,22 @@ def select_biff_bundle_for_prompt(
             continue
         score = 0
         reasons: list[str] = []
+        if slug == "biff-issue-execution" and _FOLLOW_UP_WORK_RE.search(body):
+            score += 4
+            reasons.append("follow-up work request")
+        if slug == "biff-issue-execution" and _STORY_ID_RE.search(body) and _KANBAN_ACTION_RE.search(body):
+            score += 6
+            reasons.append("story/task id with action")
+        if slug == "biff-issue-execution" and _KANBAN_WORK_RE.search(body) and _KANBAN_ACTION_RE.search(body):
+            score += 5
+            reasons.append("kanban/task action")
+        if slug == "biff-issue-execution" and _KANBAN_WORK_RE.search(body) and re.search(
+            r"\b(?:for\s+ranger|ranger\b.*\bnot\s+forge\b|not\s+forge\b.*\branger)\b",
+            body,
+            re.IGNORECASE,
+        ):
+            score += 5
+            reasons.append("explicit Ranger task correction")
         for pattern, weight in patterns:
             if re.search(pattern, body, re.IGNORECASE):
                 score += weight

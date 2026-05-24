@@ -256,6 +256,18 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+KANBAN_ORCHESTRATOR_GUIDANCE = (
+    "# Kanban board/orchestrator protocol\n"
+    "You can use Kanban as a board ledger, but you are not running inside a "
+    "specific Kanban worker task because `$HERMES_KANBAN_TASK` is not set. "
+    "Do not call `kanban_show()` with no arguments; that no-argument form is "
+    "only for dispatcher-spawned workers. If you need a board overview, call "
+    "`kanban_list(...)`. If you need details for a known card, call "
+    "`kanban_show(task_id=\"...\")` with the explicit card id. If the user's "
+    "request is ordinary research, documentation, QA, or engineering work and "
+    "does not ask for board changes, do not touch Kanban first."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

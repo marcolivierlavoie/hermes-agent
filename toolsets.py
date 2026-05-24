@@ -158,6 +158,12 @@ TOOLSETS = {
         "tools": ["skills_list", "skill_view", "skill_manage"],
         "includes": []
     },
+
+    "skills-read": {
+        "description": "Read installed skills and skill bundles without editing skill files",
+        "tools": ["skills_list", "skill_view"],
+        "includes": []
+    },
     
     "browser": {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",
@@ -245,7 +251,7 @@ TOOLSETS = {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "
             "is spawned by the kanban dispatcher (HERMES_KANBAN_TASK env "
-            "set). The dispatcher runs inside the gateway by default; see "
+            "set). Gateway-embedded dispatch is opt-in; see "
             "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "
             "tasks done with structured handoffs, block for human input, "
             "heartbeat during long ops, comment on threads, and (for "

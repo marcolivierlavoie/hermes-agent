@@ -397,6 +397,29 @@ def _compute_tool_definitions(
     # descriptions that don't actually exist, and hallucinates calls to them.
     available_tool_names = {t["function"]["name"] for t in filtered_tools}
 
+    if "kanban_show" in available_tool_names and not os.environ.get("HERMES_KANBAN_TASK"):
+        # Direct specialists/orchestrators can inspect a known card, but the
+        # no-argument default only works for dispatcher-spawned workers scoped
+        # by HERMES_KANBAN_TASK. Make that contract visible in the schema so
+        # the model does not waste its first call on a missing task_id error.
+        import copy
+        for i, td in enumerate(filtered_tools):
+            fn = td.get("function", {})
+            if fn.get("name") != "kanban_show":
+                continue
+            patched = copy.deepcopy(td)
+            params = patched.setdefault("function", {}).setdefault("parameters", {})
+            params["required"] = ["task_id"]
+            props = params.setdefault("properties", {})
+            task_id_prop = props.setdefault("task_id", {"type": "string"})
+            task_id_prop["description"] = (
+                "Required outside dispatcher-spawned Kanban workers. Use an "
+                "explicit card id such as K-1346. Only omit this when "
+                "HERMES_KANBAN_TASK is set."
+            )
+            filtered_tools[i] = patched
+            break
+
     # Rebuild execute_code schema to only list sandbox tools that are actually
     # available.  Without this, the model sees "web_search is available in
     # execute_code" even when the API key isn't configured or the toolset is
@@ -770,6 +793,33 @@ def handle_function_call(
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
+
+        direct_role = os.environ.get("HERMES_BIFF_DIRECT_ROLE", "").strip().lower()
+        if (
+            direct_role in {"quill", "vex"}
+            and os.environ.get("HERMES_BIFF_ALLOW_MUTATION", "").strip() != "1"
+            and function_name in {"patch", "write_file"}
+        ):
+            return json.dumps({
+                "error": (
+                    f"{direct_role.title()} direct lane is read-only for file mutations. "
+                    f"Route implementation/editing work to Forge, or explicitly set "
+                    f"HERMES_BIFF_ALLOW_MUTATION=1 for this invocation."
+                )
+            }, ensure_ascii=False)
+
+        try:
+            from tools.chat_guardrails import apply_chat_tool_policy
+
+            function_args, chat_guardrail_error = apply_chat_tool_policy(
+                function_name,
+                function_args,
+                task_id=task_id or "",
+            )
+            if chat_guardrail_error:
+                return json.dumps({"error": chat_guardrail_error}, ensure_ascii=False)
+        except Exception as _chat_guardrail_err:
+            logger.debug("chat tool guardrail error: %s", _chat_guardrail_err)
 
         # Check plugin hooks for a block directive (unless caller already
         # checked — e.g. run_agent._invoke_tool passes skip=True to

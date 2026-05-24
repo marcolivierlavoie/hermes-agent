@@ -1,0 +1,260 @@
+"""Canonical cheap planner for Biff live-chat turns."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any
+
+from agent.biff_bundle_selector import is_direct_question_without_action
+
+
+_SLOW_WORK_RE = re.compile(
+    r"\b(archive|migrate|import|export|backfill|sync|scan|audit|inspect|search|implement|fix|work on)\b"
+    r".*\b(all|every|entire|whole|backlog|board|repo|repository|workspace|linear|obsidian|stories|references?)\b",
+    re.IGNORECASE,
+)
+_BROAD_VERIFICATION_RE = re.compile(
+    r"\b(?:verify|validate|check|qa|audit|test)\b"
+    r".*\b(?:all|every|entire|whole|full|broad|multi[-\s]?system|workspace|repo|repository|board|backlog|cards?|stories|issues|services?|systems?)\b"
+    r"|\b(?:all|every|entire|whole|full|broad|multi[-\s]?system|workspace|repo|repository|board|backlog|cards?|stories|issues|services?|systems?)\b"
+    r".*\b(?:verify|validate|check|qa|audit|test)\b",
+    re.IGNORECASE,
+)
+_BOARD_ADMIN_RE = re.compile(
+    r"\b(?:create|add|write|make|open|reopen|close|keep|leave|mark|move|update|comment|archive|triage|sort|groom|administer|manage)\b"
+    r".*\b(?:K-\d+|story|stories|card|cards|kanban|board|ticket|tickets|issue|issues|task|tasks|backlog)\b"
+    r"|\b(?:K-\d+|story|stories|card|cards|kanban|board|ticket|tickets|issue|issues|task|tasks|backlog)\b"
+    r".*\b(?:create|write|make|open|reopen|close|keep|leave|mark|move|update|comment|archive|triage|sort|groom|administer|manage)\b",
+    re.IGNORECASE,
+)
+_ONE_TOOL_RE = re.compile(
+    r"\b(check|status|state|verify|is .* running|gateway|service|launchd|logs?)\b",
+    re.IGNORECASE,
+)
+_VEX_QA_RE = re.compile(
+    r"\b(?:vex|qa|quality\s+assurance|test|tests|testing|validate|validation|verify|verification|smoke\s+test|regression|reproduce|repro|audit|adversarial|break\s+it|check\s+whether\s+it\s+works)\b",
+    re.IGNORECASE,
+)
+_VEX_STRONG_QA_RE = re.compile(
+    r"\b(?:vex|qa|quality\s+assurance|validation|smoke\s+test|regression|reproduce|repro|adversarial|break\s+it|check\s+whether\s+it\s+works)\b",
+    re.IGNORECASE,
+)
+_QUILL_DOC_RE = re.compile(
+    r"\b(?:quill|document|documentation|docs?|write\s+up|runbook|obsidian|mnemosyne|memory|research|investigate|summari[sz]e|summary|notes?|decision\s+record|adr)\b",
+    re.IGNORECASE,
+)
+_IMPLEMENTATION_ACTION_RE = re.compile(
+    r"\b(?:implement|fix|change|patch|configure|install|restart|delete|remove|make|build|deploy|ship|debug)\b",
+    re.IGNORECASE,
+)
+_QUICK_WEB_RE = re.compile(
+    r"\b("
+    r"look\s*(?:it|this|that)?\s*up|search\s+(?:the\s+)?web|google|online|"
+    r"(?:can\s+you\s+)?(?:see|open|read|inspect|check)\s+(?:this|that|the)?\s*(?:link|url|thread|post|page|site)|"
+    r"current|latest|today|recent|right\s+now|near\s+me|open\s+now|"
+    r"deals?|sale|coupon|price|prices|availability"
+    r")\b",
+    re.IGNORECASE,
+)
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_ACTION_RE = re.compile(
+    r"\b(implement|fix|change|patch|create|write|save|remember|forget|add|update|archive|migrate|sync|run|continue|finish|complete|close|debug|deploy|configure|install|delete|remove|make|build|execute|proceed|ship|work on|get it done|let me know|document|specify|triage)\b",
+    re.IGNORECASE,
+)
+_FOLLOW_UP_ACTION_RE = re.compile(
+    r"^\s*(?:"
+    r"do\s+(?:it(?:\s+properly(?:\s+now)?)?|this|that|properly(?:\s+now)?|\d+|option\s+\d+)|"
+    r"do\s+what\s+you\s+have\s+to\s+do|"
+    r"continue|keep\s+going|go\s+ahead|proceed|execute|ship\s+it|get\s+it\s+done|"
+    r"(?:finish|complete|close)\s+(?:BIF-)?\d{3,6}|"
+    r"work\s+on\s+something\s+else|let\s+me\s+know\s+when\s+(?:it'?s\s+)?done|"
+    r"(?:now\s+)?continue\s+and\s+don'?t\s+stop\s+until\s+done"
+    r")\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_FOLLOW_UP_ACTION_LEAD_RE = re.compile(
+    r"^\s*(?:"
+    r"do\s+(?:it|this|that|what\s+you\s+have\s+to\s+do|properly|option\s+\d+|\d+)|"
+    r"continue|keep\s+going|go\s+ahead|proceed|execute|ship\s+it|get\s+it\s+done|"
+    r"finish|complete|close|fix\s+it|make\s+it\s+happen"
+    r")\b",
+    re.IGNORECASE,
+)
+_REPLY_FIX_FOLLOWUP_RE = re.compile(
+    r"^\s*\[Replying to:.*\b(?:what\s+do\s+you\s+suggest\s+we\s+do\s+to\s+fix\s+this|fix\s+this)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXPLICIT_SPECIALIST_RE = re.compile(
+    r"\b(?:use|ask|have|send|hand(?:\s+this)?\s+(?:to|off\s+to)|route\s+(?:to|through)|for)\s+"
+    r"(?P<role>forge|ranger|quill|vex)\b"
+    r"|\b(?P<role2>forge|ranger|quill|vex)\b\s+(?:should|can|please|pls|needs?\s+to|must|go\s+do)\b",
+    re.IGNORECASE,
+)
+_FORGE_DIRECT_RE = re.compile(
+    r"\b("
+    r"implement|fix|patch|debug|configure|install|test|verify|restart|delete|remove|"
+    r"gateway|hermes|biff|forge|runtime|repo|repository|code|bug|error|"
+    r"stacktrace|traceback|launchd|config(?:\.yaml)?|skill(?:[-\s]?bundle)?|"
+    r"dashboard|frontend|backend|sidebar|navigation|nav|page|route|react|tsx|vite|web/src|source|files?|"
+    r"api|model|openai|node[-\s]?red|workflow|flow|classifier"
+    r")\b",
+    re.IGNORECASE,
+)
+_RANGER_TASK_CORRECTION_RE = re.compile(
+    r"\b(?:task|story|card|issue|ticket)\b.*\b(?:for\s+ranger|ranger\b.*\bnot\s+forge\b|not\s+forge\b.*\branger)"
+    r"|\b(?:for\s+ranger|ranger\b.*\bnot\s+forge\b|not\s+forge\b.*\branger)\b.*\b(?:task|story|card|issue|ticket)\b",
+    re.IGNORECASE,
+)
+_NOT_FORGE_RE = re.compile(
+    r"\bnot\s+forge\b|\bfor\s+(?:ranger|quill|vex)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class BiffIntentRoute:
+    action: str
+    reason: str
+    max_live_tool_calls: int
+    allow_bundle_selection: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "reason": self.reason,
+            "max_live_tool_calls": self.max_live_tool_calls,
+            "allow_bundle_selection": self.allow_bundle_selection,
+        }
+
+
+@dataclass(frozen=True)
+class BiffTurnPlan:
+    """Small pre-tool contract for a Discord/Biff turn.
+
+    The gateway should resolve this before loading heavyweight bundles or
+    exposing broad tool schemas.  ``action`` is kept compatible with the older
+    route object, while the additional fields are the authoritative runtime
+    selection contract used by tests and synthetic checks.
+    """
+
+    action: str
+    reason: str
+    runtime: str
+    max_live_tool_calls: int
+    allow_bundle_selection: bool
+    toolset_profile: str
+    background: bool = False
+    specialist: str | None = None
+    requires_current_info: bool = False
+
+    def to_route(self) -> BiffIntentRoute:
+        return BiffIntentRoute(
+            self.action,
+            self.reason,
+            self.max_live_tool_calls,
+            self.allow_bundle_selection,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "reason": self.reason,
+            "runtime": self.runtime,
+            "max_live_tool_calls": self.max_live_tool_calls,
+            "allow_bundle_selection": self.allow_bundle_selection,
+            "toolset_profile": self.toolset_profile,
+            "background": self.background,
+            "specialist": self.specialist,
+            "requires_current_info": self.requires_current_info,
+        }
+
+
+_KANBAN_STATUS_RE = re.compile(
+    r"\b(?:status|state|say|show|read|check|current(?:ly)?|open|closed|done)\b.*\b(?:K-\d+|story|card|kanban|board|ticket|issue)\b"
+    r"|\b(?:K-\d+|story|card|kanban|board|ticket|issue)\b.*\b(?:status|state|say|show|read|check|current(?:ly)?|open|closed|done)\b",
+    re.IGNORECASE,
+)
+
+def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
+    """Classify a turn before context/tool/skill selection."""
+
+    body = " ".join(str(text or "").strip().split())
+    if command:
+        return BiffTurnPlan("command", "slash command already has explicit dispatch", "command", 0, True, "command")
+    if not body:
+        return BiffTurnPlan("answer_now", "empty or whitespace-only prompt", "direct_answer", 0, False, "none")
+    explicit_specialist = _EXPLICIT_SPECIALIST_RE.search(body)
+    if explicit_specialist:
+        role = (explicit_specialist.group("role") or explicit_specialist.group("role2") or "").lower()
+        if role in {"forge", "ranger", "quill", "vex"}:
+            return BiffTurnPlan(
+                f"{role}_direct",
+                f"explicit {role.title()} specialist request",
+                "specialist_work",
+                2,
+                False,
+                "specialist",
+                background=True,
+                specialist=role,
+            )
+    if _FOLLOW_UP_ACTION_RE.search(body):
+        return BiffTurnPlan("route_bundle", "short follow-up should continue prior work context", "continuation", 2, True, "base")
+    if _FOLLOW_UP_ACTION_LEAD_RE.search(body):
+        if _FORGE_DIRECT_RE.search(body):
+            return BiffTurnPlan("route_bundle", "action follow-up should stay in the live Biff turn unless Forge is explicit", "continuation", 4, True, "base")
+        return BiffTurnPlan("route_bundle", "action follow-up should continue prior work context", "continuation", 2, True, "base")
+    if _REPLY_FIX_FOLLOWUP_RE.search(body) and _FORGE_DIRECT_RE.search(body):
+        return BiffTurnPlan("forge_direct", "engineering reply-fix follow-up should go through Forge's direct lane", "specialist_work", 2, False, "specialist", background=True, specialist="forge")
+    is_kanban_status_read = _KANBAN_STATUS_RE.search(body) and not _BOARD_ADMIN_RE.search(body)
+    has_broad_quantifier = re.search(r"\b(?:all|every|entire|whole|full|broad|multi[-\s]?system)\b", body, re.IGNORECASE)
+    if is_kanban_status_read and not has_broad_quantifier:
+        return BiffTurnPlan("kanban_status", "read-only Kanban/status request", "kanban_read", 2, False, "kanban")
+    if _BROAD_VERIFICATION_RE.search(body):
+        return BiffTurnPlan(
+            "background",
+            "broad verification should get a continuation handle/background specialist instead of spending the live Discord budget",
+            "background",
+            1,
+            False,
+            "none",
+            background=True,
+            specialist="vex",
+        )
+    if _RANGER_TASK_CORRECTION_RE.search(body):
+        return BiffTurnPlan("ranger_direct", "explicit Ranger board/task request", "specialist_work", 2, False, "specialist", background=True, specialist="ranger")
+    if _BOARD_ADMIN_RE.search(body):
+        return BiffTurnPlan("ranger_direct", "Kanban/backlog administration should route to Ranger's nonblocking board lane", "specialist_work", 2, False, "specialist", background=True, specialist="ranger")
+    if _URL_RE.search(body) or _QUICK_WEB_RE.search(body):
+        return BiffTurnPlan("quick_web", "casual web lookup can use a bounded side-lane search", "web_lookup", 3, False, "web", requires_current_info=True)
+    if _QUILL_DOC_RE.search(body) and not _IMPLEMENTATION_ACTION_RE.search(body):
+        return BiffTurnPlan("route_bundle", "documentation/research/memory work should stay in the live Biff turn unless Quill is explicit", "workflow", 4, True, "base")
+    if _VEX_STRONG_QA_RE.search(body):
+        return BiffTurnPlan("route_bundle", "QA/validation work should stay in the live Biff turn unless Vex is explicit", "workflow", 4, True, "base")
+    if _VEX_QA_RE.search(body) and not _IMPLEMENTATION_ACTION_RE.search(body):
+        return BiffTurnPlan("route_bundle", "QA/validation work should stay in the live Biff turn unless Vex is explicit", "workflow", 4, True, "base")
+    if _FORGE_DIRECT_RE.search(body) and _ACTION_RE.search(body):
+        return BiffTurnPlan("forge_direct", "engineering action should route to Forge's nonblocking implementation lane", "specialist_work", 2, False, "specialist", background=True, specialist="forge")
+    if _SLOW_WORK_RE.search(body):
+        if re.search(r"\b(?:backlog|board|kanban|linear|stories|story|cards|card|tickets|issues)\b", body, re.IGNORECASE):
+            return BiffTurnPlan("ranger_direct", "broad board/backlog work should route to Ranger's nonblocking board lane", "specialist_work", 2, False, "specialist", background=True, specialist="ranger")
+        return BiffTurnPlan("background", "broad slow work should move to Kanban/background", "background", 0, False, "none", background=True)
+    if _ONE_TOOL_RE.search(body) and not _ACTION_RE.search(body):
+        return BiffTurnPlan("one_tool", "quick status/check request", "status_read", 1, False, "status")
+    if _NOT_FORGE_RE.search(body):
+        match = re.search(r"\bfor\s+(ranger|quill|vex)\b", body, re.IGNORECASE)
+        if match:
+            role = match.group(1).lower()
+            return BiffTurnPlan(f"{role}_direct", f"explicit {role.title()} specialist request", "specialist_work", 2, False, "specialist", background=True, specialist=role)
+        return BiffTurnPlan("route_bundle", "explicit specialist correction should not force Forge", "workflow", 2, True, "base")
+    if is_direct_question_without_action(body):
+        return BiffTurnPlan("answer_now", "direct question without action request", "direct_answer", 0, False, "none")
+    if _FORGE_DIRECT_RE.search(body):
+        return BiffTurnPlan("forge_direct", "engineering work should route to Forge's nonblocking implementation lane", "specialist_work", 2, False, "specialist", background=True, specialist="forge")
+    return BiffTurnPlan("route_bundle", "workflow request may benefit from bundle context", "workflow", 2, True, "base")
+
+
+def route_biff_live_intent(text: Any, *, command: bool = False) -> BiffIntentRoute:
+    """Classify a Discord turn before loading heavyweight bundle context."""
+
+    return plan_biff_turn(text, command=command).to_route()

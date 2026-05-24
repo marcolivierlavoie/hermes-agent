@@ -57,9 +57,66 @@ def test_create_task_no_parents_is_ready(kanban_home):
         tid = kb.create_task(conn, title="ship it", assignee="alice")
         t = kb.get_task(conn, tid)
     assert t is not None
+    assert t.display_id == "K-0001"
+    assert kb.get_task(conn, "K-0001") is not None
     assert t.status == "ready"
     assert t.assignee == "alice"
     assert t.workspace_kind == "scratch"
+
+
+def test_display_ids_are_stable_and_sequential(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="first")
+        second = kb.create_task(conn, title="second")
+        assert kb.get_task(conn, first).display_id == "K-0001"
+        assert kb.get_task(conn, second).display_id == "K-0002"
+        assert kb.resolve_task_id(conn, "k2") == second
+        assert kb.resolve_task_id(conn, "K-0002") == second
+
+
+def test_init_backfills_display_ids_for_legacy_tasks(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    db = home / "kanban.db"
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        );
+        CREATE TABLE task_links (parent_id TEXT NOT NULL, child_id TEXT NOT NULL, PRIMARY KEY(parent_id, child_id));
+        CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL);
+        INSERT INTO tasks (id, title, status, created_at, workspace_kind) VALUES
+          ('t_legacy1', 'old one', 'ready', 10, 'scratch'),
+          ('t_legacy2', 'old two', 'ready', 20, 'scratch');
+        """
+    )
+    conn.close()
+
+    kb.init_db(db)
+
+    with kb.connect(db) as conn:
+        one = kb.get_task(conn, "t_legacy1")
+        two = kb.get_task(conn, "t_legacy2")
+        assert one.display_id == "K-0001"
+        assert two.display_id == "K-0002"
+        new = kb.create_task(conn, title="new")
+        assert kb.get_task(conn, new).display_id == "K-0003"
 
 
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
@@ -884,10 +941,12 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
         kb.complete_task(conn, p, result="PARENT_RESULT_MARKER")
         c = kb.create_task(conn, title="child", parents=[p])
         kb.add_comment(conn, c, "user", "CLARIFICATION_MARKER")
+        child_display_id = kb.get_task(conn, c).display_id
         ctx = kb.build_worker_context(conn, c)
     assert "PARENT_RESULT_MARKER" in ctx
     assert "CLARIFICATION_MARKER" in ctx
-    assert c in ctx
+    assert child_display_id in ctx
+    assert c not in ctx
     assert "child" in ctx
 
 

@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import pytest
 
@@ -454,13 +455,15 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         user_id="u1",
     )
     event = SimpleNamespace(
-        text='/kanban --board projx create "hello" --assignee alice',
+        text='/kanban --board projx create "hello" --assignee alice --ready',
         source=source,
     )
 
     out = await GatewayRunner._handle_kanban_command(runner, event)
 
     assert "subscribed" in out.lower()
+    assert "K-" in out
+    assert "(subscribed" in out
 
     conn = kb.connect(board="projx")
     try:
@@ -477,6 +480,65 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     conn = kb.connect(board="default")
     try:
         assert kb.list_notify_subs(conn) == []
+    finally:
+        conn.close()
+
+
+def test_manual_notify_subscribe_with_k_id_stores_internal_id_and_delivers(kanban_home, capsys):
+    """Manual notify commands may accept K ids, but subscriptions must use internal ids.
+
+    Notification events are recorded under internal task ids, so storing the
+    user-facing K id breaks delivery.  The CLI should accept/display K ids
+    while keeping the DB subscription keyed by the internal id.
+    """
+    from hermes_cli import kanban as kanban_cli
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="manual subscribe", assignee="worker1")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        display_id = task.display_id
+        assert display_id is not None
+    finally:
+        conn.close()
+
+    rc = kanban_cli._cmd_notify_subscribe(argparse.Namespace(
+        task_id=display_id,
+        platform="telegram",
+        chat_id="chat1",
+        thread_id="th1",
+        user_id="u1",
+        notifier_profile="biff",
+    ))
+    assert rc == 0
+    assert f"to {display_id}" in capsys.readouterr().out
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, display_id)
+        assert len(subs) == 1
+        assert subs[0]["task_id"] == tid
+
+        kb.complete_task(conn, display_id, result="done")
+        _cursor, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=display_id,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="th1",
+            kinds=["completed"],
+        )
+        assert [e.kind for e in events] == ["completed"]
+
+        assert kb.remove_notify_sub(
+            conn,
+            task_id=display_id,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="th1",
+        ) is True
+        assert kb.list_notify_subs(conn, tid) == []
     finally:
         conn.close()
 

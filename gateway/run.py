@@ -34,6 +34,7 @@ import re
 import shlex
 import sys
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -65,6 +66,63 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_SPECIALIST_DIRECT_TOOLSETS: dict[str, tuple[str, ...]] = {
+    # Forge owns build/change work: shell, files, tests/scripts, docs lookup,
+    # browser/vision verification, and the board ledger. Keep desktop control,
+    # external sends, cron, and nested delegation out unless Biff explicitly adds
+    # them for a specific high-trust task.
+    "forge": (
+        "terminal",
+        "file",
+        "web",
+        "browser",
+        "vision",
+        "skills",
+        "memory",
+        "todo",
+        "session_search",
+        "code_execution",
+        "kanban",
+    ),
+    # Ranger owns board hygiene/routing/closure. Do not give it general shell or
+    # web/browser research by default; that drifts into Forge/Quill work.
+    "ranger": (
+        "file",
+        "skills",
+        "memory",
+        "todo",
+        "session_search",
+        "kanban",
+    ),
+    # Quill owns docs/research/context cleanup. File/web/browser/vision/search
+    # are enough; no shell by default so it does not become an implementer.
+    "quill": (
+        "file",
+        "web",
+        "browser",
+        "vision",
+        "skills",
+        "memory",
+        "todo",
+        "session_search",
+        "kanban",
+    ),
+    # Vex owns verification/QA/safety. It needs repro/test/browser/screenshot
+    # surfaces, but not desktop control, external sends, cron, or delegation.
+    "vex": (
+        "terminal",
+        "file",
+        "web",
+        "browser",
+        "vision",
+        "skills",
+        "memory",
+        "todo",
+        "session_search",
+        "code_execution",
+        "kanban",
+    ),
+}
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
@@ -680,6 +738,294 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+def _biff_seamless_rollover_enabled(platform_key: str | None) -> bool:
+    """Return whether Biff should silently roll bloated Discord sessions."""
+    if str(platform_key or "").strip().lower() != "discord":
+        return False
+    return os.getenv("HERMES_BIFF_SEAMLESS_SESSION_ROLLOVER", "1").lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _biff_seamless_rollover_threshold() -> int:
+    raw = os.getenv("HERMES_BIFF_SEAMLESS_SESSION_ROLLOVER_THRESHOLD", "50000")
+    try:
+        return max(40_000, int(str(raw).strip()))
+    except Exception:
+        return 50_000
+
+
+def _biff_visible_mode_line_enabled(
+    user_config: dict | None,
+    platform_key: str | None,
+) -> bool:
+    """Return whether replies should show the Biff operating mode line.
+
+    Economy/emergency mode is an internal behavior knob. Showing it on every
+    Discord reply turned into noise, so the visible line is opt-in for
+    debugging while the mode itself remains active.
+    """
+
+    env = os.getenv("HERMES_BIFF_SHOW_MODE_LINE")
+    if env is not None:
+        return env.strip().lower() in {"1", "true", "yes", "on"}
+    cfg = user_config if isinstance(user_config, dict) else {}
+    biff_cfg = cfg.get("biff") if isinstance(cfg.get("biff"), dict) else {}
+    platforms = biff_cfg.get("platforms") if isinstance(biff_cfg.get("platforms"), dict) else {}
+    platform_cfg = platforms.get(platform_key) if isinstance(platforms.get(platform_key), dict) else {}
+    value = platform_cfg.get("show_mode_line", biff_cfg.get("show_mode_line", False))
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_gateway_notify_schedule(
+    user_config: dict | None,
+    platform_key: str | None,
+) -> tuple[float | None, float | None]:
+    """Return ``(interval, first_delay)`` for long-running gateway updates."""
+
+    cfg = user_config if isinstance(user_config, dict) else {}
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    raw: Any = agent_cfg.get("gateway_notify_interval")
+    if raw is None:
+        raw = os.getenv("HERMES_AGENT_NOTIFY_INTERVAL", 180)
+    try:
+        interval = float(raw)
+    except Exception:
+        interval = 180.0
+    if interval <= 0:
+        return None, None
+    if str(platform_key or "").strip().lower() == "discord":
+        # Discord is where Marco watches Biff work live. A 90-180s first update
+        # means most "slow" turns finish silently, which feels like a stall.
+        interval = min(interval, 45.0)
+        return interval, min(30.0, interval)
+    return interval, interval
+
+
+def _session_quota_visible_warning_policy(
+    *,
+    platform_key: str | None,
+    quota_threshold: int | None,
+) -> tuple[bool, bool]:
+    """Return ``(show_warning, schedule_rollover)`` for session-size warnings.
+
+    Discord Biff uses seamless rollover by default, so the old visible quota
+    warning / New Session button should stay hidden there.  At or above the
+    rollover threshold, the gateway silently starts the next session instead.
+    Other platforms keep the legacy visible warning behavior.
+    """
+
+    if quota_threshold is None:
+        return False, False
+    if not _biff_seamless_rollover_enabled(platform_key):
+        return True, False
+    return False, int(quota_threshold) >= _biff_seamless_rollover_threshold()
+
+
+def _biff_iteration_limit_auto_continue_enabled(platform_key: str | None) -> bool:
+    """Return whether Discord/Biff should auto-queue a follow-up after turn budget exhaustion."""
+
+    if str(platform_key or "").strip().lower() != "discord":
+        return False
+    return os.getenv("HERMES_BIFF_ITERATION_LIMIT_AUTO_CONTINUE", "1").lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _should_auto_continue_after_iteration_limit(
+    agent_result: dict | None,
+    *,
+    platform_key: str | None,
+    interrupt_depth: int,
+    max_interrupt_depth: int,
+    operating_mode: str | None = None,
+    live_max_iterations: int | None = None,
+    live_max_tool_calls: int | None = None,
+) -> bool:
+    """Return True when a Discord/Biff turn should get one fresh-budget continuation.
+
+    ``handle_max_iterations`` must strip tools to force a final user-facing
+    summary.  For Marco's Discord command-room workflow, that summary should not
+    be the end of execution: queue a synthetic follow-up with a new tool budget.
+    The normal queued-follow-up recursion cap prevents runaway loops.
+    """
+
+    if not isinstance(agent_result, dict):
+        return False
+    if not _biff_iteration_limit_auto_continue_enabled(platform_key):
+        return False
+    if str(operating_mode or "").strip().lower() in {"emergency", "evidence-only"}:
+        return False
+    if live_max_iterations is not None and int(live_max_iterations) < 8:
+        return False
+    if live_max_tool_calls is not None and int(live_max_tool_calls) < 8:
+        return False
+    if interrupt_depth >= max_interrupt_depth:
+        return False
+    if agent_result.get("interrupted") or agent_result.get("failed"):
+        return False
+    if agent_result.get("completed") is not False:
+        return False
+    return str(agent_result.get("turn_exit_reason") or "").startswith("max_iterations_reached")
+
+
+def _build_iteration_limit_continuation_text(agent_result: dict | None) -> str:
+    """Build the synthetic follow-up that resumes after the toolless summary turn."""
+
+    result = agent_result if isinstance(agent_result, dict) else {}
+    reason = str(result.get("turn_exit_reason") or "max_iterations_reached")
+    summary = _trim_handoff_text(result.get("final_response") or "", 1200)
+    return (
+        "[System continuation: The previous assistant turn hit Hermes' "
+        "tool-calling iteration limit and therefore had to provide a toolless "
+        "summary to the user. This is not completion. Please resume the same task now "
+        "with a fresh tool budget: use tools, verify state before claiming "
+        "success, continue from the summarized state, and do not switch tasks "
+        "unless the user explicitly asked.]\n\n"
+        f"Previous turn exit reason: {reason}\n"
+        "Previous summary visible to the user:\n"
+        f"{summary or '(empty)'}"
+    )
+
+
+def _build_iteration_limit_user_handoff(
+    agent_result: dict | None,
+    *,
+    auto_continue: bool,
+) -> str:
+    """Build the Discord-visible handoff when a turn spends its iteration budget."""
+
+    result = agent_result if isinstance(agent_result, dict) else {}
+    reason = str(result.get("turn_exit_reason") or "max_iterations_reached").strip()
+    summary = _trim_handoff_text(result.get("final_response") or "", 1600)
+
+    lines = [
+        "I hit this turn's work limit before I could safely finish the task.",
+    ]
+    if auto_continue:
+        lines.append(
+            "I preserved the current state and I am continuing automatically with a fresh work budget."
+        )
+    else:
+        lines.append(
+            "I preserved the current state. The next step is to continue from this handoff or route it to the right specialist."
+        )
+    lines.append("")
+    lines.append("What is known so far:")
+    lines.append(summary or "No useful summary was produced before the limit was reached.")
+    lines.append("")
+    lines.append(
+        "This is not a success claim; the remaining work still needs verification before it is considered done."
+    )
+    lines.append(f"(Internal reason: {reason})")
+    return "\n".join(lines)
+
+
+def _trim_handoff_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 40)].rstrip() + f"\n...[trimmed {len(text) - limit} chars]"
+
+
+def _specialist_direct_toolsets(role: str) -> str:
+    """Return the additive toolset request for a direct specialist handoff."""
+
+    normalized_role = str(role or "").strip().lower()
+    toolsets = _SPECIALIST_DIRECT_TOOLSETS.get(
+        normalized_role,
+        _SPECIALIST_DIRECT_TOOLSETS["forge"],
+    )
+    return ",".join(toolsets)
+
+
+def _build_seamless_rollover_handoff(
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    threshold: int,
+    prompt_tokens: int,
+    context_length: Any,
+    user_text: str,
+    response_text: str,
+) -> str:
+    """Compact model-facing bridge written into the fresh session transcript."""
+    context_label = str(context_length or "unknown")
+    user_excerpt = _trim_handoff_text(user_text, 900)
+    response_excerpt = _trim_handoff_text(response_text, 1400)
+    return (
+        "[System handoff: Hermes silently started a fresh session after the "
+        "previous Discord session crossed the model-facing context quota. "
+        "This is not a loss of memory: raw transcripts remain archived, "
+        "Mnemosyne remains authoritative for durable memory, and this compact "
+        "handoff preserves the immediate thread. Continue naturally without "
+        "telling Marco a reset happened unless he asks.]\n\n"
+        f"Previous session: {old_session_id}\n"
+        f"Fresh session: {new_session_id}\n"
+        f"Rollover threshold: {threshold} prompt tokens\n"
+        f"Previous prompt tokens: {prompt_tokens}\n"
+        f"Context length: {context_label}\n\n"
+        "Last user message before rollover:\n"
+        f"{user_excerpt or '(empty)'}\n\n"
+        "Last assistant response before rollover:\n"
+        f"{response_excerpt or '(empty)'}"
+    )
+
+
+def _last_role_content(history: Optional[List[Dict[str, Any]]], role: str) -> str:
+    if not history:
+        return ""
+    for msg in reversed(history):
+        if not isinstance(msg, dict) or msg.get("role") != role:
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
+def _message_text_with_reply_context(
+    text: Any,
+    *,
+    reply_to_text: Any = None,
+    reply_to_message_id: Any = None,
+    limit: int = 500,
+) -> str:
+    """Return user text with Discord/Feishu reply context prepended.
+
+    Normal agent turns already inject reply context later in the pipeline.  Biff's
+    direct specialist router runs earlier, so without this helper a prompt like
+    "what do you suggest we do to fix this" loses the quoted message that defines
+    "this" before Forge/Ranger/Quill/Vex see it.
+    """
+
+    message_text = str(text or "")
+    reply_text = str(reply_to_text or "").strip()
+    if not reply_text or not reply_to_message_id:
+        return message_text
+    reply_snippet = reply_text[:limit]
+    return f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+
+
+def _build_seamless_rollover_handoff_from_history(
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    threshold: int,
+    prompt_tokens: int,
+    history: Optional[List[Dict[str, Any]]],
+) -> str:
+    return _build_seamless_rollover_handoff(
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        threshold=threshold,
+        prompt_tokens=prompt_tokens,
+        context_length="unknown",
+        user_text=_last_role_content(history, "user"),
+        response_text=_last_role_content(history, "assistant"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -1033,6 +1379,7 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from gateway.restart_handoff import persist_pre_restart_handoff
 
 
 from gateway.whatsapp_identity import (
@@ -1638,6 +1985,7 @@ def _final_turn_trailing_metadata(
     *,
     platform: Platform,
     quota_threshold_to_persist: int | None = None,
+    show_new_session_button: bool = False,
 ) -> dict:
     """Return metadata for final-turn trailing platform sends.
 
@@ -1646,7 +1994,7 @@ def _final_turn_trailing_metadata(
     """
 
     metadata = dict(base_metadata or {})
-    if platform == Platform.DISCORD and quota_threshold_to_persist is not None:
+    if platform == Platform.DISCORD and quota_threshold_to_persist is not None and show_new_session_button:
         metadata["discord_new_session_button"] = True
     return metadata
 
@@ -5072,7 +5420,12 @@ class GatewayRunner:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
+                    task_ref = (
+                        getattr(task, "display_id", None)
+                        or (getattr(task, "id", None) if task else None)
+                        or sub["task_id"]
+                    )
+                    title = (task.title if task else task_ref)[:120]
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -5097,25 +5450,25 @@ class GatewayRunner:
                                 r = task.result.strip().splitlines()[0][:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
+                                f"✔ {tag}Kanban {task_ref} done"
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"⏸ {tag}Kanban {task_ref} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
+                                f"✖ {tag}Kanban {task_ref} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
+                                f"✖ {tag}Kanban {task_ref} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
@@ -5123,7 +5476,7 @@ class GatewayRunner:
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
+                                f"⏱ {tag}Kanban {task_ref} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
                         else:
@@ -5390,7 +5743,7 @@ class GatewayRunner:
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
-        Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
+        Gated by `kanban.dispatch_in_gateway` in config.yaml (default False).
         When true, the gateway hosts the single dispatcher for this profile:
         no separate `hermes kanban daemon` process needed. When false, the
         loop exits immediately and an external daemon is expected.
@@ -5425,7 +5778,7 @@ class GatewayRunner:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if not kanban_cfg.get("dispatch_in_gateway", False):
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
@@ -7347,6 +7700,8 @@ class GatewayRunner:
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "speed":
+                    return await self._handle_speed_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
 
@@ -7364,6 +7719,45 @@ class GatewayRunner:
                     f"⏳ Agent is running — `/{_cmd_def_inner.name}` can't run "
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
+
+            if not _evt_cmd and source.platform == Platform.DISCORD:
+                try:
+                    from agent.biff_intent_router import route_biff_live_intent
+                    from gateway.biff_parallel_chat import should_use_biff_parallel_chat_lane
+
+                    _use_parallel, _parallel_reason = should_use_biff_parallel_chat_lane(
+                        event.text or "",
+                        platform_key=source.platform.value if source.platform else None,
+                        command=False,
+                        running_agent=True,
+                    )
+                    _parallel_route = route_biff_live_intent(event.text or "", command=False)
+                    if _use_parallel:
+                        _task_id = f"chatlane_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+                        _task = asyncio.create_task(
+                            self._run_background_task(
+                                event.text or "",
+                                source,
+                                _task_id,
+                                event_message_id=self._reply_anchor_for_event(event),
+                                media_urls=list(event.media_urls) if event.media_urls else None,
+                                media_types=list(event.media_types) if event.media_types else None,
+                                completion_header=False,
+                                quick_chat_lane=True,
+                            )
+                        )
+                        self._background_tasks.add(_task)
+                        _task.add_done_callback(self._background_tasks.discard)
+                        logger.info(
+                            "biff_parallel_chat_lane: session=%s task=%s action=%s reason=%s",
+                            _quick_key,
+                            _task_id,
+                            _parallel_route.action,
+                            _parallel_reason,
+                        )
+                        return None
+                except Exception as _parallel_err:
+                    logger.debug("Biff parallel chat lane skipped: %s", _parallel_err)
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
@@ -7607,6 +8001,9 @@ class GatewayRunner:
 
         if canonical == "fast":
             return await self._handle_fast_command(event)
+
+        if canonical == "speed":
+            return await self._handle_speed_command(event)
 
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
@@ -7887,20 +8284,129 @@ class GatewayRunner:
         # all other slash commands keep precedence. This is quiet by design:
         # the user sees only the normal agent response; gateway.log records the
         # selected bundle for observability.
+        _biff_live_route = None
         if not command:
             try:
+                from agent.biff_intent_router import route_biff_live_intent
                 from agent.biff_bundle_selector import select_biff_bundle_for_prompt
+                from agent.forge_direct_lane import (
+                    FORGE_DIRECT_BUNDLE_KEY,
+                    build_forge_direct_instruction,
+                )
+                from agent.ranger_direct_lane import build_ranger_direct_instruction
+                from agent.quill_direct_lane import build_quill_direct_instruction
+                from agent.vex_direct_lane import build_vex_direct_instruction
                 from agent.skill_bundles import (
                     build_bundle_invocation_message,
                     get_skill_bundles,
                 )
 
-                _original_text = event.text or ""
-                _selection = select_biff_bundle_for_prompt(
-                    _original_text,
-                    get_skill_bundles(),
+                _original_text = _message_text_with_reply_context(
+                    event.text or "",
+                    reply_to_text=getattr(event, "reply_to_text", None),
+                    reply_to_message_id=getattr(event, "reply_to_message_id", None),
                 )
+                _biff_original_text_for_deflection = _original_text
+                _biff_live_route = route_biff_live_intent(_original_text, command=False)
+                logger.info(
+                    "biff_live_intent_route: platform=%s action=%s reason=%s max_live_tool_calls=%s allow_bundle=%s",
+                    source.platform.value if source.platform else "gateway",
+                    _biff_live_route.action,
+                    _biff_live_route.reason,
+                    _biff_live_route.max_live_tool_calls,
+                    _biff_live_route.allow_bundle_selection,
+                )
+                _selection = None
+                if _biff_live_route.action in {"forge_direct", "ranger_direct", "quill_direct", "vex_direct"}:
+                    _specialist_role = _biff_live_route.action.removesuffix("_direct")
+                    _specialist_builders = {
+                        "forge": build_forge_direct_instruction,
+                        "ranger": build_ranger_direct_instruction,
+                        "quill": build_quill_direct_instruction,
+                        "vex": build_vex_direct_instruction,
+                    }
+                    _specialist_instruction = _specialist_builders[_specialist_role](_original_text)
+                    if (
+                        source.platform == Platform.DISCORD
+                        and os.getenv("HERMES_BIFF_NONBLOCKING_SPECIALISTS", os.getenv("HERMES_BIFF_NONBLOCKING_FORGE", "1")).lower()
+                        not in {"0", "false", "no", "off"}
+                    ):
+                        import hashlib
+
+                        _dispatch_text = f"{_specialist_role}:" + " ".join(
+                            _original_text.strip().lower().split()
+                        )
+                        _dispatch_key = hashlib.sha256(
+                            _dispatch_text.encode("utf-8", errors="replace")
+                        ).hexdigest()[:16]
+                        _active_specialist = getattr(self, "_active_specialist_dispatches", None)
+                        if not isinstance(_active_specialist, dict):
+                            _active_specialist = {}
+                            self._active_specialist_dispatches = _active_specialist
+                        _existing = _active_specialist.get(_dispatch_key)
+                        if _existing and not _existing.done():
+                            _existing_task_id = getattr(_existing, "_hermes_task_id", _specialist_role)
+                            logger.info(
+                                "biff_nonblocking_specialist_deduped: platform=%s role=%s task=%s",
+                                source.platform.value if source.platform else "gateway",
+                                _specialist_role,
+                                _existing_task_id,
+                            )
+                            return (
+                                f"{_specialist_role.title()} is already working on that in the background. "
+                                f"Task `{_existing_task_id}` will report back here; I won’t start a duplicate copy."
+                            )
+                        _task_id = f"{_specialist_role}_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+                        _task = asyncio.create_task(
+                            self._run_specialist_direct_background_task(
+                                _specialist_role,
+                                _specialist_instruction,
+                                source,
+                                _task_id,
+                                event_message_id=self._reply_anchor_for_event(event),
+                            )
+                        )
+                        _task._hermes_task_id = _task_id  # type: ignore[attr-defined]
+                        _active_specialist[_dispatch_key] = _task
+                        _task.add_done_callback(
+                            lambda done_task, key=_dispatch_key: getattr(self, "_active_specialist_dispatches", {}).pop(key, None)
+                        )
+                        self._background_tasks.add(_task)
+                        _task.add_done_callback(self._background_tasks.discard)
+                        logger.info(
+                            "biff_nonblocking_specialist_dispatch: platform=%s role=%s task=%s",
+                            source.platform.value if source.platform else "gateway",
+                            _specialist_role,
+                            _task_id,
+                        )
+                        return (
+                            f"I handed this to {_specialist_role.title()} in the background so Discord stays usable. "
+                            f"Task `{_task_id}` will report back here with done/blocked evidence; "
+                            f"I won’t call it done until {_specialist_role.title()} verifies it."
+                        )
+                    _bundle_result = build_bundle_invocation_message(
+                        FORGE_DIRECT_BUNDLE_KEY,
+                        _specialist_instruction,
+                        task_id=_quick_key,
+                    )
+                    if _bundle_result:
+                        _msg, _loaded, _missing = _bundle_result
+                        event.text = _msg
+                        _biff_selected_bundle_key = FORGE_DIRECT_BUNDLE_KEY
+                        logger.info(
+                            "Auto-selected Forge direct lane %s for %s prompt (skills=%d, missing=%d)",
+                            FORGE_DIRECT_BUNDLE_KEY,
+                            source.platform.value if source.platform else "gateway",
+                            len(_loaded),
+                            len(_missing),
+                        )
+                elif _biff_live_route.allow_bundle_selection:
+                    _selection = select_biff_bundle_for_prompt(
+                        _original_text,
+                        get_skill_bundles(),
+                    )
                 if _selection is not None:
+                    _biff_selected_bundle_key = _selection.command_key
                     _bundle_result = build_bundle_invocation_message(
                         _selection.command_key,
                         _original_text,
@@ -7919,6 +8425,51 @@ class GatewayRunner:
                         )
             except Exception as exc:
                 logger.debug("Biff bundle auto-selection skipped: %s", exc)
+
+        try:
+            from gateway.session_hygiene import maybe_build_slow_work_deflection
+
+            _deflection_text = locals().get("_biff_original_text_for_deflection", event.text or "")
+            _deflection = maybe_build_slow_work_deflection(
+                _deflection_text,
+                platform_key=source.platform.value if source.platform else None,
+                command=bool(command),
+            )
+            if _deflection is not None:
+                from hermes_cli import kanban_db as _kanban_db
+
+                import hashlib as _hashlib
+
+                _idem = "discord-slow-work:" + _hashlib.sha256(
+                    str(_deflection_text).encode("utf-8", errors="replace")
+                ).hexdigest()[:24]
+                _conn = _kanban_db.connect()
+                try:
+                    _task_id = _kanban_db.create_task(
+                        _conn,
+                        title=_deflection.title,
+                        body=_deflection.body,
+                        assignee=_deflection.assignee,
+                        created_by="biff-discord",
+                        priority=_deflection.priority,
+                        initial_status="ready",
+                        idempotency_key=_idem,
+                    )
+                    _task = _kanban_db.get_task(_conn, _task_id)
+                    _display_id = getattr(_task, "display_id", None) or _task_id
+                finally:
+                    _conn.close()
+                logger.info(
+                    "Deflected slow Discord work to Kanban task %s",
+                    _display_id,
+                )
+                return (
+                    f"I put this into Kanban as {_display_id} so it can run without "
+                    "blocking Discord. Ranger can organize it from there, and Biff "
+                    "will keep the live thread focused on quick updates."
+                )
+        except Exception as exc:
+            logger.debug("Slow-work Kanban deflection skipped: %s", exc)
 
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
@@ -8330,6 +8881,67 @@ class GatewayRunner:
             self._set_session_reasoning_override(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
+
+        # Biff Discord hot path: if the previous completed turn already proved
+        # this session is bloated, silently roll over before loading the old
+        # transcript into the next agent call.  Post-turn rollover still exists
+        # below for sessions that cross the threshold during the current turn;
+        # this pre-turn gate is what prevents the *next* question from paying
+        # the old context tax.
+        try:
+            _pre_rollover_threshold = _biff_seamless_rollover_threshold()
+            _pre_prompt_tokens = int(getattr(session_entry, "last_prompt_tokens", 0) or 0)
+            if (
+                _biff_seamless_rollover_enabled(_platform_config_key(source.platform))
+                and _pre_prompt_tokens >= _pre_rollover_threshold
+                and not getattr(session_entry, "was_auto_reset", False)
+                and not getattr(session_entry, "is_fresh_reset", False)
+            ):
+                _old_session_id = session_entry.session_id
+                _old_history_for_handoff = self.session_store.load_transcript(_old_session_id)
+                _new_entry = self.session_store.reset_session(session_key)
+                if _new_entry is not None:
+                    self._evict_cached_agent(session_key)
+                    self._session_model_overrides.pop(session_key, None)
+                    self._set_session_reasoning_override(session_key, None)
+                    if hasattr(self, "_pending_model_notes"):
+                        self._pending_model_notes.pop(session_key, None)
+                    _handoff = _build_seamless_rollover_handoff_from_history(
+                        old_session_id=_old_session_id,
+                        new_session_id=_new_entry.session_id,
+                        threshold=_pre_rollover_threshold,
+                        prompt_tokens=_pre_prompt_tokens,
+                        history=_old_history_for_handoff,
+                    )
+                    self.session_store.append_to_transcript(
+                        _new_entry.session_id,
+                        {
+                            "role": "user",
+                            "content": _handoff,
+                            "timestamp": datetime.now().isoformat(),
+                            "metadata": {
+                                "kind": "seamless_session_rollover_handoff",
+                                "old_session_id": _old_session_id,
+                                "new_session_id": _new_entry.session_id,
+                                "threshold": _pre_rollover_threshold,
+                                "prompt_tokens": _pre_prompt_tokens,
+                                "phase": "pre_turn",
+                            },
+                        },
+                    )
+                    session_entry = _new_entry
+                    logger.info(
+                        "biff_seamless_session_rollover_pre_turn: platform=%s chat=%s old_session=%s new_session=%s prompt_tokens=%s threshold=%s handoff_chars=%s",
+                        _platform_name,
+                        source.chat_id or "unknown",
+                        _old_session_id,
+                        _new_entry.session_id,
+                        _pre_prompt_tokens,
+                        _pre_rollover_threshold,
+                        len(_handoff),
+                    )
+        except Exception as _pre_rollover_err:
+            logger.debug("biff pre-turn seamless session rollover failed: %s", _pre_rollover_err)
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -8365,6 +8977,18 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        try:
+            from gateway.biff_hot_context import build_biff_hot_context
+
+            _hot_context = build_biff_hot_context(
+                _load_gateway_config(),
+                platform_key=_platform_config_key(source.platform),
+                session_key=session_key,
+            )
+            if _hot_context:
+                context_prompt = context_prompt + "\n\n" + _hot_context
+        except Exception as _hot_ctx_err:
+            logger.debug("Biff hot context build failed: %s", _hot_ctx_err)
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -9061,6 +9685,29 @@ class GatewayRunner:
                 _wall_metrics["long_turn_checkpoints"],
                 _wall_metrics["long_turn_thresholds"] or "none",
             )
+            try:
+                if str(_platform_name or "").strip().lower() == "discord":
+                    from gateway.biff_latency import record_biff_latency
+
+                    record_biff_latency(
+                        platform=_platform_name,
+                        chat_id=source.chat_id or "unknown",
+                        session_id=session_entry.session_id,
+                        model=agent_result.get("model") or "",
+                        response_time=_response_time,
+                        wall_metrics=_wall_metrics,
+                        api_calls=_api_calls,
+                        response_chars=_resp_len,
+                        input_tokens=int(agent_result.get("input_tokens") or 0),
+                        output_tokens=int(agent_result.get("output_tokens") or 0),
+                        last_prompt_tokens=int(agent_result.get("last_prompt_tokens") or 0),
+                        tool_schema_chars=int(agent_result.get("tool_schema_chars") or 0),
+                        prompt_budget_applied=int(agent_result.get("prompt_budget_applied") or 0),
+                        prompt_budget_tokens=int(agent_result.get("prompt_budget_tokens") or 10_000),
+                        prompt_budget_omitted_messages=int(agent_result.get("prompt_budget_omitted_messages") or 0),
+                    )
+            except Exception as _latency_err:
+                logger.debug("Biff latency record failed: %s", _latency_err)
 
             # Successful turn — clear any stuck-loop counter for this session.
             # This ensures the counter only accumulates across CONSECUTIVE
@@ -9123,6 +9770,7 @@ class GatewayRunner:
             _quota_line = ""
             _mode_line = ""
             _quota_threshold_to_persist = None
+            _quota_rollover_rec = None
             try:
                 from gateway.session_hygiene import build_session_quota_recommendation as _bsqr
                 _quota_rec = _bsqr(
@@ -9132,12 +9780,42 @@ class GatewayRunner:
                     warned_thresholds=getattr(session_entry, "quota_warning_thresholds", None),
                 )
                 if _quota_rec:
-                    _quota_line = f"⚠️ {_quota_rec.text}"
-                    _quota_threshold_to_persist = _quota_rec.threshold
+                    _platform_key = _platform_config_key(source.platform)
+                    _show_quota_warning, _schedule_quota_rollover = _session_quota_visible_warning_policy(
+                        platform_key=_platform_key,
+                        quota_threshold=_quota_rec.threshold,
+                    )
+                    if _schedule_quota_rollover:
+                        _quota_threshold_to_persist = _quota_rec.threshold
+                        _quota_rollover_rec = _quota_rec
+                        logger.info(
+                            "biff_seamless_session_rollover_scheduled: platform=%s chat=%s session=%s threshold=%s prompt_tokens=%s min_threshold=%s",
+                            _platform_name,
+                            source.chat_id or "unknown",
+                            session_entry.session_id,
+                            _quota_rec.threshold,
+                            _quota_rec.prompt_tokens,
+                            _biff_seamless_rollover_threshold(),
+                        )
+                    elif _show_quota_warning:
+                        _quota_line = f"⚠️ {_quota_rec.text}"
+                        _quota_threshold_to_persist = _quota_rec.threshold
+                    else:
+                        _quota_threshold_to_persist = _quota_rec.threshold
+                        logger.info(
+                            "biff_session_quota_warning_suppressed: platform=%s chat=%s session=%s threshold=%s prompt_tokens=%s min_rollover_threshold=%s",
+                            _platform_name,
+                            source.chat_id or "unknown",
+                            session_entry.session_id,
+                            _quota_rec.threshold,
+                            _quota_rec.prompt_tokens,
+                            _biff_seamless_rollover_threshold(),
+                        )
             except Exception as _quota_err:
                 logger.debug("session quota recommendation build failed: %s", _quota_err)
                 _quota_line = ""
                 _quota_threshold_to_persist = None
+                _quota_rollover_rec = None
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
                 _footer_line = _bfl(
@@ -9153,7 +9831,13 @@ class GatewayRunner:
                 _footer_line = ""
             try:
                 _mode = agent_result.get("biff_operating_mode") or {}
-                if isinstance(_mode, dict) and _mode.get("name") and _mode.get("name") != "normal":
+                _mode_platform_key = _platform_config_key(source.platform)
+                if (
+                    isinstance(_mode, dict)
+                    and _mode.get("name")
+                    and _mode.get("name") != "normal"
+                    and _biff_visible_mode_line_enabled(_load_gateway_config(), _mode_platform_key)
+                ):
                     _mode_line = f"⚙️ Biff mode: {_mode.get('label') or _mode.get('name')} — {_mode.get('description') or 'quota/economy safeguards active.'}"
             except Exception:
                 _mode_line = ""
@@ -9163,7 +9847,11 @@ class GatewayRunner:
                 footer_line=_footer_line,
                 already_sent=bool(agent_result.get("already_sent")),
             )
-            if not _quota_warning_delivered:
+            if (
+                not _quota_warning_delivered
+                and _quota_line
+                and _quota_rollover_rec is None
+            ):
                 _quota_threshold_to_persist = None
 
             # Emit agent:end hook
@@ -9372,6 +10060,63 @@ class GatewayRunner:
                 quota_warning_threshold=_quota_threshold_to_persist,
             )
 
+            if (
+                _quota_rollover_rec is not None
+                and not agent_failed_early
+                and session_entry
+                and session_key
+            ):
+                old_session_id = session_entry.session_id
+                new_entry = self.session_store.reset_session(session_key)
+                if new_entry is not None:
+                    self._evict_cached_agent(session_key)
+                    self._session_model_overrides.pop(session_key, None)
+                    self._set_session_reasoning_override(session_key, None)
+                    if hasattr(self, "_pending_model_notes"):
+                        self._pending_model_notes.pop(session_key, None)
+                    handoff = _build_seamless_rollover_handoff(
+                        old_session_id=old_session_id,
+                        new_session_id=new_entry.session_id,
+                        threshold=int(_quota_rollover_rec.threshold),
+                        prompt_tokens=int(agent_result.get("last_prompt_tokens", 0) or 0),
+                        context_length=agent_result.get("context_length") or None,
+                        user_text=message_text,
+                        response_text=response or "",
+                    )
+                    self.session_store.append_to_transcript(
+                        new_entry.session_id,
+                        {
+                            "role": "user",
+                            "content": handoff,
+                            "timestamp": datetime.now().isoformat(),
+                            "metadata": {
+                                "kind": "seamless_session_rollover_handoff",
+                                "old_session_id": old_session_id,
+                                "new_session_id": new_entry.session_id,
+                                "threshold": int(_quota_rollover_rec.threshold),
+                                "prompt_tokens": int(agent_result.get("last_prompt_tokens", 0) or 0),
+                            },
+                        },
+                    )
+                    logger.info(
+                        "biff_seamless_session_rollover_completed: platform=%s chat=%s old_session=%s new_session=%s threshold=%s prompt_tokens=%s handoff_chars=%s",
+                        _platform_name,
+                        source.chat_id or "unknown",
+                        old_session_id,
+                        new_entry.session_id,
+                        _quota_rollover_rec.threshold,
+                        agent_result.get("last_prompt_tokens", 0) or 0,
+                        len(handoff),
+                    )
+                else:
+                    logger.warning(
+                        "biff_seamless_session_rollover_failed: platform=%s chat=%s session=%s threshold=%s",
+                        _platform_name,
+                        source.chat_id or "unknown",
+                        old_session_id,
+                        _quota_rollover_rec.threshold,
+                    )
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
@@ -9407,6 +10152,7 @@ class GatewayRunner:
                                 self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
                                 platform=source.platform,
                                 quota_threshold_to_persist=_quota_threshold_to_persist,
+                                show_new_session_button=bool(_quota_line),
                             )
                             await _foot_adapter.send(
                                 source.chat_id,
@@ -9421,6 +10167,7 @@ class GatewayRunner:
                 response
                 and source.platform == Platform.DISCORD
                 and _quota_threshold_to_persist is not None
+                and _quota_line
             ):
                 return GatewayResponse(
                     response,
@@ -9921,14 +10668,23 @@ class GatewayRunner:
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
-        # Auto-subscribe on create. Parse the task id from the CLI's standard
-        # success line ("Created t_abcd  (ready, assignee=...)"). If the user
+        # Auto-subscribe on create. Parse the internal task id from the CLI's
+        # standard success line. Modern output is user-facing
+        # "Created K-123 (t_abcd)"; older output was "Created t_abcd".
+        # If the user
         # passed --json we don't subscribe; they're clearly scripting and
         # can call /kanban notify-subscribe explicitly.
         if is_create and output:
-            m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
-            if m:
-                task_id = m.group(1)
+            internal_m = re.search(r"Created\s+(?:K-?\d+\s+\()?((?:t_)[0-9a-f]+)\)?\b", output, re.IGNORECASE)
+            display_m = re.search(r"Created\s+(K-?\d+)\b", output, re.IGNORECASE)
+            if internal_m or display_m:
+                if display_m:
+                    raw_ref = display_m.group(1).upper()
+                    task_ref = raw_ref if raw_ref.startswith("K-") else f"K-{raw_ref[1:]}"
+                else:
+                    assert internal_m is not None
+                    task_ref = internal_m.group(1)
+                task_lookup_ref = internal_m.group(1) if internal_m else task_ref
                 try:
                     source = event.source
                     platform = getattr(source, "platform", None)
@@ -9943,8 +10699,9 @@ class GatewayRunner:
                             from hermes_cli import kanban_db as _kb
                             conn = _kb.connect(board=requested_board)
                             try:
+                                resolved_task_id = _kb.resolve_task_id(conn, task_lookup_ref) or task_lookup_ref
                                 _kb.add_notify_sub(
-                                    conn, task_id=task_id,
+                                    conn, task_id=resolved_task_id,
                                     platform=platform_str, chat_id=chat_id,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
@@ -9956,7 +10713,7 @@ class GatewayRunner:
                         output = (
                             output.rstrip()
                             + "\n"
-                            + t("gateway.kanban.subscribed_suffix", task_id=task_id)
+                            + t("gateway.kanban.subscribed_suffix", task_id=task_ref)
                         )
                 except Exception as exc:
                     logger.warning("kanban create auto-subscribe failed: %s", exc)
@@ -10298,12 +11055,26 @@ class GatewayRunner:
                 return t("gateway.draining", count=count)
             return EphemeralReply(t("gateway.restart.in_progress"))
 
+        # Persist the durable restart handoff before invoking any restart path.
+        # If this fails, abort safely while adapters are still connected so the
+        # requester gets a real failure instead of a killed gateway with no
+        # post-restart confirmation target.
+        try:
+            handoff_packet = persist_pre_restart_handoff(event, home=_hermes_home)
+        except Exception as e:
+            logger.error("Failed to persist gateway restart handoff; aborting restart: %s", e)
+            return (
+                "Restart aborted: failed to persist the gateway restart handoff packet. "
+                "The gateway was left running so this request can be retried safely."
+            )
+
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.
         try:
             notify_data = {
                 "platform": event.source.platform.value if event.source.platform else None,
                 "chat_id": event.source.chat_id,
+                "request_id": handoff_packet.get("request_id"),
             }
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
@@ -11981,6 +12752,8 @@ class GatewayRunner:
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        completion_header: bool = True,
+        quick_chat_lane: bool = False,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -12012,12 +12785,27 @@ class GatewayRunner:
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = list(configured_toolsets)
+            if quick_chat_lane and platform_key == "discord":
+                from agent.biff_intent_router import route_biff_live_intent
+                from gateway.session_hygiene import apply_biff_tool_schema_profile
+
+                enabled_toolsets = apply_biff_tool_schema_profile(user_config, platform_key, configured_toolsets)
+                _quick_route = route_biff_live_intent(prompt, command=False)
+                if _quick_route.action == "quick_web":
+                    widened = set(enabled_toolsets)
+                    for toolset in ("web", "search"):
+                        if toolset in configured_toolsets:
+                            widened.add(toolset)
+                    enabled_toolsets = sorted(widened)
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            if quick_chat_lane:
+                max_iterations = min(max_iterations, 4)
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -12041,6 +12829,20 @@ class GatewayRunner:
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
+                if quick_chat_lane:
+                    try:
+                        from tools.chat_guardrails import ChatToolPolicy, set_chat_tool_policy
+
+                        set_chat_tool_policy(
+                            task_id,
+                            ChatToolPolicy(
+                                max_terminal_timeout=10,
+                                max_tool_calls=3,
+                                block_broad_shell_search=True,
+                            ),
+                        )
+                    except Exception:
+                        pass
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -12077,6 +12879,13 @@ class GatewayRunner:
                         task_id=task_id,
                     )
                 finally:
+                    if quick_chat_lane:
+                        try:
+                            from tools.chat_guardrails import clear_chat_tool_policy
+
+                            clear_chat_tool_policy(task_id)
+                        except Exception:
+                            pass
                     self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
@@ -12091,7 +12900,7 @@ class GatewayRunner:
                 images, text_content = adapter.extract_images(response)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n' if completion_header else ""
 
                 if text_content:
                     await adapter.send(
@@ -12102,7 +12911,7 @@ class GatewayRunner:
                 elif not images and not media_files:
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + "(No response generated)",
+                        content=(header + "(No response generated)") if completion_header else "(No response generated)",
                         metadata=_thread_metadata,
                     )
 
@@ -12132,7 +12941,11 @@ class GatewayRunner:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    content=(
+                        f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)'
+                        if completion_header
+                        else "(No response generated)"
+                    ),
                     metadata=_thread_metadata,
                 )
 
@@ -12142,6 +12955,151 @@ class GatewayRunner:
                 await adapter.send(
                     chat_id=source.chat_id,
                     content=f"❌ Background task {task_id} failed: {e}",
+                    metadata=_thread_metadata,
+                )
+            except Exception:
+                pass
+
+    async def _run_forge_direct_background_task(
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        event_message_id: Optional[str] = None,
+    ) -> None:
+        await self._run_specialist_direct_background_task(
+            "forge",
+            prompt,
+            source,
+            task_id,
+            event_message_id=event_message_id,
+        )
+
+    async def _run_specialist_direct_background_task(
+        self,
+        role: str,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        event_message_id: Optional[str] = None,
+    ) -> None:
+        """Invoke the Forge profile directly for a non-blocking Discord handoff.
+
+        The first implementation routed this through a second Biff agent turn.
+        That was fast for Discord but could make the background lane delegate
+        again, duplicate work, or run searches from the wrong directory.  This
+        path starts the selected specialist itself in the canonical runtime
+        workspace.
+        """
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("No adapter for platform %s in %s background task %s", source.platform, role, task_id)
+            return
+
+        _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        repo = Path(os.getenv("HERMES_BIFF_RUNTIME_DIR", "/Users/marco/.hermes/hermes-agent-biff-runtime"))
+        script = Path("/Users/marco/.hermes/scripts/biff_role_invoke.py")
+        if not script.exists():
+            await adapter.send(
+                source.chat_id,
+                f"❌ {role.title()} background task {task_id} failed: role invocation script is missing.",
+                metadata=_thread_metadata,
+            )
+            return
+
+        def run_sync() -> subprocess.CompletedProcess[str]:
+            env = os.environ.copy()
+            env["HERMES_REPO"] = str(repo)
+            env["BIFF_ROLE_PLATFORM"] = "discord"
+            specialist_toolsets = _specialist_direct_toolsets(role)
+            command = [
+                sys.executable,
+                str(script),
+                role,
+                prompt,
+                "--platform",
+                "discord",
+                "--toolsets",
+                specialist_toolsets,
+                "--timeout",
+                os.getenv("HERMES_BIFF_FORGE_BACKGROUND_TIMEOUT", "900"),
+            ]
+            return subprocess.run(
+                command,
+                cwd=str(repo),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("HERMES_BIFF_FORGE_BACKGROUND_TIMEOUT", "900")) + 30,
+            )
+
+        try:
+            forge_task = asyncio.create_task(self._run_in_executor_with_context(run_sync))
+            started_at = time.monotonic()
+            update_count = 0
+            while not forge_task.done():
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(forge_task), timeout=45)
+                    break
+                except asyncio.TimeoutError:
+                    update_count += 1
+                    elapsed = int(time.monotonic() - started_at)
+                    try:
+                        await adapter.send(
+                            source.chat_id,
+                            (
+                                f"{role.title()} is still working on `{task_id}` in the background "
+                                f"({elapsed}s elapsed). I’ll post the result here when it finishes or blocks."
+                            ),
+                            metadata=_thread_metadata,
+                        )
+                    except Exception:
+                        logger.exception("%s background task %s progress update failed", role.title(), task_id)
+                    logger.info(
+                        "biff_specialist_direct_background_progress: platform=%s role=%s task=%s elapsed=%s updates=%s",
+                        source.platform.value if source.platform else "gateway",
+                        role,
+                        task_id,
+                        elapsed,
+                        update_count,
+                    )
+            else:
+                result = await forge_task
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
+            try:
+                payload = json.loads(stdout) if stdout else {}
+            except Exception:
+                payload = {}
+            role_status = "complete" if result.returncode == 0 else "failed"
+            body = ""
+            if isinstance(payload, dict):
+                body = str(payload.get("stdout") or payload.get("stderr_tail") or "").strip()
+            if not body:
+                body = stdout or stderr or "[no Forge output]"
+            if len(body) > 1800:
+                body = body[:1770].rstrip() + "\n...[trimmed]"
+            await adapter.send(
+                source.chat_id,
+                f"{role.title()} background task {task_id} {role_status}.\n\n{body}",
+                metadata=_thread_metadata,
+            )
+            logger.info(
+                "biff_specialist_direct_background_done: platform=%s role=%s task=%s exit=%s stdout_chars=%d stderr_chars=%d",
+                source.platform.value if source.platform else "gateway",
+                role,
+                task_id,
+                result.returncode,
+                len(stdout),
+                len(stderr),
+            )
+        except Exception as e:
+            logger.exception("%s background task %s failed", role.title(), task_id)
+            try:
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ {role.title()} background task {task_id} failed: {e}",
                     metadata=_thread_metadata,
                 )
             except Exception:
@@ -12314,6 +13272,19 @@ class GatewayRunner:
         if _save_config_key("agent.service_tier", saved_value):
             return t("gateway.fast.saved", label=label)
         return t("gateway.fast.session_only", label=label)
+
+    async def _handle_speed_command(self, event: MessageEvent) -> str:
+        """Handle /speed — show recent Discord response-time distribution."""
+        from gateway.biff_latency import render_biff_latency_report
+
+        raw = event.get_command_args().strip()
+        limit = 50
+        if raw:
+            try:
+                limit = max(5, min(200, int(raw)))
+            except Exception:
+                return "Usage: /speed [5-200]"
+        return render_biff_latency_report(limit=limit)
 
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
@@ -16087,6 +17058,8 @@ class GatewayRunner:
                 event_message_id=event_message_id,
             )
 
+        _live_max_iterations_for_auto_continue: int | None = None
+
         from run_agent import AIAgent
         import queue
 
@@ -16098,19 +17071,117 @@ class GatewayRunner:
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         from gateway.session_hygiene import (
+            apply_discord_slowdown_guard,
             apply_biff_tool_schema_profile,
+            apply_biff_turn_toolset_plan,
+            biff_discord_quick_check_budget_prompt,
             biff_operating_mode_prompt,
+            extract_biff_bundle_key,
             filter_biff_mode_enabled_toolsets,
+            render_plain_language_heartbeat,
+            resolve_biff_live_max_iterations,
+            resolve_biff_live_tool_guardrail_settings,
             resolve_biff_operating_mode,
+            widen_biff_toolsets_for_bundle,
         )
         _biff_mode = resolve_biff_operating_mode(user_config, platform_key)
+        if str(platform_key or "").strip().lower() == "discord":
+            try:
+                from gateway.rate_limit_circuit import active_rate_limit
+
+                _circuit = active_rate_limit(scope="discord")
+                if _circuit is not None:
+                    _remaining = int(_circuit.get("remaining_seconds") or 0)
+                    _mins = max(1, int((_remaining + 59) // 60))
+                    return {
+                        "final_response": (
+                            "Provider limits were hit recently, so I’m pausing live "
+                            f"Discord work for about {_mins} min instead of burning "
+                            "more attempts. Background Kanban work will wait for the "
+                            "cooldown or resume when you retry later."
+                        ),
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                        "history_offset": len(history),
+                        "failed": True,
+                        "rate_limit_circuit_open": True,
+                    }
+            except Exception as _circuit_err:
+                logger.debug("Biff rate-limit circuit check failed: %s", _circuit_err)
+        _biff_guard_enabled = (
+            os.getenv("HERMES_BIFF_DISCORD_SLOWDOWN_GUARD", "1").lower()
+            not in {"0", "false", "no", "off"}
+        )
+        _biff_mode, _biff_guard = apply_discord_slowdown_guard(
+            _biff_mode,
+            history,
+            platform_key=platform_key,
+            message=message,
+            enabled=_biff_guard_enabled,
+        )
+        if _biff_guard:
+            logger.info(
+                "biff_slowdown_guard: platform=%s session=%s from=%s to=%s reasons=%s history_messages=%d user_chars=%d assistant_chars=%d tool_chars=%d",
+                platform_key,
+                session_id,
+                _biff_guard.get("from_mode"),
+                _biff_guard.get("to_mode"),
+                ",".join(_biff_guard.get("reasons") or []),
+                int(_biff_guard.get("history_messages") or 0),
+                int(_biff_guard.get("user_chars") or 0),
+                int(_biff_guard.get("assistant_chars") or 0),
+                int(_biff_guard.get("tool_chars") or 0),
+            )
 
         from hermes_cli.tools_config import _get_platform_tools
         _configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        _profiled_toolsets = apply_biff_tool_schema_profile(user_config, platform_key, _configured_toolsets)
+        _planned_toolsets = apply_biff_turn_toolset_plan(
+            user_config,
+            platform_key,
+            _profiled_toolsets,
+            message=message,
+            configured_toolsets=_configured_toolsets,
+        )
         enabled_toolsets = filter_biff_mode_enabled_toolsets(
             _biff_mode,
-            apply_biff_tool_schema_profile(user_config, platform_key, _configured_toolsets),
+            widen_biff_toolsets_for_bundle(
+                user_config,
+                platform_key,
+                _planned_toolsets,
+                _configured_toolsets,
+                message=message,
+            ),
         )
+        try:
+            from tools.chat_guardrails import ChatToolPolicy, clear_chat_tool_policy, set_chat_tool_policy
+
+            _chat_guardrails_enabled = (
+                str(platform_key or "").strip().lower() == "discord"
+                and os.getenv("HERMES_BIFF_CHAT_TOOL_GUARDRAILS", "1").lower()
+                not in {"0", "false", "no", "off"}
+            )
+            if _chat_guardrails_enabled:
+                _guardrail_settings = resolve_biff_live_tool_guardrail_settings(
+                    user_config,
+                    platform_key,
+                    message=message,
+                )
+                set_chat_tool_policy(
+                    session_id,
+                    ChatToolPolicy(
+                        max_terminal_timeout=int(_guardrail_settings["terminal_timeout"]),
+                        max_tool_calls=_guardrail_settings["max_tool_calls"],
+                        block_broad_shell_search=True,
+                    ),
+                )
+            else:
+                clear_chat_tool_policy(session_id)
+                _guardrail_settings = {"bundle_key": None, "terminal_timeout": None, "max_tool_calls": None}
+        except Exception as _chat_guardrail_err:
+            logger.debug("failed to configure Biff chat tool guardrails: %s", _chat_guardrail_err)
+            _guardrail_settings = {"bundle_key": None, "terminal_timeout": None, "max_tool_calls": None, "error": str(_chat_guardrail_err)}
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -16175,6 +17246,7 @@ class GatewayRunner:
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
         status_progress_sent = [False]  # ``status`` mode emits one generic bubble
+        last_plain_activity = [{}]  # Plain-language heartbeat context.
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -16200,6 +17272,20 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            if event_type == "tool.started":
+                try:
+                    if preview:
+                        _activity_desc = str(preview)
+                    elif isinstance(args, dict) and args:
+                        _activity_desc = " ".join(str(k) for k in list(args.keys())[:4])
+                    else:
+                        _activity_desc = ""
+                    last_plain_activity[0] = {
+                        "current_tool": tool_name or "",
+                        "last_activity_desc": _activity_desc,
+                    }
+                except Exception:
+                    pass
             if not progress_queue or not _run_still_current():
                 return
 
@@ -16771,7 +17857,7 @@ class GatewayRunner:
             # read *and* reassign the outer `_run_agent` parameter without
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
-            nonlocal message
+            nonlocal message, _live_max_iterations_for_auto_continue
 
             _prep_started_at = time.monotonic()
 
@@ -16787,6 +17873,39 @@ class GatewayRunner:
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
+            if str(platform_key or "").strip().lower() == "discord":
+                try:
+                    max_iterations = resolve_biff_live_max_iterations(
+                        user_config,
+                        platform_key,
+                        message=message,
+                        base_max_iterations=max_iterations,
+                    )
+                except Exception:
+                    max_iterations = min(max_iterations, 4)
+            _live_max_iterations_for_auto_continue = int(max_iterations)
+            try:
+                if str(platform_key or "").strip().lower() == "discord":
+                    from gateway.biff_diagnostics import record_biff_diagnostic, text_fingerprint
+                    record_biff_diagnostic(
+                        "turn_start",
+                        {
+                            "platform": platform_key,
+                            "chat_id": source.chat_id,
+                            "session_id": session_id,
+                            "session_key": session_key,
+                            "message": text_fingerprint(message),
+                            "history_messages": len(history or []),
+                            "biff_operating_mode": _biff_mode.to_dict(),
+                            "slowdown_guard": _biff_guard,
+                            "guardrail_settings": _guardrail_settings,
+                            "max_iterations": max_iterations,
+                            "configured_toolsets": _configured_toolsets,
+                            "enabled_toolsets": enabled_toolsets,
+                        },
+                    )
+            except Exception:
+                logger.debug("Biff diagnostic turn_start failed", exc_info=True)
             
             # Combine platform context, per-channel context, and the user-configured
             # ephemeral system prompt.
@@ -16799,6 +17918,9 @@ class GatewayRunner:
             _mode_prompt = biff_operating_mode_prompt(_biff_mode)
             if _mode_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + _mode_prompt).strip()
+            if str(platform_key or "").strip().lower() == "discord":
+                _quick_budget_prompt = biff_discord_quick_check_budget_prompt(_guardrail_settings)
+                combined_ephemeral = (combined_ephemeral + "\n\n" + _quick_budget_prompt).strip()
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for
@@ -17208,8 +18330,11 @@ class GatewayRunner:
                         agent_history.append(entry)
 
             from gateway.session_hygiene import (
+                apply_biff_prompt_budget,
                 cap_model_facing_tool_outputs,
                 collect_token_source_metrics,
+                resolve_biff_prompt_budget_tokens,
+                should_apply_biff_prompt_budget,
             )
             _transcript_ref = f"session:{session_id}"
             try:
@@ -17241,6 +18366,68 @@ class GatewayRunner:
                     _tool_output_cap_stats.tool_outputs_capped_count,
                     _tool_output_cap_stats.tool_output_chars_omitted,
                 )
+            _prompt_budget_stats = None
+            if should_apply_biff_prompt_budget(user_config, platform_key, message=message):
+                _prompt_budget_tokens = resolve_biff_prompt_budget_tokens(user_config, platform_key)
+                agent_history, _prompt_budget_stats = apply_biff_prompt_budget(
+                    agent_history,
+                    budget_tokens=_prompt_budget_tokens,
+                    system_context_prompt=context_prompt,
+                    channel_prompt=channel_prompt or "",
+                    tool_schema_chars=_tool_schema_chars,
+                )
+                _token_source_metrics.update(
+                    {
+                        "prompt_budget_applied": int(_prompt_budget_stats.applied),
+                        "prompt_budget_tokens": int(_prompt_budget_stats.budget_tokens),
+                        "prompt_budget_original_messages": int(_prompt_budget_stats.original_messages),
+                        "prompt_budget_kept_messages": int(_prompt_budget_stats.kept_messages),
+                        "prompt_budget_omitted_messages": int(_prompt_budget_stats.omitted_messages),
+                        "prompt_budget_original_chars": int(_prompt_budget_stats.original_chars),
+                        "prompt_budget_kept_chars": int(_prompt_budget_stats.kept_chars),
+                    }
+                )
+                if _prompt_budget_stats.applied:
+                    logger.info(
+                        "biff_prompt_budget: platform=%s session=%s budget_tokens=%d original_messages=%d kept_messages=%d omitted_messages=%d original_chars=%d kept_chars=%d",
+                        platform_key,
+                        session_id,
+                        _prompt_budget_stats.budget_tokens,
+                        _prompt_budget_stats.original_messages,
+                        _prompt_budget_stats.kept_messages,
+                        _prompt_budget_stats.omitted_messages,
+                        _prompt_budget_stats.original_chars,
+                        _prompt_budget_stats.kept_chars,
+                    )
+            else:
+                _token_source_metrics.update(
+                    {
+                        "prompt_budget_applied": 0,
+                        "prompt_budget_tokens": int(resolve_biff_prompt_budget_tokens(user_config, platform_key)),
+                        "prompt_budget_original_messages": len(agent_history),
+                        "prompt_budget_kept_messages": len(agent_history),
+                        "prompt_budget_omitted_messages": 0,
+                        "prompt_budget_original_chars": 0,
+                        "prompt_budget_kept_chars": 0,
+                    }
+                )
+            try:
+                if str(platform_key or "").strip().lower() == "discord":
+                    from gateway.biff_diagnostics import record_biff_diagnostic
+                    record_biff_diagnostic(
+                        "prompt_prepared",
+                        {
+                            "platform": platform_key,
+                            "session_id": session_id,
+                            "agent_history_messages": len(agent_history),
+                            "tool_schema_chars": _tool_schema_chars,
+                            "system_context_prompt_chars": len(str(context_prompt or "")),
+                            "channel_prompt_chars": len(str(channel_prompt or "")),
+                            "token_source_metrics": _token_source_metrics,
+                        },
+                    )
+            except Exception:
+                logger.debug("Biff diagnostic prompt_prepared failed", exc_info=True)
             
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
@@ -17479,6 +18666,22 @@ class GatewayRunner:
                 _agent_loop_finished_at = time.monotonic()
                 _phase_metrics["agent_loop_time"] = _agent_loop_finished_at - _agent_loop_started_at
                 try:
+                    if str(platform_key or "").strip().lower() == "discord":
+                        from gateway.rate_limit_circuit import (
+                            result_has_provider_rate_limit,
+                            record_rate_limit,
+                        )
+
+                        _rate_limit_probe = {
+                            "error": result.get("error") if isinstance(result, dict) else None,
+                            "turn_exit_reason": result.get("turn_exit_reason") if isinstance(result, dict) else None,
+                        }
+                        if result_has_provider_rate_limit(result):
+                            record_rate_limit(scope="discord", reason=_rate_limit_probe)
+                            logger.warning("Biff rate-limit circuit opened for Discord live chat")
+                except Exception as _rate_circuit_err:
+                    logger.debug("Biff rate-limit circuit update failed: %s", _rate_circuit_err)
+                try:
                     _lt_signal = result.get("long_turn_signal") if isinstance(result, dict) else None
                     _turn_exit_reason = result.get("turn_exit_reason") if isinstance(result, dict) else None
                     if progress_queue is not None and isinstance(_lt_signal, dict):
@@ -17515,6 +18718,44 @@ class GatewayRunner:
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+            if str(result.get("turn_exit_reason") or "").startswith("max_iterations_reached"):
+                _auto_continue_after_limit = _should_auto_continue_after_iteration_limit(
+                    result,
+                    platform_key=platform_key,
+                    interrupt_depth=_interrupt_depth,
+                    max_interrupt_depth=self._MAX_INTERRUPT_DEPTH,
+                    operating_mode=getattr(_biff_mode, "name", None),
+                    live_max_iterations=_live_max_iterations_for_auto_continue,
+                    live_max_tool_calls=(
+                        _guardrail_settings.get("max_tool_calls")
+                        if isinstance(_guardrail_settings, dict)
+                        else None
+                    ),
+                )
+                final_response = _build_iteration_limit_user_handoff(
+                    result,
+                    auto_continue=_auto_continue_after_limit,
+                )
+                try:
+                    from gateway.continuation_artifacts import write_continuation_artifact
+
+                    _continuation_artifact = write_continuation_artifact(
+                        user_request=message,
+                        agent_result=result,
+                        session_id=session_id,
+                        platform=platform_key,
+                        source={"chat_id": source.chat_id, "user_id": source.user_id},
+                        guardrail_settings=_guardrail_settings if isinstance(_guardrail_settings, dict) else {},
+                        auto_continue=_auto_continue_after_limit,
+                        next_role="forge/vex/ranger according to the original request",
+                    )
+                    result["continuation_artifact"] = _continuation_artifact.get("artifact_paths", {})
+                    _artifact_md = result["continuation_artifact"].get("markdown") if isinstance(result["continuation_artifact"], dict) else None
+                    if _artifact_md:
+                        final_response = f"{final_response}\n\nContinuation artifact: {_artifact_md}"
+                except Exception:
+                    logger.debug("failed to write Biff continuation artifact", exc_info=True)
+                result["final_response"] = final_response
 
             # Extract per-turn token counts from the agent instance used for this run.
             # The agent counters are session-cumulative (especially for cached
@@ -17541,6 +18782,32 @@ class GatewayRunner:
             if not final_response:
                 _phase_metrics["gateway_agent_post_loop_time"] = time.monotonic() - _agent_loop_finished_at
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                try:
+                    if str(platform_key or "").strip().lower() == "discord":
+                        from gateway.biff_diagnostics import record_biff_diagnostic
+                        record_biff_diagnostic(
+                            "turn_result",
+                            {
+                                "platform": platform_key,
+                                "session_id": session_id,
+                                "status": "no_final_response",
+                                "turn_exit_reason": result.get("turn_exit_reason"),
+                                "failed": result.get("failed", False),
+                                "partial": result.get("partial", False),
+                                "completed": result.get("completed"),
+                                "interrupted": result.get("interrupted", False),
+                                "error": result.get("error"),
+                                "api_calls": result.get("api_calls", 0),
+                                "last_prompt_tokens": _last_prompt_toks,
+                                "input_tokens": _input_toks,
+                                "output_tokens": _output_toks,
+                                "context_length": _context_length,
+                                "phase_metrics": dict(_phase_metrics),
+                                "long_turn": result.get("long_turn"),
+                            },
+                        )
+                except Exception:
+                    logger.debug("Biff diagnostic turn_result failed", exc_info=True)
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -17712,6 +18979,35 @@ class GatewayRunner:
                     pass
             _phase_metrics["gateway_agent_title_dispatch_time"] = time.monotonic() - _title_dispatch_started_at
             _phase_metrics["gateway_agent_post_loop_time"] = time.monotonic() - _agent_loop_finished_at
+            try:
+                if str(platform_key or "").strip().lower() == "discord":
+                    from gateway.biff_diagnostics import record_biff_diagnostic, text_fingerprint
+                    record_biff_diagnostic(
+                        "turn_result",
+                        {
+                            "platform": platform_key,
+                            "session_id": effective_session_id,
+                            "original_session_id": session_id,
+                            "status": "final_response",
+                            "turn_exit_reason": result.get("turn_exit_reason"),
+                            "completed": result_holder[0].get("completed") if result_holder[0] else None,
+                            "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
+                            "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
+                            "error": result_holder[0].get("error") if result_holder[0] else None,
+                            "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
+                            "response": text_fingerprint(final_response),
+                            "last_prompt_tokens": _last_prompt_toks,
+                            "input_tokens": _input_toks,
+                            "output_tokens": _output_toks,
+                            "context_length": _context_length,
+                            "biff_operating_mode": _biff_mode.to_dict(),
+                            "phase_metrics": dict(_phase_metrics),
+                            "long_turn": result.get("long_turn"),
+                            "token_source_metrics": _token_source_metrics,
+                        },
+                    )
+            except Exception:
+                logger.debug("Biff diagnostic turn_result failed", exc_info=True)
 
             return {
                 "final_response": final_response,
@@ -17836,9 +19132,10 @@ class GatewayRunner:
         # Fires every N seconds so the user knows the agent hasn't died.
         # Config: agent.gateway_notify_interval in config.yaml, or
         # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
+        # Discord/Biff caps the first wait to keep visible work from feeling
+        # dead during ordinary 60-120s implementation turns.
         # 0 = disable notifications.
-        _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        _NOTIFY_INTERVAL, _NOTIFY_FIRST_DELAY = _resolve_gateway_notify_schedule(user_config, platform_key)
         _notify_start = time.time()
 
         async def _notify_long_running():
@@ -17847,27 +19144,36 @@ class GatewayRunner:
             _notify_adapter = self.adapters.get(source.platform)
             if not _notify_adapter:
                 return
+            _next_delay = _NOTIFY_FIRST_DELAY or _NOTIFY_INTERVAL
             while True:
-                await asyncio.sleep(_NOTIFY_INTERVAL)
-                _elapsed_mins = int((time.time() - _notify_start) // 60)
+                await asyncio.sleep(_next_delay)
+                _next_delay = _NOTIFY_INTERVAL
                 # Include agent activity context if available.
                 _agent_ref = agent_holder[0]
-                _status_detail = ""
+                _activity_summary = {}
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
-                        else:
-                            _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
+                        _activity_summary = _agent_ref.get_activity_summary() or {}
                     except Exception:
                         pass
+                if last_plain_activity[0]:
+                    _activity_summary = {**_activity_summary, **last_plain_activity[0]}
                 try:
+                    _elapsed_secs = time.time() - _notify_start
+                    _heartbeat_text = render_plain_language_heartbeat(
+                        elapsed_seconds=_elapsed_secs,
+                        activity=_activity_summary,
+                    )
+                    logger.info(
+                        "gateway_long_running_heartbeat: platform=%s chat=%s elapsed=%.1fs text=%s",
+                        platform_key,
+                        source.chat_id or "unknown",
+                        _elapsed_secs,
+                        _heartbeat_text,
+                    )
                     _notify_res = await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
+                        _heartbeat_text,
                         metadata=_status_thread_metadata,
                     )
                     if (
@@ -18146,6 +19452,40 @@ class GatewayRunner:
                 pending_event = None
                 pending = None
 
+            if (
+                not self._draining
+                and pending_event is None
+                and not pending
+                and _should_auto_continue_after_iteration_limit(
+                    result,
+                    platform_key=platform_key,
+                    interrupt_depth=_interrupt_depth,
+                    max_interrupt_depth=self._MAX_INTERRUPT_DEPTH,
+                    operating_mode=getattr(_biff_mode, "name", None),
+                    live_max_iterations=_live_max_iterations_for_auto_continue,
+                    live_max_tool_calls=(
+                        _guardrail_settings.get("max_tool_calls")
+                        if isinstance(_guardrail_settings, dict)
+                        else None
+                    ),
+                )
+            ):
+                pending_event = MessageEvent(
+                    text=_build_iteration_limit_continuation_text(result),
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    internal=True,
+                )
+                pending = pending_event.text
+                logger.info(
+                    "biff_iteration_limit_auto_continue_queued: platform=%s chat=%s session=%s depth=%s reason=%s",
+                    platform_key,
+                    source.chat_id or "unknown",
+                    session_id,
+                    _interrupt_depth,
+                    (result or {}).get("turn_exit_reason"),
+                )
+
             if pending_event or pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])
 
@@ -18326,6 +19666,11 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
+            try:
+                from tools.chat_guardrails import clear_chat_tool_policy
+                clear_chat_tool_policy(session_id)
+            except Exception:
+                pass
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
@@ -18664,12 +20009,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         sync_skills(quiet=True)
     except Exception:
         pass
-
-    # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
-    # and gateway.log (INFO+, gateway-component records only).
-    # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
-    from hermes_logging import setup_logging
-    setup_logging(hermes_home=_hermes_home, mode="gateway")
 
     # Periodic process memory usage logging (gateway only) — emits a
     # grep-friendly "[MEMORY] rss=...MB ..." line every N minutes so
