@@ -232,6 +232,22 @@ def test_review_message_for_forge_does_not_dispatch_to_forge():
     assert plan.specialist is None
 
 
+def test_specialist_misroute_feedback_stays_with_biff_controller():
+    for prompt in (
+        "you sent my question to forge again",
+        "why did you send that to Forge?",
+        "don't route this to forge",
+        "Biff routed my prompt through Vex again",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action == "answer_now"
+        assert plan.runtime == "direct_answer"
+        assert plan.allow_bundle_selection is False
+        assert plan.background is False
+        assert plan.specialist is None
+
+
 def test_explicit_ranger_correction_does_not_route_to_forge_direct_lane():
     plan = plan_biff_turn("this is a task for ranger, not forge")
 

@@ -117,6 +117,15 @@ _SPECIALIST_REVIEW_BEFORE_SEND_RE = re.compile(
     r".*\b(?:forge|ranger|quill|vex)\b",
     re.IGNORECASE,
 )
+_SPECIALIST_MISROUTE_FEEDBACK_RE = re.compile(
+    r"\b(?:you|biff)\b.*\b(?:sent|routed|handed|dispatched|delegated)\b"
+    r".*\b(?:question|prompt|message|this|that|it)?\b.*\b(?:to|through)\s+(?:forge|ranger|quill|vex)\b"
+    r"|\b(?:why\s+did\s+you|did\s+you)\b.*\b(?:send|route|hand\s+off|dispatch|delegate)\b"
+    r".*\b(?:to|through)\s+(?:forge|ranger|quill|vex)\b"
+    r"|\b(?:don'?t|do\s+not|stop)\b.*\b(?:send|route|hand\s+off|dispatch|delegate)\b"
+    r".*\b(?:to|through)\s+(?:forge|ranger|quill|vex)\b",
+    re.IGNORECASE,
+)
 _FORGE_DIRECT_RE = re.compile(
     r"\b("
     r"implement|fix|patch|debug|configure|install|test|verify|restart|delete|remove|"
@@ -216,6 +225,8 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("one_tool", "specialist control request must stay in Biff/controller, not route to the specialist being controlled", "status_read", 2, False, "status")
     if _SPECIALIST_REVIEW_BEFORE_SEND_RE.search(body):
         return BiffTurnPlan("answer_now", "review-before-send request must stay with Biff instead of dispatching to a specialist", "direct_answer", 0, False, "none")
+    if _SPECIALIST_MISROUTE_FEEDBACK_RE.search(body):
+        return BiffTurnPlan("answer_now", "specialist routing feedback must stay with Biff/controller instead of dispatching to that specialist", "direct_answer", 0, False, "none")
     if _REFRESH_RESUME_RE.search(body):
         return BiffTurnPlan(
             "resume_context",

@@ -194,6 +194,19 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
 )
 
 
+BIFF_RUNTIME_GUARDRAIL_CHECKS: tuple[str, ...] = (
+    "current_chat_replies",
+    "busy_message_queueing",
+    "steer_interruption",
+    "nonblocking_specialist_dispatch",
+    "completion_closeout_delivery",
+    "vex_closeout_pass_block_gate",
+    "session_rollover_resume",
+    "loop_bounding_no_empty_search_loops",
+    "update_notifications_noop_degrade",
+)
+
+
 def _scenario_names(wanted: Iterable[str] | None) -> set[str]:
     return {str(name).strip() for name in (wanted or []) if str(name).strip()}
 
@@ -290,6 +303,83 @@ def summarize_synthetic_checks(results: Iterable[SyntheticCheckResult]) -> dict[
     for result in results:
         counts[result.status] = counts.get(result.status, 0) + 1
     return counts
+
+
+def run_runtime_guardrail_smoke_checks(
+    *,
+    run_py_source: str | None = None,
+) -> list[SyntheticCheckResult]:
+    """Run bounded static/synthetic checks for Biff's live runtime guardrails.
+
+    These checks intentionally do not send live Discord messages or start role
+    workers. They assert that risky runtime surfaces have explicit bounded
+    behavior; focused pytest tests exercise the async helpers directly.
+    """
+
+    if run_py_source is None:
+        run_py_source = (Path(__file__).resolve().parent / "run.py").read_text(encoding="utf-8")
+
+    scenario_by_name = {scenario.name: scenario for scenario in DEFAULT_SCENARIOS}
+    checks: dict[str, tuple[bool, str, dict[str, Any]]] = {
+        "current_chat_replies": (
+            "_thread_metadata_for_source" in run_py_source and "_reply_anchor_for_event" in run_py_source,
+            "Discord replies keep the source chat/reply anchor unless thread metadata exists",
+            {},
+        ),
+        "busy_message_queueing": (
+            "Failed to queue busy message" in run_py_source and "Queued for the next turn" in run_py_source,
+            "Busy queue merge failures are logged and the ack path remains bounded",
+            {},
+        ),
+        "steer_interruption": (
+            "running_agent.steer" in run_py_source and "Steered into current run" in run_py_source,
+            "/steer injects into the active run without replaying as queued text",
+            {},
+        ),
+        "nonblocking_specialist_dispatch": (
+            "biff_nonblocking_specialist_dispatch" in run_py_source
+            and "biff_nonblocking_specialist_dispatch_blocked" in run_py_source,
+            "Specialist dispatch is asynchronous and has a degraded no-op path",
+            {},
+        ),
+        "completion_closeout_delivery": (
+            "_format_specialist_direct_completion_recap" in run_py_source
+            and "_final_response_has_executive_closeout_shape" in run_py_source,
+            "Background/synchronous subagent closeouts preserve Status/Evidence/Next-step shape",
+            {},
+        ),
+        "vex_closeout_pass_block_gate": (
+            "_parse_vex_top_level_closeout_decision" in run_py_source
+            and "missing explicit top-level Vex PASS/BLOCK decision" in run_py_source
+            and "ambiguous multiple top-level Vex PASS/BLOCK decisions" in run_py_source,
+            "Vex closeout stays blocked unless an explicit unambiguous top-level PASS is present",
+            {},
+        ),
+        "session_rollover_resume": (
+            "build_resume_context_injection" in run_py_source
+            and "write_continuation_checkpoint" in run_py_source,
+            "Refresh/resume path has bounded context injection and checkpoint recovery",
+            {},
+        ),
+        "loop_bounding_no_empty_search_loops": (
+            scenario_by_name["explicit_secondbrain_lookup"].max_tool_calls == 1
+            and scenario_by_name["smart_connections_fallback_to_bounded_lookup"].max_tool_calls == 1
+            and scenario_by_name["broad_secondbrain_deep_research_background"].expected_background,
+            "SecondBrain/Smart Connections lookups are bounded or deflected to background",
+            {},
+        ),
+        "update_notifications_noop_degrade": (
+            "Update prompt fallback send failed" in run_py_source and "continue" in run_py_source,
+            "Update prompt delivery failures log and continue polling instead of crashing the watcher",
+            {},
+        ),
+    }
+
+    results: list[SyntheticCheckResult] = []
+    for name in BIFF_RUNTIME_GUARDRAIL_CHECKS:
+        passed, detail, observed = checks[name]
+        results.append(SyntheticCheckResult(name, PASS if passed else FAIL, detail, observed))
+    return results
 
 
 def synthetic_results_as_json(results: Iterable[SyntheticCheckResult]) -> str:

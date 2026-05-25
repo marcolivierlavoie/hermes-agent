@@ -249,6 +249,52 @@ def test_specialist_direct_completion_recap_uses_executive_closeout_shape():
     assert "**Recap from Forge:**" not in message
 
 
+def test_vex_top_level_decision_parser_allows_only_explicit_unambiguous_pass():
+    pass_decision = GatewayRunner._parse_vex_top_level_closeout_decision(
+        "PASS\n\nEvidence: focused checks passed."
+    )
+    assert pass_decision["decision"] == "PASS"
+    assert pass_decision["closeout_allowed"] is True
+
+    for text, reason in [
+        ("BLOCK\n\nMissing live smoke.", "explicit BLOCK"),
+        ("Decision: PASS\n\nLooks good.", "malformed"),
+        ("PASS\n\nBLOCK", "ambiguous"),
+        ("Looks good; tests pass.", "missing"),
+    ]:
+        decision = GatewayRunner._parse_vex_top_level_closeout_decision(text)
+        assert decision["closeout_allowed"] is False
+        assert reason in decision["reason"]
+
+
+def test_vex_direct_recap_requires_explicit_top_level_pass_for_done():
+    message = GatewayRunner._format_specialist_direct_completion_recap(
+        role="vex",
+        task_id="vex_missing_decision",
+        role_status="done",
+        detail_suffix=" (session `abc`)",
+        role_output="Looks good; tests passed.",
+    )
+
+    assert "Vex background task `vex_missing_decision` blocked" in message
+    assert "**Status:** Blocked" in message
+    assert "missing explicit top-level Vex PASS/BLOCK decision" in message
+    assert "Looks good; tests passed." in message
+
+
+def test_vex_direct_recap_accepts_only_top_level_pass():
+    message = GatewayRunner._format_specialist_direct_completion_recap(
+        role="vex",
+        task_id="vex_pass",
+        role_status="done",
+        role_output="PASS\n\nVerified focused tests and safety boundaries.",
+    )
+
+    assert "Vex background task `vex_pass` done" in message
+    assert "**Status:** Done" in message
+    assert "Verified focused tests" in message
+
+
 def test_specialist_direct_blocked_recap_uses_decision_shape():
     message = GatewayRunner._format_specialist_direct_completion_recap(
         role="vex",

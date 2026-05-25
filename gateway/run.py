@@ -3541,7 +3541,17 @@ class GatewayRunner:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
+        try:
+            pending = getattr(adapter, "_pending_messages", None)
+            if pending is None:
+                pending = {}
+                setattr(adapter, "_pending_messages", pending)
+            merge_pending_message_event(pending, session_key, event)
+        except Exception as exc:
+            # Busy/drain queueing is a resilience feature, not a reason to wedge
+            # the live chat path.  Fail closed: drop the follow-up, log it, and
+            # let the caller continue with an ack/degraded notice when possible.
+            logger.warning("Failed to queue pending message for session %s: %s", session_key, exc)
 
     async def _deliver_internal_process_completion_out_of_band(
         self,
@@ -3646,18 +3656,21 @@ class GatewayRunner:
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
-            await adapter._send_with_retry(
-                chat_id=event.source.chat_id,
-                content=message,
-                reply_to=(
-                    reply_anchor
-                    if event.source.platform == Platform.TELEGRAM
-                    and event.source.chat_type == "dm"
-                    and event.source.thread_id
-                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
-                ),
-                metadata=thread_meta,
-            )
+            try:
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=message,
+                    reply_to=(
+                        reply_anchor
+                        if event.source.platform == Platform.TELEGRAM
+                        and event.source.chat_type == "dm"
+                        and event.source.thread_id
+                        else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                    ),
+                    metadata=thread_meta,
+                )
+            except Exception as exc:
+                logger.warning("Gateway drain busy-ack failed for session %s: %s", session_key, exc)
             return True
 
         # Normal busy case (agent actively running a task)
@@ -3695,8 +3708,17 @@ class GatewayRunner:
         # current run finishes (or is interrupted).  Skip this for a
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
+        queue_store_failed = False
         if not steered:
-            merge_pending_message_event(adapter._pending_messages, session_key, event)
+            try:
+                pending = getattr(adapter, "_pending_messages", None)
+                if pending is None:
+                    pending = {}
+                    setattr(adapter, "_pending_messages", pending)
+                merge_pending_message_event(pending, session_key, event)
+            except Exception as exc:
+                queue_store_failed = True
+                logger.warning("Failed to queue busy message for session %s: %s", session_key, exc)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -3749,7 +3771,12 @@ class GatewayRunner:
                 pass
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        if is_steer_mode:
+        if queue_store_failed:
+            message = (
+                "⚠️ I could not queue that follow-up; "
+                "please resend after the current task finishes."
+            )
+        elif is_steer_mode:
             message = (
                 f"⏩ Steered into current run{status_detail}. "
                 f"Your message arrives after the next tool call."
@@ -6410,22 +6437,26 @@ class GatewayRunner:
 
             timeout = self._restart_drain_timeout
 
-            # Pre-mark sessions as resume_pending BEFORE the drain wait.
-            # If the process is killed by the service manager during the
-            # drain, the durable marker is already written so the next
-            # gateway boot can recover in-flight sessions (#27856).
+            # Pre-mark restart sessions as resume_pending BEFORE the drain wait.
+            # If the process is killed by the service manager during a restart
+            # drain, the durable marker is already written so the next gateway
+            # boot can recover in-flight sessions (#27856). Plain shutdowns do
+            # not pre-mark: if their drain finishes cleanly they should leave no
+            # stale resume flag, and timeout handling below marks only sessions
+            # that are still running at the deadline.
             _pre_drain_keys: list[str] = []
-            for _sk, _agent in list(self._running_agents.items()):
-                if _agent is _AGENT_PENDING_SENTINEL:
-                    continue
-                try:
-                    self.session_store.mark_resume_pending(
-                        _sk,
-                        "restart_timeout" if self._restart_requested else "shutdown_timeout",
-                    )
-                    _pre_drain_keys.append(_sk)
-                except Exception as _e:
-                    logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
+            if self._restart_requested:
+                for _sk, _agent in list(self._running_agents.items()):
+                    if _agent is _AGENT_PENDING_SENTINEL:
+                        continue
+                    try:
+                        self.session_store.mark_resume_pending(
+                            _sk,
+                            "restart_timeout",
+                        )
+                        _pre_drain_keys.append(_sk)
+                    except Exception as _e:
+                        logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
@@ -8427,15 +8458,28 @@ class GatewayRunner:
                                 "I’ll keep chatting here and post progress in #biff-ops."
                             )
                         _task_id = f"{_specialist_role}_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
-                        _task = asyncio.create_task(
-                            self._run_specialist_direct_background_task(
-                                _specialist_role,
-                                _specialist_instruction,
-                                source,
-                                _task_id,
-                                event_message_id=self._reply_anchor_for_event(event),
+                        try:
+                            _task = asyncio.create_task(
+                                self._run_specialist_direct_background_task(
+                                    _specialist_role,
+                                    _specialist_instruction,
+                                    source,
+                                    _task_id,
+                                    event_message_id=self._reply_anchor_for_event(event),
+                                )
                             )
-                        )
+                        except Exception as _dispatch_exc:
+                            logger.warning(
+                                "biff_nonblocking_specialist_dispatch_blocked: platform=%s role=%s task=%s error=%s",
+                                source.platform.value if source.platform else "gateway",
+                                _specialist_role,
+                                _task_id,
+                                _dispatch_exc,
+                            )
+                            return (
+                                f"{_specialist_role.title()} dispatch is temporarily degraded, so I did not run this live. "
+                                "I’ll keep chatting here; Biff can retry or put it on Kanban if it still matters."
+                            )
                         _task._hermes_task_id = _task_id  # type: ignore[attr-defined]
                         _active_specialist[_dispatch_key] = _task
                         _task.add_done_callback(
@@ -13262,6 +13306,67 @@ class GatewayRunner:
                 pass
 
     @staticmethod
+    def _parse_vex_top_level_closeout_decision(text: str) -> dict[str, Any]:
+        """Parse Vex's explicit top-level PASS/BLOCK closeout decision.
+
+        The controller must not infer a Vex pass from prose like "looks good"
+        or a successful process exit.  The first meaningful top-level line must
+        be exactly PASS or BLOCK (allowing simple markdown emphasis/heading).
+        Any missing, malformed, ambiguous, or BLOCK decision keeps the closeout
+        blocked.
+        """
+
+        raw_lines = str(text or "").splitlines()
+        meaningful: list[str] = []
+        for raw in raw_lines:
+            line = raw.strip()
+            if not line:
+                continue
+            # Bullets/quotes are evidence, not the top-level decision line.
+            if line.startswith(("-", "* ", "+", ">")):
+                continue
+            line = line.lstrip("#").strip()
+            line = line.strip("*_` ").upper()
+            if line:
+                meaningful.append(line)
+
+        decisions = [line for line in meaningful if line in {"PASS", "BLOCK"}]
+        if len(decisions) > 1:
+            return {
+                "decision": None,
+                "closeout_allowed": False,
+                "reason": "ambiguous multiple top-level Vex PASS/BLOCK decisions",
+            }
+        if len(decisions) == 1 and meaningful and meaningful[0] == decisions[0]:
+            decision = decisions[0]
+            return {
+                "decision": decision,
+                "closeout_allowed": decision == "PASS",
+                "reason": "explicit top-level PASS" if decision == "PASS" else "explicit BLOCK",
+            }
+        if decisions:
+            return {
+                "decision": None,
+                "closeout_allowed": False,
+                "reason": "malformed Vex PASS/BLOCK decision is not the first top-level line",
+            }
+        if meaningful and (
+            meaningful[0].startswith("DECISION")
+            or meaningful[0].startswith("VEX")
+            or meaningful[0].startswith("VERDICT")
+        ) and any(word in meaningful[0].split() for word in {"PASS", "BLOCK"}):
+            return {
+                "decision": None,
+                "closeout_allowed": False,
+                "reason": "malformed Vex PASS/BLOCK decision; expected first line exactly PASS or BLOCK",
+            }
+        return {
+            "decision": None,
+            "closeout_allowed": False,
+            "reason": "missing explicit top-level Vex PASS/BLOCK decision",
+        }
+
+    @staticmethod
     def _format_specialist_direct_completion_recap(
         *,
         role: str,
@@ -13280,11 +13385,22 @@ class GatewayRunner:
         """
 
         role_title = role.title()
-        status_label = "Done" if role_status == "done" else "Blocked"
-        header = f"{role_title} background task `{task_id}` {role_status}{detail_suffix}."
         output = "\n".join(str(role_output or "").strip().splitlines()).strip()
         stderr = "\n".join(str(stderr_tail or "").strip().splitlines()).strip()
+        vex_decision: dict[str, Any] | None = None
+        if str(role or "").strip().lower() == "vex" and role_status == "done":
+            vex_decision = GatewayRunner._parse_vex_top_level_closeout_decision(output or stderr)
+            if not vex_decision.get("closeout_allowed"):
+                role_status = "blocked"
+                reason = str(vex_decision.get("reason") or "Vex closeout decision did not pass")
+                stderr = f"{reason}."
+                if output:
+                    stderr = f"{stderr}\n\n{output}"
+        status_label = "Done" if role_status == "done" else "Blocked"
+        header = f"{role_title} background task `{task_id}` {role_status}{detail_suffix}."
         evidence_bits = ["Lifecycle: #biff-ops", f"raw detail: #{role}"]
+        if vex_decision:
+            evidence_bits.append(f"Vex decision: {vex_decision.get('decision') or 'not accepted'}")
         if detail_suffix:
             evidence_bits.append(detail_suffix.strip(" ()"))
 
@@ -15828,14 +15944,18 @@ class GatewayRunner:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
-                            await adapter.send(
-                                chat_id,
-                                f"⚕ **Update needs your input:**\n\n"
-                                f"{prompt_text}{default_hint}\n\n"
-                                f"Reply `/approve` (yes) or `/deny` (no), "
-                                f"or type your answer directly.",
-                                metadata=metadata,
-                            )
+                            try:
+                                await adapter.send(
+                                    chat_id,
+                                    f"⚕ **Update needs your input:**\n\n"
+                                    f"{prompt_text}{default_hint}\n\n"
+                                    f"Reply `/approve` (yes) or `/deny` (no), "
+                                    f"or type your answer directly.",
+                                    metadata=metadata,
+                                )
+                            except Exception as send_err:
+                                logger.warning("Update prompt fallback send failed for %s: %s", session_key, send_err)
+                                continue
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
                         # next watcher can recover by re-forwarding it from

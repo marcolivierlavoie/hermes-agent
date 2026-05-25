@@ -10,6 +10,9 @@ def test_forge_direct_instruction_preserves_user_request_and_contract():
     assert FORGE_DIRECT_BUNDLE_KEY == "/biff-hermes-runtime-change"
     assert "Fix the gateway restart loop and add tests." in message
     assert "Delegate to Forge immediately" in message
+    assert "current chat available as the control plane" in message
+    assert "plain follow-ups queue for the next turn" in message
+    assert "`/steer ...` injects guidance into the active run" in message
     assert "Use Kanban as the lightweight ledger only" in message
     assert "preferring rg and bounded paths" in message
     assert "Run focused tests" in message

@@ -32,6 +32,7 @@ def build_forge_direct_instruction(user_request: Any) -> str:
         - Treat this as active engineering/debug/configuration work, not triage.
         - Work from `/Users/marco/.hermes/hermes-agent-biff-runtime` unless Marco explicitly names another repository or host.
         - Delegate to Forge immediately with this full request when delegation is available; if delegation is unavailable, follow the same Forge contract in the current turn.
+        - Keep Biff's current chat available as the control plane: plain follow-ups queue for the next turn, `/steer ...` injects guidance into the active run, and Biff should mention that path when direct work may take time.
         - Use Kanban as the lightweight ledger only: create, claim, or update the relevant card, but do not route the user through Ranger before work starts.
         - Do not call kanban_show with no task_id; that form is only valid for dispatcher-spawned Kanban workers.
         - Inspect the code/config first with narrow searches, preferring rg and bounded paths.
