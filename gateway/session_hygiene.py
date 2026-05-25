@@ -229,6 +229,7 @@ BIFF_TURN_TOOLSET_PROFILES: dict[str, frozenset[str]] = {
     "none": frozenset(),
     "status": frozenset({"terminal", "file", "kanban"}),
     "kanban": frozenset({"kanban", "terminal"}),
+    "secondbrain": frozenset({"terminal", "file"}),
     "web": frozenset({"web", "search", "browser", "terminal", "file"}),
     "base": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
     "specialist": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
@@ -310,6 +311,8 @@ def resolve_biff_live_tool_guardrail_settings(
         timeout_default = 45
     elif route_action == "kanban_status":
         timeout_default = 20
+    elif route_action == "secondbrain_lookup":
+        timeout_default = 10
     elif route_action == "route_bundle":
         timeout_default = 45
     elif route_action in {"quick_web", "one_tool"}:
@@ -330,6 +333,8 @@ def resolve_biff_live_tool_guardrail_settings(
         timeout_keys = ("vex_direct_chat_terminal_timeout", "route_bundle_chat_terminal_timeout", "chat_terminal_timeout")
     elif route_action == "kanban_status":
         timeout_keys = ("kanban_chat_terminal_timeout", "one_tool_chat_terminal_timeout")
+    elif route_action == "secondbrain_lookup":
+        timeout_keys = ("secondbrain_chat_terminal_timeout", "one_tool_chat_terminal_timeout")
     elif route_action == "route_bundle":
         timeout_keys = ("route_bundle_chat_terminal_timeout", "chat_terminal_timeout")
     elif route_action == "quick_web":
@@ -360,6 +365,8 @@ def resolve_biff_live_tool_guardrail_settings(
         tool_keys = ("vex_direct_chat_max_tool_calls", "route_bundle_chat_max_tool_calls")
     elif route_action == "kanban_status":
         tool_keys = ("kanban_chat_max_tool_calls", "one_tool_chat_max_tool_calls")
+    elif route_action == "secondbrain_lookup":
+        tool_keys = ("secondbrain_chat_max_tool_calls", "one_tool_chat_max_tool_calls")
     elif route_action == "route_bundle":
         tool_keys = ("route_bundle_chat_max_tool_calls", "bundle_chat_max_tool_calls")
     elif route_action == "quick_web":
@@ -388,6 +395,8 @@ def resolve_biff_live_tool_guardrail_settings(
         tool_default = 24
     elif route_action == "kanban_status":
         tool_default = 3
+    elif route_action == "secondbrain_lookup":
+        tool_default = 1
     elif route_action == "route_bundle":
         tool_default = 36
     elif route_action == "quick_web":
@@ -455,6 +464,8 @@ def resolve_biff_live_max_iterations(
         iterations_key = "vex_direct_chat_max_iterations"
     elif route_action == "kanban_status":
         iterations_key = "kanban_chat_max_iterations"
+    elif route_action == "secondbrain_lookup":
+        iterations_key = "secondbrain_chat_max_iterations"
     elif route_action == "route_bundle":
         iterations_key = "route_bundle_chat_max_iterations"
     elif route_action == "quick_web":
@@ -481,6 +492,8 @@ def resolve_biff_live_max_iterations(
         iterations_default = 24
     elif route_action == "kanban_status":
         iterations_default = 5
+    elif route_action == "secondbrain_lookup":
+        iterations_default = 2
     elif route_action == "route_bundle":
         iterations_default = 48
     elif route_action == "quick_web":

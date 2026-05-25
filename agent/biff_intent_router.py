@@ -184,6 +184,8 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("command", "slash command already has explicit dispatch", "command", 0, True, "command")
     if not body:
         return BiffTurnPlan("answer_now", "empty or whitespace-only prompt", "direct_answer", 0, False, "none")
+    if re.fullmatch(r"(?i)\s*(?:hi|hello|hey|yo|sup|thanks|thank you|ok|okay|gm|gn)[.!?\s]*", body):
+        return BiffTurnPlan("answer_now", "casual greeting or acknowledgement", "direct_answer", 0, False, "none")
     explicit_specialist = _EXPLICIT_SPECIALIST_RE.search(body)
     if explicit_specialist:
         role = (explicit_specialist.group("role") or explicit_specialist.group("role2") or "").lower()
@@ -220,6 +222,51 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
             "none",
             background=True,
             specialist="vex",
+        )
+    # Preserve board/archive hygiene routing before SecondBrain RAG broad-match.
+    # Prompts like "archive Linear stories and scan Obsidian" belong to Ranger's
+    # continuation lane, not Quill's SecondBrain retrieval lane.
+    if _SLOW_WORK_RE.search(body) and re.search(
+        r"\b(?:backlog|board|kanban|linear|stories|story|cards|card|tickets|issues)\b",
+        body,
+        re.IGNORECASE,
+    ):
+        return BiffTurnPlan(
+            "ranger_direct",
+            "broad board/backlog work should route to Ranger's nonblocking board lane",
+            "specialist_work",
+            2,
+            False,
+            "specialist",
+            background=True,
+            specialist="ranger",
+        )
+    try:
+        from agent.biff_rag_router import classify_biff_rag_request
+
+        rag_decision = classify_biff_rag_request(body)
+    except Exception:
+        rag_decision = None
+    if rag_decision is not None and rag_decision.action == "background":
+        return BiffTurnPlan(
+            "background",
+            rag_decision.reason,
+            "background",
+            1,
+            False,
+            "none",
+            background=True,
+            specialist="quill",
+        )
+    if rag_decision is not None and rag_decision.action == "sqlite_fts":
+        return BiffTurnPlan(
+            "secondbrain_lookup",
+            rag_decision.reason,
+            "secondbrain_lookup",
+            rag_decision.max_live_tool_calls,
+            False,
+            "secondbrain",
+            requires_current_info=False,
         )
     if _RANGER_TASK_CORRECTION_RE.search(body):
         return BiffTurnPlan("ranger_direct", "explicit Ranger board/task request", "specialist_work", 2, False, "specialist", background=True, specialist="ranger")

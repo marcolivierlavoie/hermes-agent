@@ -48,12 +48,46 @@ class SyntheticCheckResult:
 
 DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
     SyntheticScenario(
+        name="casual_hi_no_rag",
+        prompt="hi",
+        expected_action="answer_now",
+        expected_runtime="direct_answer",
+        expected_toolsets=(),
+        max_tool_calls=1,
+    ),
+    SyntheticScenario(
         name="casual_answer_chicken_rice",
         prompt="Quick question: what are three simple dinner ideas with chicken and rice?",
         expected_action="answer_now",
         expected_runtime="direct_answer",
         expected_toolsets=(),
         max_tool_calls=1,
+    ),
+    SyntheticScenario(
+        name="explicit_secondbrain_lookup",
+        prompt="Look up SecondBrain notes about Biff routing.",
+        expected_action="secondbrain_lookup",
+        expected_runtime="secondbrain_lookup",
+        expected_toolsets=("file", "terminal"),
+        max_tool_calls=1,
+    ),
+    SyntheticScenario(
+        name="smart_connections_fallback_to_bounded_lookup",
+        prompt="Use Smart Connections to find notes about Biff routing.",
+        expected_action="secondbrain_lookup",
+        expected_runtime="secondbrain_lookup",
+        expected_toolsets=("file", "terminal"),
+        max_tool_calls=1,
+    ),
+    SyntheticScenario(
+        name="broad_secondbrain_deep_research_background",
+        prompt="Search my entire SecondBrain and Smart Connections history for every old decision about Biff and summarize all of it.",
+        expected_action="background",
+        expected_runtime="background",
+        expected_toolsets=(),
+        max_tool_calls=1,
+        expected_background=True,
+        expected_specialist="quill",
     ),
     SyntheticScenario(
         name="read_only_kanban_status",

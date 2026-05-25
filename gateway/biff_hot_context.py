@@ -92,6 +92,7 @@ def build_biff_hot_context(
     platform_key: str | None,
     session_key: str | None = None,
     ttl_seconds: int = 30,
+    query: str | None = None,
 ) -> str:
     """Return a small cached context capsule for live Discord turns.
 
@@ -108,7 +109,7 @@ def build_biff_hot_context(
     if not _truthy(discord_cfg.get("hot_context", True)):
         return ""
 
-    key = str(session_key or "discord")
+    key = str(session_key or "discord") + ":" + str(hash(str(query or "")))
     now = time.monotonic()
     cached = _CACHE.get(key)
     if cached and now - cached[0] <= max(1, int(ttl_seconds)):
@@ -138,8 +139,16 @@ def build_biff_hot_context(
             lines.append(memory_snapshot)
     except Exception:
         pass
+    try:
+        from agent.biff_rag_router import secondbrain_rag_context
 
-    capsule = _clip("\n".join(lines), 2200)
+        rag_context = secondbrain_rag_context(query or "", max_chars=900)
+        if rag_context:
+            lines.append(rag_context)
+    except Exception:
+        pass
+
+    capsule = _clip("\n".join(lines), 3000)
     _CACHE[key] = (now, capsule)
     return capsule
 
