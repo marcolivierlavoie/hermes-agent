@@ -1375,6 +1375,7 @@ from gateway.platforms.base import (
     merge_pending_message_event,
 )
 from gateway.restart import (
+    DEFAULT_GATEWAY_DETACHED_RESTART_MAX_WAIT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
@@ -4180,9 +4181,53 @@ class GatewayRunner:
         except Exception:
             pass
 
+    @staticmethod
+    def _load_detached_restart_max_wait() -> float:
+        raw = os.getenv("HERMES_DETACHED_RESTART_MAX_WAIT", "")
+        if not str(raw or "").strip():
+            return DEFAULT_GATEWAY_DETACHED_RESTART_MAX_WAIT
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid HERMES_DETACHED_RESTART_MAX_WAIT '%s', using default %.0fs",
+                raw,
+                DEFAULT_GATEWAY_DETACHED_RESTART_MAX_WAIT,
+            )
+            return DEFAULT_GATEWAY_DETACHED_RESTART_MAX_WAIT
+
+    @staticmethod
+    def _detached_restart_ready_path(pid: int) -> Path:
+        return _hermes_home / f".restart_ready.{pid}"
+
+    @staticmethod
+    def _detached_restart_watcher_log_path() -> Path:
+        return _hermes_home / "logs" / "gateway-restart-watcher.log"
+
+    def _mark_detached_restart_ready(self) -> None:
+        """Signal the detached watcher that teardown reached the safe point."""
+        try:
+            path = self._detached_restart_ready_path(os.getpid())
+            path.write_text(str(time.time()), encoding="utf-8")
+            logger.info("Detached restart ready marker written: %s", path)
+        except Exception as exc:
+            logger.warning("Failed to write detached restart ready marker: %s", exc)
+
+    def _force_exit_after_clean_detached_restart(self) -> None:
+        """Hard-exit after clean detached restart teardown to shed stray non-daemon work."""
+        if os.getenv("HERMES_DISABLE_DETACHED_RESTART_FORCE_EXIT") == "1":
+            logger.warning("Detached restart force-exit disabled by env; process may linger")
+            return
+        logger.warning(
+            "Detached restart clean teardown complete; forcing process exit now "
+            "to avoid lingering background threads/subprocesses delaying startup."
+        )
+        os._exit(0)
+
     async def _launch_detached_restart_command(self) -> None:
         import shutil
         import subprocess
+        import textwrap
 
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
@@ -4190,94 +4235,135 @@ class GatewayRunner:
             return
 
         current_pid = os.getpid()
+        cmd_argv = [*hermes_cmd, "gateway", "restart"]
+        ready_path = self._detached_restart_ready_path(current_pid)
+        log_path = self._detached_restart_watcher_log_path()
+        max_wait = self._load_detached_restart_max_wait()
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
-        # On Windows there's no bash/setsid chain — spawn a tiny Python
-        # watcher directly via sys.executable instead.  The watcher polls
-        # current_pid, waits for our exit, then runs `hermes gateway
-        # restart` with detach flags so the respawn survives the CLI
-        # that triggered the /restart command closing its console.
+        watcher = textwrap.dedent(
+            """
+            import datetime, os, subprocess, sys, time
+            pid = int(sys.argv[1])
+            max_wait = float(sys.argv[2])
+            ready_path = sys.argv[3]
+            log_path = sys.argv[4]
+            cmd = sys.argv[5:]
+
+            def _log(message):
+                try:
+                    ts = datetime.datetime.now().isoformat(timespec='seconds')
+                    with open(log_path, 'a', encoding='utf-8') as fh:
+                        fh.write(f"{ts} pid={pid} {message}\\n")
+                except Exception:
+                    pass
+
+            def _alive(p):
+                if os.name == 'nt':
+                    import ctypes
+                    k32 = ctypes.windll.kernel32
+                    k32.OpenProcess.restype = ctypes.c_void_p
+                    k32.WaitForSingleObject.restype = ctypes.c_uint
+                    k32.GetLastError.restype = ctypes.c_uint
+                    h = k32.OpenProcess(0x1000 | 0x100000, False, int(p))
+                    if not h:
+                        return k32.GetLastError() != 87
+                    try:
+                        return k32.WaitForSingleObject(h, 0) == 0x102
+                    finally:
+                        k32.CloseHandle(h)
+                try:
+                    os.kill(int(p), 0)
+                    return True
+                except ProcessLookupError:
+                    return False
+                except PermissionError:
+                    return True
+                except OSError:
+                    return False
+
+            _log(f"watcher started max_wait={max_wait:.1f}s ready_path={ready_path} cmd={' '.join(cmd)}")
+            deadline = time.monotonic() + max_wait
+            last_log = 0.0
+            start_allowed = False
+            while True:
+                alive = _alive(pid)
+                ready = os.path.exists(ready_path)
+                if not alive:
+                    _log("old pid exited; launching restart")
+                    start_allowed = True
+                    break
+                if ready:
+                    _log("ready marker detected while old pid is still alive; launching restart")
+                    start_allowed = True
+                    break
+                now = time.monotonic()
+                if now >= deadline:
+                    _log("max wait exceeded before old pid exit or ready marker; not launching unsafe restart")
+                    break
+                if now - last_log >= 5:
+                    _log("waiting for old pid exit or clean-teardown ready marker")
+                    last_log = now
+                time.sleep(0.2)
+
+            if not start_allowed:
+                sys.exit(2)
+
+            popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            if os.name == 'nt':
+                popen_kwargs["creationflags"] = 0x00000200 | 0x00000008 | 0x08000000
+            subprocess.Popen(cmd, **popen_kwargs)
+            _log("restart command launched")
+            try:
+                os.unlink(ready_path)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                _log(f"ready marker cleanup failed: {exc}")
+            """
+        ).strip()
+
+        argv = [
+            sys.executable,
+            "-c",
+            watcher,
+            str(current_pid),
+            str(max_wait),
+            str(ready_path),
+            str(log_path),
+            *cmd_argv,
+        ]
+        logger.info(
+            "Launching detached restart watcher for pid=%s max_wait=%.1fs log=%s ready=%s",
+            current_pid,
+            max_wait,
+            log_path,
+            ready_path,
+        )
+
         if sys.platform == "win32":
-            import textwrap
             from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 
-            cmd_argv = [*hermes_cmd, "gateway", "restart"]
-            watcher = textwrap.dedent(
-                """
-                import os, subprocess, sys, time
-                pid = int(sys.argv[1])
-                cmd = sys.argv[2:]
-                deadline = time.monotonic() + 120
-
-                def _alive(p):
-                    # On Windows, os.kill(pid, 0) is NOT a no-op — it maps to
-                    # GenerateConsoleCtrlEvent(0, pid) (bpo-14484). Use the
-                    # Win32 handle-based existence check instead.
-                    if os.name == 'nt':
-                        import ctypes
-                        k32 = ctypes.windll.kernel32
-                        k32.OpenProcess.restype = ctypes.c_void_p
-                        k32.WaitForSingleObject.restype = ctypes.c_uint
-                        k32.GetLastError.restype = ctypes.c_uint
-                        h = k32.OpenProcess(0x1000 | 0x100000, False, int(p))
-                        if not h:
-                            return k32.GetLastError() != 87
-                        try:
-                            return k32.WaitForSingleObject(h, 0) == 0x102
-                        finally:
-                            k32.CloseHandle(h)
-                    try:
-                        os.kill(int(p), 0)
-                        return True
-                    except ProcessLookupError:
-                        return False
-                    except PermissionError:
-                        return True
-                    except OSError:
-                        return False
-
-                while time.monotonic() < deadline:
-                    if not _alive(pid):
-                        break
-                    time.sleep(0.2)
-                _CREATE_NEW_PROCESS_GROUP = 0x00000200
-                _DETACHED_PROCESS = 0x00000008
-                _CREATE_NO_WINDOW = 0x08000000
-                subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=_CREATE_NEW_PROCESS_GROUP | _DETACHED_PROCESS | _CREATE_NO_WINDOW,
-                )
-                """
-            ).strip()
             subprocess.Popen(
-                [sys.executable, "-c", watcher, str(current_pid), *cmd_argv],
+                argv,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 **windows_detach_popen_kwargs(),
             )
             return
 
-        cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
-        shell_cmd = (
-            f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
-            f"{cmd} gateway restart"
-        )
         setsid_bin = shutil.which("setsid")
         if setsid_bin:
-            subprocess.Popen(
-                [setsid_bin, "bash", "-lc", shell_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        else:
-            subprocess.Popen(
-                ["bash", "-lc", shell_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            argv = [setsid_bin, *argv]
+        subprocess.Popen(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
@@ -6396,6 +6482,20 @@ class GatewayRunner:
                 """
                 try:
                     from tools.process_registry import process_registry
+                    try:
+                        _running = [
+                            p for p in process_registry.list_sessions()
+                            if p.get("status") == "running"
+                        ]
+                    except Exception:
+                        _running = []
+                    if _running:
+                        logger.info(
+                            "Shutdown (%s): terminating %d registered tool subprocess(es): %s",
+                            phase,
+                            len(_running),
+                            ", ".join(str(p.get("session_id", "?")) for p in _running[:8]),
+                        )
                     _killed = process_registry.kill_all()
                     if _killed:
                         logger.info(
@@ -6596,10 +6696,33 @@ class GatewayRunner:
                 _phase_elapsed(),
             )
 
-            for _task in list(self._background_tasks):
-                if _task is self._stop_task:
-                    continue
+            _tasks_to_cancel = [
+                _task for _task in list(self._background_tasks)
+                if _task is not self._stop_task
+            ]
+            if _tasks_to_cancel:
+                logger.info(
+                    "Shutdown phase: cancelling %d gateway background task(s): %s",
+                    len(_tasks_to_cancel),
+                    ", ".join(str(_task.get_name()) for _task in _tasks_to_cancel[:8]),
+                )
+            for _task in _tasks_to_cancel:
                 _task.cancel()
+            if _tasks_to_cancel:
+                done, pending = await asyncio.wait(_tasks_to_cancel, timeout=2.0)
+                if pending:
+                    logger.warning(
+                        "Shutdown phase: %d gateway background task(s) still pending after cancellation wait: %s",
+                        len(pending),
+                        ", ".join(str(_task.get_name()) for _task in list(pending)[:8]),
+                    )
+                for _task in done:
+                    try:
+                        _task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        logger.debug("Gateway background task ended during shutdown with error: %s", exc)
             self._background_tasks.clear()
 
             self.adapters.clear()
@@ -6691,9 +6814,18 @@ class GatewayRunner:
                 self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
                 self._exit_reason = self._exit_reason or "Gateway restart requested"
 
+            clean_detached_restart = bool(
+                self._restart_requested and self._restart_detached and not timed_out
+            )
+            if clean_detached_restart:
+                self._mark_detached_restart_ready()
+
             self._draining = False
             self._update_runtime_status("stopped", self._exit_reason)
             logger.info("Gateway stopped (total teardown %.2fs)", _phase_elapsed())
+
+            if clean_detached_restart:
+                self._force_exit_after_clean_detached_restart()
 
         self._stop_task = asyncio.create_task(_stop_impl())
         await self._stop_task
@@ -12899,8 +13031,10 @@ class GatewayRunner:
                 event_message_id=event_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
-            )
+            ),
+            name=f"gateway-background:{task_id}",
         )
+        logger.info("Background task %s scheduled for %s", task_id, source.platform.value)
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
 
@@ -12932,6 +13066,7 @@ class GatewayRunner:
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
         try:
+            logger.info("Background task %s starting", task_id)
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
@@ -13052,6 +13187,7 @@ class GatewayRunner:
                     self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
+            logger.info("Background task %s agent run returned", task_id)
 
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
@@ -13112,6 +13248,9 @@ class GatewayRunner:
                     metadata=_thread_metadata,
                 )
 
+        except asyncio.CancelledError:
+            logger.warning("Background task %s cancelled during gateway shutdown", task_id)
+            raise
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:

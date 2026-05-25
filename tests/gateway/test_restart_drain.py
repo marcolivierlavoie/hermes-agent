@@ -160,12 +160,14 @@ async def test_request_restart_is_idempotent():
 
 
 @pytest.mark.asyncio
-async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
+async def test_launch_detached_restart_command_uses_bounded_python_watcher(monkeypatch, tmp_path):
     runner, _adapter = make_restart_runner()
     popen_calls = []
 
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["/usr/bin/hermes"])
     monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setenv("HERMES_DETACHED_RESTART_MAX_WAIT", "3")
     monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/setsid" if cmd == "setsid" else None)
 
     def fake_popen(cmd, **kwargs):
@@ -178,12 +180,41 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
 
     assert len(popen_calls) == 1
     cmd, kwargs = popen_calls[0]
-    assert cmd[:2] == ["/usr/bin/setsid", "bash"]
-    assert "gateway restart" in cmd[-1]
-    assert "kill -0 321" in cmd[-1]
+    assert cmd[0] == "/usr/bin/setsid"
+    assert cmd[1:4] == [gateway_run.sys.executable, "-c", cmd[3]]
+    assert "max wait exceeded" in cmd[3]
+    assert "ready marker detected" in cmd[3]
+    assert cmd[4:8] == ["321", "3.0", str(tmp_path / ".restart_ready.321"), str(tmp_path / "logs" / "gateway-restart-watcher.log")]
+    assert cmd[-3:] == ["/usr/bin/hermes", "gateway", "restart"]
     assert kwargs["start_new_session"] is True
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
+
+
+def test_detached_restart_ready_marker_and_force_exit(monkeypatch, tmp_path):
+    runner, _adapter = make_restart_runner()
+    exits = []
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 654)
+    monkeypatch.setattr(gateway_run.os, "_exit", lambda code: exits.append(code))
+
+    runner._mark_detached_restart_ready()
+    assert (tmp_path / ".restart_ready.654").exists()
+
+    runner._force_exit_after_clean_detached_restart()
+    assert exits == [0]
+
+
+def test_load_detached_restart_max_wait_prefers_env(monkeypatch):
+    monkeypatch.setenv("HERMES_DETACHED_RESTART_MAX_WAIT", "4.5")
+    assert gateway_run.GatewayRunner._load_detached_restart_max_wait() == 4.5
+
+    monkeypatch.setenv("HERMES_DETACHED_RESTART_MAX_WAIT", "invalid")
+    assert (
+        gateway_run.GatewayRunner._load_detached_restart_max_wait()
+        == gateway_run.DEFAULT_GATEWAY_DETACHED_RESTART_MAX_WAIT
+    )
 
 
 # ── Shutdown notification tests ──────────────────────────────────────
