@@ -85,12 +85,12 @@ def test_run_slash_no_args_shows_usage(kanban_home):
 def test_run_slash_create_and_list(kanban_home):
     out = kc.run_slash("create 'ship feature' --assignee alice")
     assert "Created" in out
-    assert "K-0001" in out
+    assert "BIF-001" in out
     assert "t_" not in out
     out = kc.run_slash("list")
     assert "ship feature" in out
     assert "alice" in out
-    assert "K-0001" in out
+    assert "BIF-001" in out
     assert "t_" not in out
 
 
@@ -103,17 +103,17 @@ def test_run_slash_create_defaults_to_captured_triage(kanban_home):
 
 def test_run_slash_show_accepts_simple_id_and_hides_internal_id(kanban_home):
     out = kc.run_slash("create 'simple ids' --assignee alice")
-    assert "K-0001" in out
-    show = kc.run_slash("show K-0001")
-    assert "Task K-0001: simple ids" in show
+    assert "BIF-001" in out
+    show = kc.run_slash("show BIF-001")
+    assert "Task BIF-001: simple ids" in show
     assert "t_" not in show
 
 
 def test_run_slash_json_uses_simple_id(kanban_home):
     out = kc.run_slash("create 'json simple id' --assignee alice --json")
     payload = json.loads(out)
-    assert payload["id"] == "K-0001"
-    assert payload["display_id"] == "K-0001"
+    assert payload["id"] == "BIF-001"
+    assert payload["display_id"] == "BIF-001"
     assert "internal_id" not in payload
     assert not any(isinstance(v, str) and v.startswith("t_") for v in payload.values())
 
@@ -144,7 +144,7 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
     out1 = kc.run_slash("create 'parent' --assignee alice --ready")
     # Extract the "t_xxxx" id from "Created t_xxxx (ready, ...)"
     import re
-    m = re.search(r"(K-\d{4})", out1)
+    m = re.search(r"(BIF-\d{3,})", out1)
     assert m
     p = m.group(1)
     out2 = kc.run_slash(f"create 'child' --assignee bob --parent {p} --ready")
@@ -160,7 +160,7 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
 def test_run_slash_show_includes_comments(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
-    tid = re.search(r"(K-\d{4})", out).group(1)
+    tid = re.search(r"(BIF-\d{3,})", out).group(1)
     kc.run_slash(f"comment {tid} 'remember to include performance section'")
     show = kc.run_slash(f"show {tid}")
     assert "performance section" in show
@@ -169,7 +169,7 @@ def test_run_slash_show_includes_comments(kanban_home):
 def test_run_slash_comment_max_len_trims_long_body(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
-    tid = re.search(r"(K-\d{4})", out).group(1)
+    tid = re.search(r"(BIF-\d{3,})", out).group(1)
     kc.run_slash(f"comment {tid} '{'x' * 30}' --max-len 20")
     show = kc.run_slash(f"show {tid}")
     assert "trimmed to 20 chars by --max-len" in show
@@ -179,7 +179,7 @@ def test_run_slash_comment_max_len_trims_long_body(kanban_home):
 def test_run_slash_block_unblock_cycle(kanban_home):
     out = kc.run_slash("create 'x' --assignee alice --ready")
     import re
-    tid = re.search(r"(K-\d{4})", out).group(1)
+    tid = re.search(r"(BIF-\d{3,})", out).group(1)
     # Claim first so block() finds it running
     kc.run_slash(f"claim {tid}")
     assert "Blocked" in kc.run_slash(f"block {tid} 'need decision'")
@@ -204,7 +204,7 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
 def test_run_slash_context_output_format(kanban_home):
     out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
     import re
-    tid = re.search(r"(K-\d{4})", out).group(1)
+    tid = re.search(r"(BIF-\d{3,})", out).group(1)
     kc.run_slash(f"comment {tid} 'remember to include performance section'")
     ctx = kc.run_slash(f"context {tid}")
     assert "tech spec" in ctx
@@ -272,7 +272,7 @@ def test_run_slash_usage_error_returns_message(kanban_home):
 def test_run_slash_assign_reassigns(kanban_home):
     out = kc.run_slash("create 'x' --assignee alice --ready")
     import re
-    tid = re.search(r"(K-\d{4})", out).group(1)
+    tid = re.search(r"(BIF-\d{3,})", out).group(1)
     assert "Assigned" in kc.run_slash(f"assign {tid} bob")
     show = kc.run_slash(f"show {tid}")
     assert "bob" in show
@@ -282,8 +282,8 @@ def test_run_slash_link_unlink(kanban_home):
     a = kc.run_slash("create 'a' --ready")
     b = kc.run_slash("create 'b' --ready")
     import re
-    ta = re.search(r"(K-\d{4})", a).group(1)
-    tb = re.search(r"(K-\d{4})", b).group(1)
+    ta = re.search(r"(BIF-\d{3,})", a).group(1)
+    tb = re.search(r"(BIF-\d{3,})", b).group(1)
     assert "Linked" in kc.run_slash(f"link {ta} {tb}")
     # After link, b is todo
     show = kc.run_slash(f"show {tb}")
@@ -356,7 +356,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     from hermes_cli import kanban_db as kb
 
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
-    m = re.search(r"(K-\d{4})", out1)
+    m = re.search(r"(BIF-\d{3,})", out1)
     assert m
     tid = m.group(1)
 
@@ -396,7 +396,7 @@ def test_run_slash_reassign_with_reclaim_flag(kanban_home):
     from hermes_cli import kanban_db as kb
 
     out1 = kc.run_slash("create 'switch model' --assignee orig")
-    m = re.search(r"(K-\d{4})", out1)
+    m = re.search(r"(BIF-\d{3,})", out1)
     tid = m.group(1)
 
     # Simulate a running claim.
@@ -440,7 +440,7 @@ def test_run_slash_specify_end_to_end(kanban_home, monkeypatch):
     # Create a triage task via the same slash surface.
     create_out = kc.run_slash("create 'rough idea' --triage")
     import re
-    m = re.search(r"(K-\d{4})", create_out)
+    m = re.search(r"(BIF-\d{3,})", create_out)
     assert m, f"no task id in: {create_out!r}"
     tid = m.group(1)
 

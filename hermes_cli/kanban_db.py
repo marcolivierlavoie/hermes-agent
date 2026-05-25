@@ -1309,14 +1309,14 @@ def write_txn(conn: sqlite3.Connection):
 # ID generation
 # ---------------------------------------------------------------------------
 
-_DISPLAY_ID_PREFIX = "K"
-_DISPLAY_ID_RE = re.compile(r"^K-?0*(\d+)$", re.IGNORECASE)
+_DISPLAY_ID_PREFIX = "BIF"
+_DISPLAY_ID_RE = re.compile(r"^(?:BIF|K)-?0*(\d+)$", re.IGNORECASE)
 _DISPLAY_ID_SEQUENCE = "task_display_id"
 
 
 def format_display_id(n: int) -> str:
     """Return the canonical human-facing Kanban id for a sequence number."""
-    return f"{_DISPLAY_ID_PREFIX}-{int(n):04d}"
+    return f"{_DISPLAY_ID_PREFIX}-{int(n):03d}"
 
 
 def normalize_display_id(value: Optional[str]) -> Optional[str]:
@@ -1361,9 +1361,14 @@ def _ensure_display_ids(conn: sqlite3.Connection) -> None:
         n = _display_id_number(r["display_id"])
         if n is not None:
             max_seen = max(max_seen, n)
-            continue
-        next_n = max_seen + 1
-        display_id = format_display_id(next_n)
+            canonical = format_display_id(n)
+            if r["display_id"] == canonical:
+                continue
+            display_id = canonical
+            next_n = n
+        else:
+            next_n = max_seen + 1
+            display_id = format_display_id(next_n)
         while display_id in used:
             next_n += 1
             display_id = format_display_id(next_n)

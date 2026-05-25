@@ -57,8 +57,8 @@ def test_create_task_no_parents_is_ready(kanban_home):
         tid = kb.create_task(conn, title="ship it", assignee="alice")
         t = kb.get_task(conn, tid)
     assert t is not None
-    assert t.display_id == "K-0001"
-    assert kb.get_task(conn, "K-0001") is not None
+    assert t.display_id == "BIF-001"
+    assert kb.get_task(conn, "BIF-001") is not None
     assert t.status == "ready"
     assert t.assignee == "alice"
     assert t.workspace_kind == "scratch"
@@ -68,10 +68,10 @@ def test_display_ids_are_stable_and_sequential(kanban_home):
     with kb.connect() as conn:
         first = kb.create_task(conn, title="first")
         second = kb.create_task(conn, title="second")
-        assert kb.get_task(conn, first).display_id == "K-0001"
-        assert kb.get_task(conn, second).display_id == "K-0002"
+        assert kb.get_task(conn, first).display_id == "BIF-001"
+        assert kb.get_task(conn, second).display_id == "BIF-002"
         assert kb.resolve_task_id(conn, "k2") == second
-        assert kb.resolve_task_id(conn, "K-0002") == second
+        assert kb.resolve_task_id(conn, "BIF-002") == second
 
 
 def test_init_backfills_display_ids_for_legacy_tasks(tmp_path, monkeypatch):
@@ -113,10 +113,10 @@ def test_init_backfills_display_ids_for_legacy_tasks(tmp_path, monkeypatch):
     with kb.connect(db) as conn:
         one = kb.get_task(conn, "t_legacy1")
         two = kb.get_task(conn, "t_legacy2")
-        assert one.display_id == "K-0001"
-        assert two.display_id == "K-0002"
+        assert one.display_id == "BIF-001"
+        assert two.display_id == "BIF-002"
         new = kb.create_task(conn, title="new")
-        assert kb.get_task(conn, new).display_id == "K-0003"
+        assert kb.get_task(conn, new).display_id == "BIF-003"
 
 
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
