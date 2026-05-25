@@ -13155,13 +13155,21 @@ class GatewayRunner:
             try:
                 payload = json.loads(stdout) if stdout else {}
             except Exception:
-                payload = {}
+                payload = None
             role_status = "done" if returncode == 0 else "blocked"
             elapsed = None
             session_id = ""
             if isinstance(payload, dict):
                 elapsed = payload.get("elapsed_seconds")
                 session_id = str(payload.get("session_id") or "").strip()
+
+            role_output = ""
+            stderr_tail = stderr[-1000:]
+            if isinstance(payload, dict):
+                role_output = str(payload.get("stdout") or "").strip()
+                stderr_tail = str(payload.get("stderr_tail") or stderr_tail or "").strip()
+            elif stdout:
+                role_output = stdout
 
             details: list[str] = []
             if elapsed not in (None, ""):
@@ -13172,18 +13180,23 @@ class GatewayRunner:
                 details.append(f"session `{session_id}`")
             detail_suffix = f" ({', '.join(details)})" if details else ""
 
-            # Keep progress/lifecycle noise and raw worker stdout/stderr out of
-            # the command-room channel (#hermes), but close the loop with Marco
-            # there when the background role finishes. biff_role_invoke.py sends
-            # terse lifecycle events to #biff-ops and full detail to the role's
-            # raw channel.
+            recap = self._format_specialist_direct_completion_recap(
+                role=role,
+                task_id=task_id,
+                role_status=role_status,
+                detail_suffix=detail_suffix,
+                role_output=role_output,
+                stderr_tail=stderr_tail,
+            )
+            # Keep progress/lifecycle noise out of the command-room channel
+            # (#hermes), but restore the high-signal completion recap there when
+            # the background role finishes. biff_role_invoke.py sends terse
+            # lifecycle events to #biff-ops and full raw detail to the role's
+            # channel; #hermes gets the role's actual conclusion plus a next
+            # step instead of a generic pointer.
             await adapter.send(
                 source.chat_id,
-                (
-                    f"{role.title()} background task `{task_id}` {role_status}{detail_suffix}.\n\n"
-                    f"Lifecycle: #biff-ops. Full worker detail: #{role}. "
-                    "#hermes stays free for new questions and decisions."
-                ),
+                recap,
                 metadata=_thread_metadata,
             )
             logger.info(
@@ -13210,6 +13223,52 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
+
+    @staticmethod
+    def _format_specialist_direct_completion_recap(
+        *,
+        role: str,
+        task_id: str,
+        role_status: str,
+        detail_suffix: str = "",
+        role_output: str = "",
+        stderr_tail: str = "",
+    ) -> str:
+        """Return the Marco-facing recap for a completed direct role lane.
+
+        Direct specialist lanes are intentionally nonblocking, but completion
+        must still come back to the command room with the role's real conclusion
+        and a useful next step. The role channel remains the raw transcript;
+        this recap is capped to keep Discord readable.
+        """
+
+        role_title = role.title()
+        header = f"{role_title} background task `{task_id}` {role_status}{detail_suffix}."
+        output = "\n".join(str(role_output or "").strip().splitlines()).strip()
+        stderr = "\n".join(str(stderr_tail or "").strip().splitlines()).strip()
+        sections: list[str] = [header]
+        if role_status == "done":
+            if output:
+                if len(output) > 1800:
+                    output = output[:1790].rstrip() + "…"
+                sections.append(f"**Recap from {role_title}:**\n{output}")
+            else:
+                sections.append(f"**Recap from {role_title}:** Completed, but returned no written summary.")
+            sections.append(
+                "**Next step:** Biff should use this result to decide whether Vex verification, "
+                "a commit/deploy, a Kanban closeout, or a follow-up question is needed."
+            )
+        else:
+            blocker = stderr or output or "No worker diagnostic was returned."
+            if len(blocker) > 1200:
+                blocker = blocker[:1190].rstrip() + "…"
+            sections.append(f"**Blocker from {role_title}:**\n{blocker}")
+            sections.append(
+                "**Next step:** Biff should inspect the role output, then retry, split the work, "
+                "or ask Marco only if there is a real human blocker."
+            )
+        sections.append(f"Lifecycle: #biff-ops. Full raw worker detail: #{role}.")
+        return "\n\n".join(sections)
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.

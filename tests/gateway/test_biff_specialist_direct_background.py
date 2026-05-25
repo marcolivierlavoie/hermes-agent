@@ -62,13 +62,12 @@ def test_specialist_direct_progress_does_not_post_to_command_room_but_completion
     completion_block = source[source.index("role_status = "):source.index("        except Exception as e:", source.index("role_status = "))]
 
     assert "await adapter.send" not in progress_block
-    assert "close the loop with Marco" in completion_block
-    assert "raw worker stdout/stderr out" in completion_block
+    assert "restore the high-signal completion recap" in completion_block
+    assert "#hermes gets the role's actual conclusion plus a next" in completion_block
     assert "await adapter.send" in completion_block
-    assert 'f"{role.title()} background task `{task_id}` {role_status}{detail_suffix}' in completion_block
+    assert "_format_specialist_direct_completion_recap" in completion_block
     assert 'role_status = "done" if returncode == 0 else "blocked"' in completion_block
     assert "body =" not in completion_block
-    assert "stdout or stderr" not in completion_block
     assert marker in completion_block
 
 
@@ -109,11 +108,39 @@ async def test_specialist_direct_timeout_progress_does_not_send_to_hermes_but_co
     assert chat_id == "hermes-channel"
     assert "Forge background task `forge_123` done" in message
     assert "elapsed" not in message
-    assert "verified evidence from Forge" not in message
+    assert "**Recap from Forge:**" in message
+    assert "verified evidence from Forge" in message
+    assert "**Next step:**" in message
+    assert "Vex verification" in message
     assert "Lifecycle: #biff-ops" in message
-    assert "Full worker detail: #forge" in message
-    assert "#hermes stays free" in message
+    assert "Full raw worker detail: #forge" in message
     assert wait_for_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_specialist_direct_completion_falls_back_to_non_json_stdout(monkeypatch):
+    runner = GatewayRunner(GatewayConfig())
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner.adapters[Platform.DISCORD] = cast(Any, adapter)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="hermes-channel", user_id="marco")
+
+    async def fake_executor(_run_sync):
+        return subprocess.CompletedProcess(
+            args=["biff_role_invoke.py"],
+            returncode=0,
+            stdout="plain-text role recap",
+            stderr="",
+        )
+
+    monkeypatch.setattr(runner, "_run_in_executor_with_context", fake_executor)
+
+    await runner._run_specialist_direct_background_task("forge", "do work", source, "forge_plain")
+
+    assert adapter.send.await_count == 1
+    _chat_id, message = adapter.send.await_args.args[:2]
+    assert "Forge background task `forge_plain` done" in message
+    assert "plain-text role recap" in message
+    assert "Completed, but returned no written summary" not in message
 
 
 @pytest.mark.asyncio
