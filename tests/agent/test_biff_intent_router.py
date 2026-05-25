@@ -136,6 +136,22 @@ def test_short_follow_up_actions_continue_prior_work_context():
         assert route.allow_bundle_selection is True
 
 
+def test_refresh_resume_routes_to_context_recovery_without_kanban_assumption():
+    for prompt in (
+        "the chat refreshed again so I can't see your progress",
+        "where did we leave off?",
+        "pick up the non-Kanban thing",
+        "resume",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action == "resume_context"
+        assert plan.runtime == "context_resume"
+        assert plan.toolset_profile == "resume"
+        assert plan.allow_bundle_selection is False
+        assert plan.max_live_tool_calls == 3
+
+
 def test_action_follow_up_with_extra_question_routes_to_implementation_lane():
     route = route_biff_live_intent("do it. Btw I do see that it hit the OpenAI API. could mini be too weak?")
 
@@ -193,6 +209,28 @@ def test_explicit_forge_request_routes_to_named_specialist():
     assert plan.allow_bundle_selection is False
     assert plan.background is True
     assert plan.specialist == "forge"
+
+
+def test_stop_forge_stays_in_biff_controller_not_forge():
+    plan = plan_biff_turn("Can you stop Forge please?")
+
+    assert plan.action == "one_tool"
+    assert plan.allow_bundle_selection is False
+    assert plan.background is False
+    assert plan.specialist is None
+
+
+def test_review_message_for_forge_does_not_dispatch_to_forge():
+    plan = plan_biff_turn(
+        "So I have a message for Forge can you read it before sending it to him: "
+        "Do not run hermes gateway restart."
+    )
+
+    assert plan.action == "answer_now"
+    assert plan.allow_bundle_selection is False
+    assert plan.background is False
+    assert plan.specialist is None
+
 
 def test_explicit_ranger_correction_does_not_route_to_forge_direct_lane():
     plan = plan_biff_turn("this is a task for ranger, not forge")

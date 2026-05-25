@@ -231,6 +231,22 @@ HARDLINE_PATTERNS_COMPILED = [
     for pattern, description in HARDLINE_PATTERNS
 ]
 
+# Biff role workers run out-of-band from the live #hermes controller. A role
+# process that restarts the gateway/dashboard can kill the supervising chat turn
+# or create launchd split-brain while other role work is still running. These
+# commands are therefore hard-blocked only for direct Biff role profiles; the
+# controller/user may still perform an explicit approved restart outside a role
+# worker.
+BIFF_ROLE_SERVICE_RESTART_PATTERNS = [
+    (r'\bhermes\s+gateway\s+(stop|restart)\b', "Biff role attempted hermes gateway stop/restart"),
+    (r'(?:^|[\s;&|])(?:\S*/)?restart-hermes-(?:gateway|dashboard)\.sh\b', "Biff role attempted Hermes restart wrapper"),
+    (r'\blaunchctl\s+[^\n]*(?:kickstart\s+-k|bootout|disable|remove)\s+[^\n]*(?:ai\.hermes\.(?:gateway|dashboard))\b', "Biff role attempted Hermes LaunchDaemon restart/stop"),
+]
+BIFF_ROLE_SERVICE_RESTART_PATTERNS_COMPILED = [
+    (re.compile(pattern, _RE_FLAGS), description)
+    for pattern, description in BIFF_ROLE_SERVICE_RESTART_PATTERNS
+]
+
 
 # =========================================================================
 # Sudo stdin guard — block password guessing via "sudo -S"
@@ -274,6 +290,17 @@ def detect_hardline_command(command: str) -> tuple:
     """
     normalized = _normalize_command_for_detection(command).lower()
     for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
+        if pattern_re.search(normalized):
+            return (True, description)
+    return (False, None)
+
+
+def detect_biff_role_service_restart(command: str) -> tuple:
+    """Block service restarts from direct Biff role workers only."""
+    if not os.getenv("HERMES_BIFF_DIRECT_ROLE"):
+        return (False, None)
+    normalized = _normalize_command_for_detection(command).lower()
+    for pattern_re, description in BIFF_ROLE_SERVICE_RESTART_PATTERNS_COMPILED:
         if pattern_re.search(normalized):
             return (True, description)
     return (False, None)
@@ -1061,6 +1088,12 @@ def check_all_command_guards(command: str, env_type: str,
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
+
+    is_role_restart, role_restart_desc = detect_biff_role_service_restart(command)
+    if is_role_restart:
+        logger.warning("Biff role service-restart block: %s (command: %s)",
+                       role_restart_desc, command[:200])
+        return _hardline_block_result(role_restart_desc)
 
     # == Sudo stdin guard ==
     # Like the hardline floor above, this is unconditional: there is never a

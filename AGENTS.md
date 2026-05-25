@@ -837,8 +837,8 @@ kanban task.
   task also get `kanban_list` and `kanban_unblock` for board routing.
 - **Dispatcher:** long-lived loop that (default every 60s) reclaims
   stale claims, promotes ready tasks, atomically claims, and spawns
-  assigned profiles. Runs **inside the gateway** by default via
-  `kanban.dispatch_in_gateway: true`.
+  assigned profiles. It can run inside the gateway when explicitly
+  enabled via `kanban.dispatch_in_gateway: true`; the default is false.
 - **Plugin assets:** `plugins/kanban/dashboard/` (web UI) +
   `plugins/kanban/systemd/` (`hermes-kanban-dispatcher.service` for
   standalone dispatcher deployment).

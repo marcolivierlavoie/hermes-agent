@@ -229,6 +229,7 @@ BIFF_TURN_TOOLSET_PROFILES: dict[str, frozenset[str]] = {
     "none": frozenset(),
     "status": frozenset({"terminal", "file", "kanban"}),
     "kanban": frozenset({"kanban", "terminal"}),
+    "resume": frozenset({"session_search", "terminal", "file", "kanban"}),
     "secondbrain": frozenset({"terminal", "file"}),
     "web": frozenset({"web", "search", "browser", "terminal", "file"}),
     "base": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
@@ -403,6 +404,8 @@ def resolve_biff_live_tool_guardrail_settings(
         tool_default = 4
     elif route_action == "one_tool":
         tool_default = 2
+    elif route_action == "resume_context":
+        tool_default = 3
     elif route_action == "answer_now":
         tool_default = 1
     else:

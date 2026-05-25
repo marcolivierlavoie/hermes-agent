@@ -14,9 +14,10 @@ def test_forge_direct_instruction_preserves_user_request_and_contract():
     assert "preferring rg and bounded paths" in message
     assert "Run focused tests" in message
     assert "rebuild the web bundle" in message
-    assert "verify the live UI" in message
+    assert "served source/UI" in message
     assert "Do not report the task as done until build/restart/live verification steps" in message
-    assert "Restart the Hermes gateway only when runtime changes need it" in message
+    assert "Do not restart the Hermes gateway/dashboard from a role lane" in message
+    assert "direct launchctl/health probes, not restart wrapper scripts" in message
     assert "Use Vex, Quill, Ranger, or other specialists only when the task actually needs their role" in message
     assert "Do not call kanban_show with no task_id" in message
 

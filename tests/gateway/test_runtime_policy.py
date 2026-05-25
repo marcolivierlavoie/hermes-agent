@@ -48,6 +48,27 @@ def test_gateway_runtime_policy_accepts_venv_python_symlink_resolving_outside_ve
     assert gateway_runtime_policy_violations(diag) == []
 
 
+def test_gateway_runtime_policy_accepts_symlinked_canonical_venv_target(tmp_path):
+    runtime = tmp_path / "hermes-agent-biff-runtime"
+    shared_runtime = tmp_path / "hermes-agent"
+    canonical_venv = runtime / "venv"
+    shared_venv = shared_runtime / "venv"
+    real_python = tmp_path / "Python.framework" / "Versions" / "Current" / "bin" / "python3"
+    shared_venv.mkdir(parents=True)
+    real_python.parent.mkdir(parents=True)
+    real_python.write_text("", encoding="utf-8")
+    runtime.mkdir(parents=True)
+    canonical_venv.symlink_to(shared_venv, target_is_directory=True)
+
+    diag = _diag(runtime, canonical_venv)
+    diag["virtual_env"] = str(shared_venv)
+    diag["virtual_env_resolved"] = str(shared_venv.resolve())
+    diag["sys_executable"] = str(shared_venv / "bin" / "python")
+    diag["sys_executable_resolved"] = str(real_python.resolve())
+
+    assert gateway_runtime_policy_violations(diag) == []
+
+
 def test_gateway_runtime_policy_rejects_old_split_brain_virtualenv(tmp_path):
     runtime = tmp_path / "hermes-agent-biff-runtime"
     old_runtime = tmp_path / "hermes-agent"

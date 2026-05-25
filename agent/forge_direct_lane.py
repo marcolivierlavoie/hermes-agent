@@ -37,8 +37,8 @@ def build_forge_direct_instruction(user_request: Any) -> str:
         - Inspect the code/config first with narrow searches, preferring rg and bounded paths.
         - Make the smallest coherent change; do not revert unrelated user work.
         - Run focused tests or operational checks that match the changed surface.
-        - For dashboard/frontend changes, rebuild the web bundle, restart the dashboard if it serves built assets, and verify the live UI/source being served.
-        - Restart the Hermes gateway only when runtime changes need it, then verify the service state.
+        - For dashboard/frontend changes, rebuild the web bundle and verify the served source/UI without restarting services unless the user explicitly approved a restart in the current thread.
+        - Do not restart the Hermes gateway/dashboard from a role lane. Service restarts require explicit Biff/controller approval for the current task and must use the system LaunchDaemon path only; status checks must use direct launchctl/health probes, not restart wrapper scripts.
         - Do not report the task as done until build/restart/live verification steps have either passed or you have named the specific blocker.
         - Ask Marco only for a true human blocker or a very high-risk decision.
         - Use Vex, Quill, Ranger, or other specialists only when the task actually needs their role.

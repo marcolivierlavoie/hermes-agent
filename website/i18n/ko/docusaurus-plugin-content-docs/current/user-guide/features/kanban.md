@@ -71,7 +71,7 @@ Hermes Kanban은 모든 Hermes 프로필이 함께 쓰는 **지속형 작업 보
   - `scratch` (기본값) — `~/.hermes/kanban/workspaces/<id>/` 아래의 새 tmp 디렉터리 (non-default board는 board 경로 아래)
   - `dir:<path>` — 기존 공유 디렉터리. **절대경로만 허용**됩니다.
   - `worktree` — 코딩 task를 위한 git worktree (`.worktrees/<id>/`)
-- **Dispatcher** — 주기적으로 stale claim 회수, crashed worker 정리, ready task 승격, atomic claim, assigned profile spawn을 수행하는 장기 실행 루프. 기본적으로 gateway 내부(`kanban.dispatch_in_gateway: true`)에서 동작합니다.
+- **Dispatcher** — 주기적으로 stale claim 회수, crashed worker 정리, ready task 승격, atomic claim, assigned profile spawn을 수행하는 장기 실행 루프. `kanban.dispatch_in_gateway: true`로 명시적으로 활성화하면 gateway 내부에서 동작하지만, 기본값은 false입니다.
 - **Tenant** — board 내부의 선택적 namespace. 예를 들어 하나의 specialist fleet가 여러 고객사를 처리할 때 `--tenant business-a`처럼 사용합니다. tenant는 soft filter이고, board가 hard isolation boundary입니다.
 
 ## Boards (멀티 프로젝트) {#boards-multi-project}

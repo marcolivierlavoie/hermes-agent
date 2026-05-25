@@ -156,6 +156,14 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         max_tool_calls=16,
     ),
     SyntheticScenario(
+        name="refresh_resume_context_recovery",
+        prompt="The chat refreshed again so I can't see your progress; where did we leave off?",
+        expected_action="resume_context",
+        expected_runtime="context_resume",
+        expected_toolsets=("file", "kanban", "session_search", "terminal"),
+        max_tool_calls=3,
+    ),
+    SyntheticScenario(
         name="broad_slow_work",
         prompt="Archive every old Linear story and scan the entire Obsidian workspace for references before updating the board.",
         expected_action="ranger_direct",
@@ -210,7 +218,7 @@ def run_synthetic_checks(
 
     config = config or {"biff": {"platforms": {"discord": {"tool_schema_profile": "v3"}}}}
     configured = sorted(
-        {str(t) for t in (configured_toolsets or ("terminal", "file", "memory", "skills", "skills-read", "todo", "kanban", "web", "search", "delegation", "code_execution", "vision")) if str(t).strip()}
+        {str(t) for t in (configured_toolsets or ("terminal", "file", "memory", "skills", "skills-read", "todo", "kanban", "session_search", "web", "search", "delegation", "code_execution", "vision")) if str(t).strip()}
     )
     wanted = _scenario_names(scenario_names)
     results: list[SyntheticCheckResult] = []

@@ -106,20 +106,30 @@ def gateway_runtime_policy_violations(diag: dict[str, Any] | None = None) -> lis
             f"cwd {diag.get('cwd')} does not match canonical runtime {diag.get('canonical_runtime_dir')}"
         )
 
-    if diag.get("virtual_env") != venv_raw:
+    virtual_env_raw = diag.get("virtual_env")
+    virtual_env_resolved = diag.get("virtual_env_resolved")
+    virtual_env_matches_raw = virtual_env_raw == venv_raw
+    virtual_env_matches_resolved = bool(
+        venv_resolved and virtual_env_resolved and virtual_env_resolved == venv_resolved
+    )
+    if not (virtual_env_matches_raw or virtual_env_matches_resolved):
         violations.append(
             f"VIRTUAL_ENV {diag.get('virtual_env')} does not match canonical venv {venv_raw}"
         )
 
     executable_raw = diag.get("sys_executable")
     executable_resolved = diag.get("sys_executable_resolved")
-    # Virtualenv Python shims can be symlinks that resolve outside the apparent
-    # venv (for example to a framework/Homebrew Python).  Accept either the raw
-    # argv path inside the canonical venv or the fully-resolved path inside the
-    # resolved venv; reject only when both views point elsewhere.
+    # Runtime venvs can be symlinks, and virtualenv Python shims can themselves
+    # resolve outside the apparent venv (for example to a framework/Homebrew
+    # Python).  Accept either raw or resolved executable paths under either the
+    # canonical venv path or its resolved target; reject only when all views point
+    # elsewhere.
     executable_in_raw_venv = _is_relative_to(str(executable_raw), str(venv_raw))
+    executable_raw_in_resolved_venv = _is_relative_to(str(executable_raw), str(venv_resolved))
     executable_in_resolved_venv = _is_relative_to(str(executable_resolved), str(venv_resolved))
-    if venv_resolved and executable_resolved and not (executable_in_raw_venv or executable_in_resolved_venv):
+    if venv_resolved and executable_resolved and not (
+        executable_in_raw_venv or executable_raw_in_resolved_venv or executable_in_resolved_venv
+    ):
         violations.append(
             f"Python executable {diag.get('sys_executable')} is not inside canonical venv {venv_raw}"
         )

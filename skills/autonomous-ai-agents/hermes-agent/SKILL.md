@@ -693,8 +693,8 @@ sessions still have zero `kanban_*` schema footprint unless configured.
   `kanban_link`; profiles that explicitly enable the `kanban` toolset
   outside a dispatcher-spawned task also get `kanban_list` and
   `kanban_unblock` for board routing.
-- **Dispatcher** runs inside the gateway by default
-  (`kanban.dispatch_in_gateway: true`) — reclaims stale claims,
+- **Dispatcher** can run inside the gateway when explicitly enabled
+  (`kanban.dispatch_in_gateway: true`; default is false) — reclaims stale claims,
   promotes ready tasks, atomically claims, spawns assigned profiles.
   Auto-blocks a task after `failure_limit` consecutive spawn failures
   (default 2; configurable via `kanban.failure_limit` or per-task

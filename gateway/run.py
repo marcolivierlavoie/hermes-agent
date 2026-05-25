@@ -3443,6 +3443,59 @@ class GatewayRunner:
         return mode
 
     @staticmethod
+    def _background_output_summary(output: str, *, exit_code: int | None, limit: int = 1200) -> str:
+        """Return a chat-safe summary of background process output.
+
+        Successful background completions should not dump raw stdout/stderr into
+        #hermes. Failures still need enough diagnostic context to be actionable,
+        but only as a bounded tail with obvious truncation.
+        """
+        from tools.ansi_strip import strip_ansi
+
+        raw = strip_ansi(output or "").strip()
+        if exit_code in {0, None}:
+            if not raw:
+                return "No output captured."
+            line_count = len(raw.splitlines())
+            return f"Output captured ({line_count} line{'s' if line_count != 1 else ''}); open the process log for details."
+        if not raw:
+            return "No failure output captured."
+        if len(raw) <= limit:
+            return raw
+        tail = raw[-limit:]
+        nl = tail.find("\n")
+        if nl != -1:
+            tail = tail[nl + 1 :]
+        return f"[… output truncated — showing last {len(tail)} chars]\n{tail}"
+
+    @classmethod
+    def _background_completion_message(
+        cls,
+        session_id: str,
+        *,
+        exit_code: int | None,
+        command: str | None,
+        output: str,
+        agent_event: bool,
+    ) -> str:
+        """Build a concise background completion notification.
+
+        ``agent_event`` wraps the text for synthetic internal handling; either
+        way the payload stays summary-first and avoids raw successful diffs/code.
+        """
+        status = "completed" if exit_code in {0, None} else "failed"
+        summary = cls._background_output_summary(output, exit_code=exit_code)
+        command_line = f"\nCommand: {command}" if command else ""
+        body = (
+            f"Background process {session_id} {status} (exit code {exit_code})."
+            f"{command_line}\n"
+            f"Summary: {summary}"
+        )
+        if agent_event:
+            return f"[IMPORTANT: {body}]"
+        return f"[{body}]"
+
+    @staticmethod
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
@@ -4824,9 +4877,9 @@ class GatewayRunner:
         asyncio.create_task(self._kanban_notifier_watcher())
 
         # Start background kanban dispatcher — spawns workers for ready
-        # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
-        # When false, users run `hermes kanban daemon` externally or
-        # simply don't use kanban; this loop becomes a no-op.
+        # tasks only when `kanban.dispatch_in_gateway` is explicitly enabled.
+        # Default is false; users run `hermes kanban daemon` externally or
+        # simply don't use kanban, and this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
 
         # Start background reconnection watcher for platforms that failed at startup
@@ -8316,6 +8369,23 @@ class GatewayRunner:
                     _biff_live_route.max_live_tool_calls,
                     _biff_live_route.allow_bundle_selection,
                 )
+                if _biff_live_route.action == "resume_context":
+                    try:
+                        from agent.biff_continuation_context import build_resume_context_injection
+
+                        _resume_injection = build_resume_context_injection(
+                            _original_text,
+                            session_key=_quick_key,
+                        )
+                        if _resume_injection:
+                            event.text = _resume_injection
+                            logger.info(
+                                "biff_resume_context_injected: platform=%s session=%s",
+                                source.platform.value if source.platform else "gateway",
+                                _quick_key,
+                            )
+                    except Exception as _resume_exc:
+                        logger.debug("Biff resume context injection skipped: %s", _resume_exc)
                 _selection = None
                 if _biff_live_route.action in {"forge_direct", "ranger_direct", "quill_direct", "vex_direct"}:
                     _specialist_role = _biff_live_route.action.removesuffix("_direct")
@@ -8353,8 +8423,8 @@ class GatewayRunner:
                                 _existing_task_id,
                             )
                             return (
-                                f"{_specialist_role.title()} is already working on that in the background. "
-                                f"Task `{_existing_task_id}` will report back here; I won’t start a duplicate copy."
+                                f"{_specialist_role.title()} is already handling that; "
+                                "I’ll keep chatting here and post progress in #biff-ops."
                             )
                         _task_id = f"{_specialist_role}_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
                         _task = asyncio.create_task(
@@ -8380,9 +8450,8 @@ class GatewayRunner:
                             _task_id,
                         )
                         return (
-                            f"I handed this to {_specialist_role.title()} in the background so Discord stays usable. "
-                            f"Task `{_task_id}` will report back here with done/blocked evidence; "
-                            f"I won’t call it done until {_specialist_role.title()} verifies it."
+                            f"I’m sending this to {_specialist_role.title()} now; "
+                            "I’ll keep chatting here and post progress in #biff-ops."
                         )
                     _bundle_result = build_bundle_invocation_message(
                         FORGE_DIRECT_BUNDLE_KEY,
@@ -8511,6 +8580,21 @@ class GatewayRunner:
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
                 if _final_text.strip():
+                    try:
+                        from agent.biff_continuation_context import write_continuation_checkpoint
+
+                        _checkpoint_user_text = locals().get("_biff_original_text_for_deflection") or getattr(event, "text", "") or ""
+                        _checkpoint_route = locals().get("_biff_live_route")
+                        write_continuation_checkpoint(
+                            session_key=_quick_key,
+                            platform=source.platform.value if source.platform else "gateway",
+                            user_text=_checkpoint_user_text,
+                            assistant_text=_final_text,
+                            route_action=getattr(_checkpoint_route, "action", None),
+                            route_reason=getattr(_checkpoint_route, "reason", None),
+                        )
+                    except Exception as _checkpoint_exc:
+                        logger.debug("Biff continuation checkpoint write skipped: %s", _checkpoint_exc)
                     try:
                         session_entry = self.session_store.get_or_create_session(source)
                     except Exception:
@@ -13003,7 +13087,11 @@ class GatewayRunner:
         if not script.exists():
             await adapter.send(
                 source.chat_id,
-                f"❌ {role.title()} background task {task_id} failed: role invocation script is missing.",
+                (
+                    f"❌ {role.title()} background task `{task_id}` blocked before specialist launch.\n\n"
+                    f"Lifecycle: #biff-ops. Full worker detail: #{role}. "
+                    "Role invocation script is missing on the gateway host."
+                ),
                 metadata=_thread_metadata,
             )
             return
@@ -13022,6 +13110,8 @@ class GatewayRunner:
                 "discord",
                 "--toolsets",
                 specialist_toolsets,
+                "--issue",
+                task_id,
                 "--timeout",
                 os.getenv("HERMES_BIFF_FORGE_BACKGROUND_TIMEOUT", "900"),
             ]
@@ -13045,17 +13135,10 @@ class GatewayRunner:
                 except asyncio.TimeoutError:
                     update_count += 1
                     elapsed = int(time.monotonic() - started_at)
-                    try:
-                        await adapter.send(
-                            source.chat_id,
-                            (
-                                f"{role.title()} is still working on `{task_id}` in the background "
-                                f"({elapsed}s elapsed). I’ll post the result here when it finishes or blocks."
-                            ),
-                            metadata=_thread_metadata,
-                        )
-                    except Exception:
-                        logger.exception("%s background task %s progress update failed", role.title(), task_id)
+                    # Keep the command-room channel (#hermes) quiet during long
+                    # role runs. The role invocation script posts start/done or
+                    # blocked lifecycle events to #biff-ops, while raw role
+                    # channels keep the detailed black-box-recorder trail.
                     logger.info(
                         "biff_specialist_direct_background_progress: platform=%s role=%s task=%s elapsed=%s updates=%s",
                         source.platform.value if source.platform else "gateway",
@@ -13066,40 +13149,63 @@ class GatewayRunner:
                     )
             else:
                 result = await forge_task
-            stdout = (result.stdout or "").strip()
-            stderr = (result.stderr or "").strip()
+            returncode = int(getattr(result, "returncode", 1))
+            stdout = (getattr(result, "stdout", "") or "").strip()
+            stderr = (getattr(result, "stderr", "") or "").strip()
             try:
                 payload = json.loads(stdout) if stdout else {}
             except Exception:
                 payload = {}
-            role_status = "complete" if result.returncode == 0 else "failed"
-            body = ""
+            role_status = "done" if returncode == 0 else "blocked"
+            elapsed = None
+            session_id = ""
             if isinstance(payload, dict):
-                body = str(payload.get("stdout") or payload.get("stderr_tail") or "").strip()
-            if not body:
-                body = stdout or stderr or "[no Forge output]"
-            if len(body) > 1800:
-                body = body[:1770].rstrip() + "\n...[trimmed]"
+                elapsed = payload.get("elapsed_seconds")
+                session_id = str(payload.get("session_id") or "").strip()
+
+            details: list[str] = []
+            if elapsed not in (None, ""):
+                details.append(f"elapsed {elapsed}s")
+            if returncode != 0:
+                details.append(f"exit {returncode}")
+            if session_id:
+                details.append(f"session `{session_id}`")
+            detail_suffix = f" ({', '.join(details)})" if details else ""
+
+            # Keep progress/lifecycle noise and raw worker stdout/stderr out of
+            # the command-room channel (#hermes), but close the loop with Marco
+            # there when the background role finishes. biff_role_invoke.py sends
+            # terse lifecycle events to #biff-ops and full detail to the role's
+            # raw channel.
             await adapter.send(
                 source.chat_id,
-                f"{role.title()} background task {task_id} {role_status}.\n\n{body}",
+                (
+                    f"{role.title()} background task `{task_id}` {role_status}{detail_suffix}.\n\n"
+                    f"Lifecycle: #biff-ops. Full worker detail: #{role}. "
+                    "#hermes stays free for new questions and decisions."
+                ),
                 metadata=_thread_metadata,
             )
             logger.info(
-                "biff_specialist_direct_background_done: platform=%s role=%s task=%s exit=%s stdout_chars=%d stderr_chars=%d",
+                "biff_specialist_direct_background_done: platform=%s role=%s task=%s status=%s exit=%s stdout_chars=%d stderr_chars=%d",
                 source.platform.value if source.platform else "gateway",
                 role,
                 task_id,
-                result.returncode,
+                role_status,
+                returncode,
                 len(stdout),
                 len(stderr),
             )
         except Exception as e:
-            logger.exception("%s background task %s failed", role.title(), task_id)
+            logger.exception("%s background task %s blocked", role.title(), task_id)
             try:
                 await adapter.send(
                     source.chat_id,
-                    f"❌ {role.title()} background task {task_id} failed: {e}",
+                    (
+                        f"❌ {role.title()} background task `{task_id}` blocked before final relay.\n\n"
+                        f"Lifecycle: #biff-ops. Full worker detail: #{role}. "
+                        "Check gateway logs for the internal exception."
+                    ),
                     metadata=_thread_metadata,
                 )
             except Exception:
@@ -16120,25 +16226,12 @@ class GatewayRunner:
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if agent_notify and should_agent_notify and not _pr_check.is_completion_consumed(session_id):
-                    from tools.ansi_strip import strip_ansi
-                    _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
-                    # Truncate at line boundaries so notifications never start
-                    # mid-line (fixes #23284). Keep the last ~2000 chars but
-                    # snap to the nearest preceding newline, then prepend a
-                    # truncation marker when output was cut.
-                    _LIMIT = 2000
-                    if len(_raw) > _LIMIT:
-                        _tail = _raw[-_LIMIT:]
-                        _nl = _tail.find("\n")
-                        _tail = _tail[_nl + 1:] if _nl != -1 else _tail
-                        _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
-                    else:
-                        _out = _raw
-                    synth_text = (
-                        f"[IMPORTANT: Background process {session_id} completed "
-                        f"(exit code {session.exit_code}).\n"
-                        f"Command: {session.command}\n"
-                        f"Output:\n{_out}]"
+                    synth_text = self._background_completion_message(
+                        session_id,
+                        exit_code=session.exit_code,
+                        command=getattr(session, "command", "") or "",
+                        output=session.output_buffer or "",
+                        agent_event=True,
                     )
                     source = self._build_process_event_source({
                         "session_id": session_id,
@@ -16201,10 +16294,12 @@ class GatewayRunner:
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
-                    new_output = session.output_buffer[-1000:] if session.output_buffer else ""
-                    message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                    message_text = self._background_completion_message(
+                        session_id,
+                        exit_code=session.exit_code,
+                        command=getattr(session, "command", "") or "",
+                        output=session.output_buffer or "",
+                        agent_event=False,
                     )
                     adapter = None
                     for p, a in self.adapters.items():
@@ -17870,9 +17965,11 @@ class GatewayRunner:
             if _biff_mode.max_iterations is not None:
                 max_iterations = min(max_iterations, int(_biff_mode.max_iterations))
             
-            # Map platform enum to the platform hint key the agent understands.
-            # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
-            platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
+            # Use the platform key resolved in the outer _run_agent scope.  Do
+            # not reassign it here: any assignment inside this closure makes
+            # Python treat platform_key as a local throughout run_sync, so
+            # earlier diagnostics can crash with UnboundLocalError if code is
+            # moved above the assignment.
             if str(platform_key or "").strip().lower() == "discord":
                 try:
                     max_iterations = resolve_biff_live_max_iterations(

@@ -10,6 +10,8 @@ from tools.approval import (
     _get_approval_mode,
     _smart_approve,
     approve_session,
+    check_all_command_guards,
+    detect_biff_role_service_restart,
     detect_dangerous_command,
     is_approved,
     load_permanent,
@@ -127,6 +129,39 @@ class TestSafeCommand:
         assert desc is None
 
 
+class TestBiffRoleServiceRestartGuard:
+    def test_restart_wrapper_blocked_for_direct_role(self):
+        with mock_patch.dict("os.environ", {"HERMES_BIFF_DIRECT_ROLE": "vex"}, clear=False):
+            blocked, desc = detect_biff_role_service_restart("scripts/restart-hermes-gateway.sh status || true")
+
+        assert blocked is True
+        assert "restart wrapper" in desc
+
+    def test_launchctl_kickstart_blocked_for_direct_role(self):
+        cmd = "sudo -n /bin/launchctl kickstart -k system/ai.hermes.gateway"
+        with mock_patch.dict("os.environ", {"HERMES_BIFF_DIRECT_ROLE": "forge"}, clear=False):
+            result = check_all_command_guards(cmd, "local")
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+        assert "LaunchDaemon" in result["message"]
+
+    def test_launchctl_print_allowed_for_direct_role(self):
+        cmd = "/bin/launchctl print system/ai.hermes.gateway"
+        with mock_patch.dict("os.environ", {"HERMES_BIFF_DIRECT_ROLE": "vex"}, clear=False):
+            blocked, desc = detect_biff_role_service_restart(cmd)
+
+        assert blocked is False
+        assert desc is None
+
+    def test_controller_not_hard_blocked_by_role_guard(self):
+        with mock_patch.dict("os.environ", {}, clear=True):
+            blocked, desc = detect_biff_role_service_restart("scripts/restart-hermes-gateway.sh")
+
+        assert blocked is False
+        assert desc is None
+
+
 def _clear_session(key):
     """Replace for removed clear_session() — directly clear internal state."""
     approval_module._session_approved.pop(key, None)
@@ -156,18 +191,18 @@ class TestSessionKeyContext:
         run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
         module = ast.parse(run_py.read_text(encoding="utf-8"))
 
-        run_sync = None
-        for node in ast.walk(module):
-            if isinstance(node, ast.FunctionDef) and node.name == "run_sync":
-                run_sync = node
-                break
+        run_sync_nodes = [
+            node for node in ast.walk(module)
+            if isinstance(node, ast.FunctionDef) and node.name == "run_sync"
+        ]
 
-        assert run_sync is not None, "gateway.run.run_sync not found"
+        assert run_sync_nodes, "gateway.run.run_sync not found"
 
         called_names = set()
-        for node in ast.walk(run_sync):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                called_names.add(node.func.id)
+        for run_sync in run_sync_nodes:
+            for node in ast.walk(run_sync):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    called_names.add(node.func.id)
 
         assert "set_current_session_key" in called_names
         assert "reset_current_session_key" in called_names

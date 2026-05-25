@@ -103,10 +103,15 @@ def _make_run_side_effect(
                 return subprocess.CompletedProcess(cmd, system_restart_rc, stdout="", stderr=stderr)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        # launchctl list ai.hermes.gateway
-        if "launchctl" in joined and "list" in joined:
+        # launchctl print gui/<uid>/ai.hermes.gateway
+        if "launchctl" in joined and "print" in joined:
             if launchctl_loaded:
-                return subprocess.CompletedProcess(cmd, 0, stdout="PID\tStatus\tLabel\n123\t0\tai.hermes.gateway\n", stderr="")
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout='service = {\n\tstate = running\n\tpid = 123\n}\n',
+                    stderr="",
+                )
             return subprocess.CompletedProcess(cmd, 113, stdout="", stderr="Could not find service")
 
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -1022,10 +1027,10 @@ class TestGetServicePids:
 
         def fake_run(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
-            if "launchctl" in joined and "list" in joined:
+            if "launchctl" in joined and "print" in joined:
                 return subprocess.CompletedProcess(
                     cmd, 0,
-                    stdout="PID\tStatus\tLabel\n67890\t0\tai.hermes.gateway\n",
+                    stdout='service = {\n\tstate = running\n\tpid = 67890\n}\n',
                     stderr="",
                 )
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")

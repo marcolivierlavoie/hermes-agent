@@ -81,6 +81,18 @@ _FOLLOW_UP_ACTION_LEAD_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_REFRESH_RESUME_RE = re.compile(
+    r"("
+    r"\b(?:chat|tab|window|dashboard|browser|page|ui)\b.*\b(?:refresh(?:ed)?|reload(?:ed)?|closed|lost|disappear(?:ed)?)\b"
+    r"|\b(?:refresh(?:ed)?|reload(?:ed)?|closed)\b.*\b(?:chat|tab|window|dashboard|browser|page|ui)\b"
+    r"|\b(?:can'?t|cannot|don'?t)\s+(?:see|find)\s+(?:your\s+)?(?:progress|context|status|work)\b"
+    r"|\b(?:where\s+did\s+we\s+leave\s+off|what\s+were\s+we\s+(?:doing|discussing|working\s+on))\b"
+    r"|\b(?:resume|continue|pick\s+up)\s+(?:this\s+)?(?:conversation|thread|context|non[-\s]?kanban\s+thing)\b"
+    r"|\bpick\s+up\s+the\s+non[-\s]?kanban\s+thing\b"
+    r"|^\s*resume\s*[.!?]*\s*$"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
 _REPLY_FIX_FOLLOWUP_RE = re.compile(
     r"^\s*\[Replying to:.*\b(?:what\s+do\s+you\s+suggest\s+we\s+do\s+to\s+fix\s+this|fix\s+this)\b",
     re.IGNORECASE | re.DOTALL,
@@ -89,6 +101,20 @@ _EXPLICIT_SPECIALIST_RE = re.compile(
     r"\b(?:use|ask|have|send|hand(?:\s+this)?\s+(?:to|off\s+to)|route\s+(?:to|through)|for)\s+"
     r"(?P<role>forge|ranger|quill|vex)\b"
     r"|\b(?P<role2>forge|ranger|quill|vex)\b\s+(?:should|can|please|pls|needs?\s+to|must|go\s+do)\b",
+    re.IGNORECASE,
+)
+_SPECIALIST_CONTROL_RE = re.compile(
+    r"\b(?:stop|cancel|kill|interrupt|pause|halt|shut\s+down)\b"
+    r".*\b(?:forge|ranger|quill|vex|specialist|subagent|worker|background\s+task)\b"
+    r"|\b(?:forge|ranger|quill|vex|specialist|subagent|worker|background\s+task)\b"
+    r".*\b(?:stop|cancel|kill|interrupt|pause|halt|shut\s+down)\b",
+    re.IGNORECASE,
+)
+_SPECIALIST_REVIEW_BEFORE_SEND_RE = re.compile(
+    r"\b(?:message|prompt|note|instruction)s?\s+for\s+(?:forge|ranger|quill|vex)\b"
+    r".*\b(?:read|review|check|look\s+at)\b.*\b(?:before|instead\s+of)\b.*\b(?:send|sending|route|routing|hand(?:ing)?\s+off)\b"
+    r"|\b(?:read|review|check|look\s+at)\b.*\b(?:before|instead\s+of)\b.*\b(?:send|sending|route|routing|hand(?:ing)?\s+off)\b"
+    r".*\b(?:forge|ranger|quill|vex)\b",
     re.IGNORECASE,
 )
 _FORGE_DIRECT_RE = re.compile(
@@ -186,6 +212,19 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("answer_now", "empty or whitespace-only prompt", "direct_answer", 0, False, "none")
     if re.fullmatch(r"(?i)\s*(?:hi|hello|hey|yo|sup|thanks|thank you|ok|okay|gm|gn)[.!?\s]*", body):
         return BiffTurnPlan("answer_now", "casual greeting or acknowledgement", "direct_answer", 0, False, "none")
+    if _SPECIALIST_CONTROL_RE.search(body):
+        return BiffTurnPlan("one_tool", "specialist control request must stay in Biff/controller, not route to the specialist being controlled", "status_read", 2, False, "status")
+    if _SPECIALIST_REVIEW_BEFORE_SEND_RE.search(body):
+        return BiffTurnPlan("answer_now", "review-before-send request must stay with Biff instead of dispatching to a specialist", "direct_answer", 0, False, "none")
+    if _REFRESH_RESUME_RE.search(body):
+        return BiffTurnPlan(
+            "resume_context",
+            "refresh/lost-context request should recover recent session and scratch checkpoint state without assuming Kanban",
+            "context_resume",
+            3,
+            False,
+            "resume",
+        )
     explicit_specialist = _EXPLICIT_SPECIALIST_RE.search(body)
     if explicit_specialist:
         role = (explicit_specialist.group("role") or explicit_specialist.group("role2") or "").lower()

@@ -1,5 +1,6 @@
 import errno
 import sqlite3
+import time
 
 from agent.biff_intent_router import plan_biff_turn
 from agent.biff_rag_router import (
@@ -9,6 +10,7 @@ from agent.biff_rag_router import (
     query_secondbrain_fts,
     secondbrain_rag_context,
     shape_fts_query,
+    smart_connections_status,
     smart_status_is_available,
 )
 
@@ -38,7 +40,12 @@ def _make_index(path):
     con.close()
 
 
-def test_casual_hi_skips_rag_and_tools():
+def test_casual_hi_skips_rag_and_tools(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("casual/direct prompts must not inspect Smart status")
+
+    monkeypatch.setattr("agent.biff_rag_router.smart_connections_status", fail_if_called)
+
     decision = classify_biff_rag_request("hi")
     plan = plan_biff_turn("hi")
 
@@ -111,6 +118,44 @@ def test_smart_unavailable_or_errno_11_falls_back_to_sqlite(monkeypatch, tmp_pat
     assert "Smart Connections skipped" in context
     assert "errno 11" in context
     assert "Biff SecondBrain RAG Context" in context
+
+
+def test_slow_smart_status_helper_times_out_fail_closed(monkeypatch):
+    class SlowIndexer:
+        @staticmethod
+        def smart_connections_status(*args, **kwargs):
+            time.sleep(0.5)
+            return {"state": "available", "files": 10, "readable_samples": 3}
+
+    monkeypatch.setattr("agent.biff_rag_router._load_indexer_module", lambda: SlowIndexer)
+
+    started = time.monotonic()
+    status = smart_connections_status(timeout_ms=25)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    assert elapsed_ms < 200
+    assert status == {"state": "unavailable", "reason": "timed_out", "timeout_ms": 25}
+
+
+def test_smart_status_timeout_context_falls_back_to_sqlite_without_raw_payload(monkeypatch, tmp_path):
+    db = tmp_path / "secondbrain.sqlite"
+    _make_index(db)
+    _RAG_CONTEXT_CACHE.clear()
+
+    def timed_out_status(*args, **kwargs):
+        return {"state": "unavailable", "reason": "timed_out", "timeout_ms": 25}
+
+    monkeypatch.setattr("agent.biff_rag_router.smart_connections_status", timed_out_status)
+
+    decision = classify_biff_rag_request("Use Smart Connections to find notes about routing")
+    context = secondbrain_rag_context("Use Smart Connections to find notes about routing", db_path=db)
+
+    assert decision.action == "sqlite_fts"
+    assert decision.smart_allowed is False
+    assert "Smart Connections skipped: timed_out" in context
+    assert "[SecondBrain SQLite FTS:" in context
+    assert "available', 'files'" not in context
+    assert "Traceback" not in context
 
 
 def test_result_merger_dedupes_limits_and_preserves_best_attribution():

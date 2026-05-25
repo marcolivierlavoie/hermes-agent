@@ -11,16 +11,19 @@ from __future__ import annotations
 
 import errno
 import importlib.util
+import queue
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 DEFAULT_SECOND_BRAIN_DB = Path.home() / ".hermes" / "indexes" / "secondbrain.sqlite"
 SECOND_BRAIN_INDEXER = Path.home() / ".hermes" / "scripts" / "secondbrain_sqlite_index.py"
 DEFAULT_RAG_LATENCY_MS = 750
+DEFAULT_SMART_STATUS_TIMEOUT_MS = 200
 DEFAULT_RAG_TOP_N = 3
 DEFAULT_RAG_CACHE_TTL_SECONDS = 30
 MAX_QUERY_TERMS = 8
@@ -110,17 +113,45 @@ def _load_indexer_module() -> Any | None:
     return module
 
 
-def smart_connections_status(*, timeout_ms: int = 200) -> dict[str, Any]:
-    """Read Smart Connections status with a tiny live-path budget."""
+def _call_with_hard_timeout(fn: Callable[[], Any], *, timeout_ms: int) -> tuple[bool, Any]:
+    """Run a potentially blocking Smart helper behind a hard live-path guard."""
 
+    budget_ms = max(1, int(timeout_ms or DEFAULT_SMART_STATUS_TIMEOUT_MS))
+    results: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def runner() -> None:
+        try:
+            results.put_nowait(("ok", fn()))
+        except BaseException as exc:  # surfaced to caller when it happens inside budget
+            results.put_nowait(("error", exc))
+
+    worker = threading.Thread(target=runner, name="biff-smart-status-timeout", daemon=True)
+    worker.start()
+    try:
+        kind, value = results.get(timeout=budget_ms / 1000)
+    except queue.Empty:
+        return False, None
+    if kind == "error":
+        raise value
+    return True, value
+
+
+def smart_connections_status(*, timeout_ms: int = DEFAULT_SMART_STATUS_TIMEOUT_MS) -> dict[str, Any]:
+    """Read Smart Connections status with a tiny live-path hard timeout."""
+
+    budget_ms = max(1, int(timeout_ms or DEFAULT_SMART_STATUS_TIMEOUT_MS))
     started = time.monotonic()
-    module = _load_indexer_module()
-    if module is None or not hasattr(module, "smart_connections_status"):
-        return {"state": "unavailable", "reason": "indexer_status_missing"}
-    status = module.smart_connections_status(sample_limit=3)
+
+    def read_status() -> Any:
+        module = _load_indexer_module()
+        if module is None or not hasattr(module, "smart_connections_status"):
+            return {"state": "unavailable", "reason": "indexer_status_missing"}
+        return module.smart_connections_status(sample_limit=3)
+
+    completed, status = _call_with_hard_timeout(read_status, timeout_ms=budget_ms)
+    if not completed:
+        return {"state": "unavailable", "reason": "timed_out", "timeout_ms": budget_ms}
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    if elapsed_ms > max(1, int(timeout_ms)):
-        return {"state": "unavailable", "reason": "smart_status_over_budget", "elapsed_ms": elapsed_ms}
     if isinstance(status, Mapping):
         out = dict(status)
         out["elapsed_ms"] = elapsed_ms
