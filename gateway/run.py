@@ -13170,6 +13170,8 @@ class GatewayRunner:
                 stderr_tail = str(payload.get("stderr_tail") or stderr_tail or "").strip()
             elif stdout:
                 role_output = stdout
+            if not role_output and session_id:
+                role_output = self._load_specialist_session_final_response(role=role, session_id=session_id)
 
             details: list[str] = []
             if elapsed not in (None, ""):
@@ -13243,32 +13245,103 @@ class GatewayRunner:
         """
 
         role_title = role.title()
+        status_label = "Done" if role_status == "done" else "Blocked"
         header = f"{role_title} background task `{task_id}` {role_status}{detail_suffix}."
         output = "\n".join(str(role_output or "").strip().splitlines()).strip()
         stderr = "\n".join(str(stderr_tail or "").strip().splitlines()).strip()
-        sections: list[str] = [header]
+        evidence_bits = ["Lifecycle: #biff-ops", f"raw detail: #{role}"]
+        if detail_suffix:
+            evidence_bits.append(detail_suffix.strip(" ()"))
+
+        sections: list[str] = [header, f"**Status:** {status_label}"]
         if role_status == "done":
             if output:
-                if len(output) > 1800:
-                    output = output[:1790].rstrip() + "…"
-                sections.append(f"**Recap from {role_title}:**\n{output}")
+                if len(output) > 1500:
+                    output = output[:1490].rstrip() + "…"
+                sections.append(f"**Result / what changed:**\n{output}")
             else:
-                sections.append(f"**Recap from {role_title}:** Completed, but returned no written summary.")
+                sections.append("**Result / what changed:**\nCompleted, but no written role summary was recoverable.")
+            sections.append(f"**Evidence:** {', '.join(evidence_bits)}.")
             sections.append(
-                "**Next step:** Biff should use this result to decide whether Vex verification, "
-                "a commit/deploy, a Kanban closeout, or a follow-up question is needed."
+                "**Next step:** No action needed from Marco unless this result is insufficient; "
+                "Biff can continue with verification, commit/deploy, Kanban closeout, or a follow-up if needed."
             )
         else:
             blocker = stderr or output or "No worker diagnostic was returned."
             if len(blocker) > 1200:
                 blocker = blocker[:1190].rstrip() + "…"
-            sections.append(f"**Blocker from {role_title}:**\n{blocker}")
+            sections.append(f"**Blocker / decision needed:**\n{blocker}")
+            sections.append(f"**Evidence:** {', '.join(evidence_bits)}.")
             sections.append(
-                "**Next step:** Biff should inspect the role output, then retry, split the work, "
-                "or ask Marco only if there is a real human blocker."
+                "**Next step:** Biff should change strategy, retry/split the work, or ask Marco only if "
+                "there is a real human decision or approval boundary."
             )
-        sections.append(f"Lifecycle: #biff-ops. Full raw worker detail: #{role}.")
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _extract_final_assistant_text_from_messages(messages: list[dict[str, Any]]) -> str:
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                parts: list[str] = []
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text") or item.get("content")
+                        if text:
+                            parts.append(str(text))
+                    elif item:
+                        parts.append(str(item))
+                text = "\n".join(parts).strip()
+            else:
+                text = str(content or "").strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _load_specialist_session_final_response(*, role: str, session_id: str) -> str:
+        """Best-effort recovery of a role's final assistant text from persisted state.
+
+        ``hermes chat -q --quiet`` can legitimately emit no stdout even when the
+        role session contains a useful final answer. Direct specialist completion
+        notices should relay that answer instead of telling Marco the worker
+        returned no written summary. Prefer JSON transcripts when present, then
+        fall back to the role profile SQLite state DB.
+        """
+
+        safe_role = re.sub(r"[^a-z0-9_-]", "", str(role or "").lower())
+        safe_session = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))
+        if not safe_role or not safe_session:
+            return ""
+        session_path = _hermes_home / "profiles" / safe_role / "sessions" / f"session_{safe_session}.json"
+        try:
+            payload = json.loads(session_path.read_text(encoding="utf-8"))
+            messages = payload.get("messages") if isinstance(payload, dict) else None
+            if isinstance(messages, list):
+                text = GatewayRunner._extract_final_assistant_text_from_messages(messages)
+                if text:
+                    return text
+        except Exception:
+            pass
+
+        db_path = _hermes_home / "profiles" / safe_role / "state.db"
+        try:
+            with sqlite3.connect(str(db_path)) as con:
+                rows = con.execute(
+                    """
+                    SELECT role, content
+                    FROM messages
+                    WHERE session_id = ?
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    (safe_session,),
+                ).fetchall()
+        except Exception:
+            return ""
+        messages = [{"role": row[0], "content": row[1]} for row in rows]
+        return GatewayRunner._extract_final_assistant_text_from_messages(messages)
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.

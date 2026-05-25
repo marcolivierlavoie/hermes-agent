@@ -109,6 +109,11 @@ def test_ops_summary_suppresses_long_transcripts_and_secrets():
     [
         ('PASS\nVerified the production path.', 'PASS'),
         ('Vex decision: PASS\nEvidence follows.', 'PASS'),
+        ('PASS\nStatus: PASS\nEvidence follows.', 'PASS'),
+        ('Status: PASS — controlled smoke emitted.', 'PASS'),
+        ('PASS — controlled smoke payload prepared.', 'PASS'),
+        ('Status:\nPASS — controlled smoke payload prepared.', 'PASS'),
+        ('Decision:\nBLOCKED — missing live relay proof.', 'BLOCKED'),
         ('BLOCKED\nThe explanation says it would PASS after a restart.', 'BLOCKED'),
         ('Decision: BLOCKED\nUseful evidence exists.', 'BLOCKED'),
         ('Evidence: focused tests PASS but no decision line.', 'UNKNOWN'),

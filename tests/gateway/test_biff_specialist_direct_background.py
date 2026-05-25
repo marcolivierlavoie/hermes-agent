@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,12 +109,14 @@ async def test_specialist_direct_timeout_progress_does_not_send_to_hermes_but_co
     assert chat_id == "hermes-channel"
     assert "Forge background task `forge_123` done" in message
     assert "elapsed" not in message
-    assert "**Recap from Forge:**" in message
+    assert "**Status:** Done" in message
+    assert "**Result / what changed:**" in message
     assert "verified evidence from Forge" in message
-    assert "**Next step:**" in message
-    assert "Vex verification" in message
+    assert "**Evidence:**" in message
     assert "Lifecycle: #biff-ops" in message
-    assert "Full raw worker detail: #forge" in message
+    assert "raw detail: #forge" in message
+    assert "**Next step:**" in message
+    assert "No action needed from Marco" in message
     assert wait_for_calls >= 1
 
 
@@ -140,7 +143,127 @@ async def test_specialist_direct_completion_falls_back_to_non_json_stdout(monkey
     _chat_id, message = adapter.send.await_args.args[:2]
     assert "Forge background task `forge_plain` done" in message
     assert "plain-text role recap" in message
-    assert "Completed, but returned no written summary" not in message
+    assert "Completed, but no written role summary was recoverable" not in message
+
+
+@pytest.mark.asyncio
+async def test_specialist_direct_completion_falls_back_to_role_session_when_stdout_empty(monkeypatch, tmp_path):
+    runner = GatewayRunner(GatewayConfig())
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner.adapters[Platform.DISCORD] = cast(Any, adapter)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="hermes-channel", user_id="marco")
+
+    session_id = "20260525_113429_43b469"
+    session_dir = tmp_path / "profiles" / "forge" / "sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir / f"session_{session_id}.json").write_text(
+        '{"messages": ['
+        '{"role": "assistant", "content": ""},'
+        '{"role": "tool", "content": "{}"},'
+        '{"role": "assistant", "content": "actual final Forge summary"}'
+        ']}'
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    async def fake_executor(_run_sync):
+        return subprocess.CompletedProcess(
+            args=["biff_role_invoke.py"],
+            returncode=0,
+            stdout=(
+                '{"stdout": "", "session_id": "20260525_113429_43b469", '
+                '"elapsed_seconds": 232.3}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(runner, "_run_in_executor_with_context", fake_executor)
+
+    await runner._run_specialist_direct_background_task("forge", "do work", source, "forge_empty")
+
+    assert adapter.send.await_count == 1
+    _chat_id, message = adapter.send.await_args.args[:2]
+    assert "Forge background task `forge_empty` done" in message
+    assert "session `20260525_113429_43b469`" in message
+    assert "actual final Forge summary" in message
+    assert "Completed, but no written role summary was recoverable" not in message
+
+
+@pytest.mark.asyncio
+async def test_specialist_direct_completion_falls_back_to_role_state_db_when_json_absent(monkeypatch, tmp_path):
+    runner = GatewayRunner(GatewayConfig())
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner.adapters[Platform.DISCORD] = cast(Any, adapter)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="hermes-channel", user_id="marco")
+
+    session_id = "20260525_115426_1e84e3"
+    db_dir = tmp_path / "profiles" / "vex"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "state.db"
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp INTEGER)")
+        con.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (session_id, "assistant", "PASS\n\nRecovered DB-only Vex summary", 1),
+        )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    async def fake_executor(_run_sync):
+        return subprocess.CompletedProcess(
+            args=["biff_role_invoke.py"],
+            returncode=0,
+            stdout=(
+                '{"stdout": "", "session_id": "20260525_115426_1e84e3", '
+                '"elapsed_seconds": 111.1}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(runner, "_run_in_executor_with_context", fake_executor)
+
+    await runner._run_specialist_direct_background_task("vex", "verify work", source, "vex_db_only")
+
+    assert adapter.send.await_count == 1
+    _chat_id, message = adapter.send.await_args.args[:2]
+    assert "Vex background task `vex_db_only` done" in message
+    assert "session `20260525_115426_1e84e3`" in message
+    assert "Recovered DB-only Vex summary" in message
+    assert "Completed, but no written role summary was recoverable" not in message
+
+
+def test_specialist_direct_completion_recap_uses_executive_closeout_shape():
+    message = GatewayRunner._format_specialist_direct_completion_recap(
+        role="forge",
+        task_id="forge_done",
+        role_status="done",
+        detail_suffix=" (elapsed 12.3s, session `abc`)",
+        role_output="What changed:\n- Fixed the route.\n\nEvidence:\n- Tests passed.",
+    )
+
+    assert "Forge background task `forge_done` done" in message
+    assert "**Status:** Done" in message
+    assert "**Result / what changed:**" in message
+    assert "Fixed the route" in message
+    assert "**Evidence:** Lifecycle: #biff-ops, raw detail: #forge, elapsed 12.3s, session `abc`." in message
+    assert "**Next step:** No action needed from Marco" in message
+    assert "**Recap from Forge:**" not in message
+
+
+def test_specialist_direct_blocked_recap_uses_decision_shape():
+    message = GatewayRunner._format_specialist_direct_completion_recap(
+        role="vex",
+        task_id="vex_blocked",
+        role_status="blocked",
+        detail_suffix=" (exit 2, session `def`)",
+        role_output="",
+        stderr_tail="Vex decision was BLOCKED",
+    )
+
+    assert "Vex background task `vex_blocked` blocked" in message
+    assert "**Status:** Blocked" in message
+    assert "**Blocker / decision needed:**" in message
+    assert "Vex decision was BLOCKED" in message
+    assert "**Evidence:** Lifecycle: #biff-ops, raw detail: #vex, exit 2, session `def`." in message
+    assert "**Next step:** Biff should change strategy" in message
 
 
 @pytest.mark.asyncio
