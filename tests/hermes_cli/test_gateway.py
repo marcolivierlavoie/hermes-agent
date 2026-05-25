@@ -1,12 +1,18 @@
 """Tests for hermes_cli.gateway."""
 
+import os
+import subprocess
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch, call
 
 import pytest
 
 import hermes_cli.gateway as gateway
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _install_fake_gateway_run(monkeypatch, start_gateway):
@@ -66,6 +72,26 @@ def test_run_gateway_exits_nonzero_when_start_gateway_reports_failure(monkeypatc
 
     assert exc_info.value.code == 1
     assert calls == [(True, None)]
+
+
+def test_gateway_list_subcommand_is_not_registered(tmp_path):
+    hermes_home = tmp_path / "profiles" / "test"
+    hermes_home.mkdir(parents=True)
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    env["PYTHONPATH"] = str(PROJECT_ROOT)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "gateway", "list"],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 2
+    assert "invalid choice: 'list'" in result.stderr
 
 
 def test_run_gateway_refuses_root_in_official_docker(monkeypatch, tmp_path, capsys):

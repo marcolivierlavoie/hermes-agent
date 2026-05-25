@@ -10358,9 +10358,6 @@ def main():
         help="Target the Linux system-level gateway service",
     )
 
-    # gateway list
-    gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
-
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
