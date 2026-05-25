@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -264,6 +265,62 @@ def test_specialist_direct_blocked_recap_uses_decision_shape():
     assert "Vex decision was BLOCKED" in message
     assert "**Evidence:** Lifecycle: #biff-ops, raw detail: #vex, exit 2, session `def`." in message
     assert "**Next step:** Biff should change strategy" in message
+
+
+def test_delegate_task_trace_distinguishes_subagent_path_from_direct_role():
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_delegate",
+                    "type": "function",
+                    "function": {"name": "delegate_task", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_delegate",
+            "content": json.dumps(
+                [
+                    {
+                        "task_index": 1,
+                        "status": "completed",
+                        "summary": "Subagent verified the Discord final closeout path.",
+                    }
+                ]
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "**Status:** Done\n\n"
+                "**Result / what changed:**\nDelegate-task work returned to Biff.\n\n"
+                "**Evidence:** subagent completed; Biff sent this final response.\n\n"
+                "**Next step:** No action needed."
+            ),
+        },
+    ]
+
+    trace = GatewayRunner._collect_delegate_task_closeout_trace(messages)
+    final_response = messages[-1]["content"]
+
+    assert trace["mechanism"] == "delegate_task"
+    assert trace["tool_calls"] == 1
+    assert trace["result_count"] == 1
+    assert trace["statuses"] == ["completed"]
+    assert "Subagent verified" in trace["summaries"][0]
+    assert GatewayRunner._final_response_has_executive_closeout_shape(final_response)
+
+
+def test_delegate_task_final_closeout_logging_has_separate_marker():
+    source = RUN_PY.read_text()
+
+    assert "biff_delegate_task_final_closeout" in source
+    assert '"mechanism": "delegate_task"' in source
+    assert "dispatched_work_final_closeout" in source
+    assert "biff_specialist_direct_background_done" in source
 
 
 @pytest.mark.asyncio

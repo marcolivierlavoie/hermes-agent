@@ -9817,6 +9817,41 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+            try:
+                if source.platform == Platform.DISCORD:
+                    _delegate_trace = self._collect_delegate_task_closeout_trace(agent_messages)
+                    if _delegate_trace:
+                        _delegate_statuses = ",".join(_delegate_trace.get("statuses") or []) or "unknown"
+                        _delegate_shape = self._final_response_has_executive_closeout_shape(response)
+                        logger.info(
+                            "biff_delegate_task_final_closeout: platform=%s chat=%s session=%s mechanism=delegate_task tool_calls=%d results=%d statuses=%s executive_shape=%s response_chars=%d",
+                            _platform_name,
+                            source.chat_id or "unknown",
+                            session_entry.session_id,
+                            int(_delegate_trace.get("tool_calls") or 0),
+                            int(_delegate_trace.get("result_count") or 0),
+                            _delegate_statuses,
+                            _delegate_shape,
+                            len(response or ""),
+                        )
+                        try:
+                            from gateway.biff_diagnostics import record_biff_diagnostic
+                            record_biff_diagnostic(
+                                "dispatched_work_final_closeout",
+                                {
+                                    "platform": _platform_name,
+                                    "chat_id": source.chat_id or "unknown",
+                                    "session_id": session_entry.session_id,
+                                    "mechanism": "delegate_task",
+                                    "trace": _delegate_trace,
+                                    "executive_shape": _delegate_shape,
+                                    "response_chars": len(response or ""),
+                                },
+                            )
+                        except Exception:
+                            logger.debug("Biff delegate_task diagnostic failed", exc_info=True)
+            except Exception:
+                logger.debug("Biff delegate_task final closeout trace failed", exc_info=True)
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -13277,6 +13312,84 @@ class GatewayRunner:
                 "there is a real human decision or approval boundary."
             )
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _final_response_has_executive_closeout_shape(text: str) -> bool:
+        """Return whether a Discord final response has Biff's closeout sections."""
+
+        body = str(text or "")
+        return bool(
+            "**Status:**" in body
+            and "**Evidence:**" in body
+            and "**Next step:**" in body
+            and (
+                "**Result / what changed:**" in body
+                or "**Blocker / decision needed:**" in body
+            )
+        )
+
+    @staticmethod
+    def _collect_delegate_task_closeout_trace(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Summarize delegate_task calls/results from one completed parent turn.
+
+        ``delegate_task`` is synchronous from the parent's point of view: the
+        child result is delivered as a normal tool result, then the parent Biff
+        turn writes the final Marco-facing answer. This trace lets Discord logs
+        distinguish that path from the direct_role/background specialist path.
+        """
+
+        delegate_tool_call_ids: set[str] = set()
+        delegate_tool_calls = 0
+        for msg in messages or []:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tool_call in msg.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                fn = tool_call.get("function") or {}
+                if isinstance(fn, dict) and fn.get("name") == "delegate_task":
+                    delegate_tool_calls += 1
+                    tc_id = tool_call.get("id")
+                    if tc_id:
+                        delegate_tool_call_ids.add(str(tc_id))
+
+        if not delegate_tool_calls:
+            return {}
+
+        statuses: list[str] = []
+        result_count = 0
+        summaries: list[str] = []
+        for msg in messages or []:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            tc_id = str(msg.get("tool_call_id") or "")
+            if delegate_tool_call_ids and tc_id not in delegate_tool_call_ids:
+                continue
+            content = msg.get("content")
+            try:
+                payload = json.loads(content) if isinstance(content, str) else content
+            except Exception:
+                payload = content
+            entries = payload if isinstance(payload, list) else [payload]
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if "task_index" not in entry and "summary" not in entry and "status" not in entry:
+                    continue
+                result_count += 1
+                status = str(entry.get("status") or "unknown").strip() or "unknown"
+                statuses.append(status)
+                summary = str(entry.get("summary") or entry.get("error") or "").strip()
+                if summary:
+                    summaries.append(summary[:160])
+
+        return {
+            "mechanism": "delegate_task",
+            "tool_calls": delegate_tool_calls,
+            "result_count": result_count,
+            "statuses": statuses,
+            "summaries": summaries[:3],
+        }
 
     @staticmethod
     def _extract_final_assistant_text_from_messages(messages: list[dict[str, Any]]) -> str:
