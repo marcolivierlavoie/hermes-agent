@@ -93,6 +93,15 @@ _REFRESH_RESUME_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
+_RESTART_DONE_FOLLOWUP_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:i(?:'ll|\s+will)\s+(?:just\s+)?say\s+)?restart\s+(?:is\s+)?done|"
+    r"(?:gateway\s+)?restart(?:ed)?\s+(?:is\s+)?done|"
+    r"(?:i(?:'ve|\s+have)?\s+)?restart(?:ed)?\s+(?:the\s+)?gateway|"
+    r"(?:gateway\s+)?restarted"
+    r")\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
 _REPLY_FIX_FOLLOWUP_RE = re.compile(
     r"^\s*\[Replying to:.*\b(?:what\s+do\s+you\s+suggest\s+we\s+do\s+to\s+fix\s+this|fix\s+this)\b",
     re.IGNORECASE | re.DOTALL,
@@ -235,6 +244,15 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
             3,
             False,
             "resume",
+        )
+    if _RESTART_DONE_FOLLOWUP_RE.search(body):
+        return BiffTurnPlan(
+            "route_bundle",
+            "restart-complete follow-up should stay with Biff/controller and continue prior work context",
+            "continuation",
+            2,
+            True,
+            "base",
         )
     explicit_specialist = _EXPLICIT_SPECIALIST_RE.search(body)
     if explicit_specialist:

@@ -248,6 +248,23 @@ def test_specialist_misroute_feedback_stays_with_biff_controller():
         assert plan.specialist is None
 
 
+def test_restart_done_followup_stays_with_biff_controller_continuation():
+    for prompt in (
+        "I'll just say restart done",
+        "restart done",
+        "gateway restart done",
+        "I restarted the gateway",
+        "gateway restarted",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action == "route_bundle"
+        assert plan.runtime == "continuation"
+        assert plan.allow_bundle_selection is True
+        assert plan.background is False
+        assert plan.specialist is None
+
+
 def test_explicit_ranger_correction_does_not_route_to_forge_direct_lane():
     plan = plan_biff_turn("this is a task for ranger, not forge")
 
