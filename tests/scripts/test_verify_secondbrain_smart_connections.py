@@ -1,6 +1,8 @@
 import json
+import time
 import sqlite3
 
+from scripts import verify_secondbrain_smart_connections as smart_verify
 from scripts.verify_secondbrain_smart_connections import verify
 
 
@@ -51,3 +53,29 @@ def test_secondbrain_verifier_fails_when_sqlite_missing(tmp_path):
 
     assert result["status"] == "FAIL"
     assert "no SQLite" in " ".join(result["follow_up"])
+
+
+def test_secondbrain_verifier_times_out_slow_sqlite_discovery(tmp_path, monkeypatch):
+    vault = tmp_path / "SecondBrain"
+    vault.mkdir()
+
+    def slow_find_sqlite_files(_vault, _explicit):
+        time.sleep(1)
+        return []
+
+    monkeypatch.setattr(smart_verify, "_find_sqlite_files", slow_find_sqlite_files)
+
+    started = time.monotonic()
+    result = verify(str(vault), timeout_seconds=0.05)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert result["status"] == "FAIL"
+    assert result["state"] == "timed_out"
+    assert result["checked"] == [
+        {"component": "smart_connections", "status": "unavailable", "reason": "timed_out"}
+    ]
+    assert result["evidence_paths"] == []
+    assert result["follow_up"] == [
+        "Smart Connections status check timed out before completing; retry with a healthy local/iCloud/FileProvider state."
+    ]

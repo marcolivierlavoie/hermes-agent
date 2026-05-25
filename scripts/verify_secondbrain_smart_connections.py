@@ -8,19 +8,72 @@ or secret-bearing environment data.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import sys
 import time
 from typing import Any
+
+DEFAULT_SMART_STATUS_TIMEOUT_SECONDS = 5.0
+SMART_STATUS_TIMEOUT_ENV = "HERMES_SMART_STATUS_TIMEOUT_SECONDS"
 
 DEFAULT_VAULT_CANDIDATES = [
     Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/SecondBrain",
     Path.home() / "Documents/SecondBrain",
     Path.home() / "docs/SecondBrain",
 ]
+
+
+class _SmartStatusTimedOut(BaseException):
+    """Internal sentinel so broad Exception handlers do not leak timeout details."""
+
+
+def _timeout_result() -> dict[str, Any]:
+    return {
+        "status": "FAIL",
+        "state": "timed_out",
+        "checked": [{"component": "smart_connections", "status": "unavailable", "reason": "timed_out"}],
+        "evidence_paths": [],
+        "follow_up": ["Smart Connections status check timed out before completing; retry with a healthy local/iCloud/FileProvider state."],
+    }
+
+
+def _timeout_seconds(value: float | None) -> float:
+    if value is not None:
+        return max(0.0, float(value))
+    raw = os.environ.get(SMART_STATUS_TIMEOUT_ENV)
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return DEFAULT_SMART_STATUS_TIMEOUT_SECONDS
+    return DEFAULT_SMART_STATUS_TIMEOUT_SECONDS
+
+
+@contextmanager
+def _hard_timeout(seconds: float):
+    if seconds <= 0 or not hasattr(signal, "setitimer"):
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def _raise_timeout(_signum: int, _frame: Any) -> None:
+        raise _SmartStatusTimedOut()
+
+    signal.signal(signal.SIGALRM, _raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
 
 
 def _find_vault(explicit: str | None) -> Path | None:
@@ -75,7 +128,15 @@ def _sqlite_probe(path: Path) -> dict[str, Any]:
     return info
 
 
-def verify(vault: str | None = None, sqlite_path: str | None = None, schedule_path: str | None = None) -> dict[str, Any]:
+def verify(vault: str | None = None, sqlite_path: str | None = None, schedule_path: str | None = None, timeout_seconds: float | None = None) -> dict[str, Any]:
+    try:
+        with _hard_timeout(_timeout_seconds(timeout_seconds)):
+            return _verify_unprotected(vault, sqlite_path, schedule_path)
+    except _SmartStatusTimedOut:
+        return _timeout_result()
+
+
+def _verify_unprotected(vault: str | None = None, sqlite_path: str | None = None, schedule_path: str | None = None) -> dict[str, Any]:
     checked: list[dict[str, Any]] = []
     follow_up: list[str] = []
     status = "PASS"
@@ -114,9 +175,18 @@ def main() -> int:
     parser.add_argument("--vault")
     parser.add_argument("--sqlite")
     parser.add_argument("--schedule")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help=(
+            "Hard timeout in seconds for status/provenance reads "
+            f"(default: ${SMART_STATUS_TIMEOUT_ENV} or {DEFAULT_SMART_STATUS_TIMEOUT_SECONDS:g}s)"
+        ),
+    )
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
-    result = verify(args.vault, args.sqlite, args.schedule)
+    result = verify(args.vault, args.sqlite, args.schedule, timeout_seconds=args.timeout)
     if args.as_json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:

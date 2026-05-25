@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import errno
 import importlib.util
+import multiprocessing as mp
 import queue
 import re
 import sqlite3
@@ -114,21 +115,56 @@ def _load_indexer_module() -> Any | None:
 
 
 def _call_with_hard_timeout(fn: Callable[[], Any], *, timeout_ms: int) -> tuple[bool, Any]:
-    """Run a potentially blocking Smart helper behind a hard live-path guard."""
+    """Run a potentially blocking Smart helper behind a hard live-path guard.
+
+    Prefer a short-lived child process so a stuck iCloud/FileProvider read can be
+    terminated instead of leaving a daemon thread blocked after the live Discord
+    turn has already fallen back.  When ``fork`` is unavailable (Windows), fall
+    back to the previous daemon-thread guard; it still protects caller latency.
+    """
 
     budget_ms = max(1, int(timeout_ms or DEFAULT_SMART_STATUS_TIMEOUT_MS))
+    timeout_s = budget_ms / 1000
+    if "fork" in mp.get_all_start_methods():
+        ctx = mp.get_context("fork")
+        proc_results: Any = ctx.Queue(maxsize=1)
+
+        def runner() -> None:
+            try:
+                proc_results.put(("ok", fn()))
+            except BaseException as exc:
+                proc_results.put(("error", exc))
+
+        proc = ctx.Process(target=runner, name="biff-smart-status-timeout")
+        proc.start()
+        proc.join(timeout_s)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(0.1)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(0.1)
+            return False, None
+        try:
+            kind, value = proc_results.get_nowait()
+        except queue.Empty:
+            return False, None
+        if kind == "error":
+            raise value
+        return True, value
+
     results: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
 
-    def runner() -> None:
+    def thread_runner() -> None:
         try:
             results.put_nowait(("ok", fn()))
         except BaseException as exc:  # surfaced to caller when it happens inside budget
             results.put_nowait(("error", exc))
 
-    worker = threading.Thread(target=runner, name="biff-smart-status-timeout", daemon=True)
+    worker = threading.Thread(target=thread_runner, name="biff-smart-status-timeout", daemon=True)
     worker.start()
     try:
-        kind, value = results.get(timeout=budget_ms / 1000)
+        kind, value = results.get(timeout=timeout_s)
     except queue.Empty:
         return False, None
     if kind == "error":
