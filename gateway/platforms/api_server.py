@@ -27,6 +27,7 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+import html
 import ipaddress
 import json
 import logging
@@ -867,6 +868,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
         return None
 
+    def _check_fast_biff_ui_gate(self, request: "web.Request") -> Optional["web.Response"]:
+        """Gate the beta browser shell without requiring the bearer token to fetch HTML."""
+        if not self._fast_biff_enabled:
+            self._audit_fast_biff("ui_disabled", request, status=503)
+            return web.Response(text="Fast Biff beta UI is disabled.", status=503, content_type="text/plain")
+        if self._fast_biff_tailnet_only:
+            client_ip = self._request_client_ip(request)
+            if not self._ip_allowed_for_fast_biff(client_ip):
+                self._audit_fast_biff("ui_tailnet_denied", request, status=403)
+                return web.Response(
+                    text="Fast Biff beta UI accepts only loopback or Tailscale clients.",
+                    status=403,
+                    content_type="text/plain",
+                )
+        return None
+
     def _fast_biff_session_id(self, request: "web.Request", body: Dict[str, Any]) -> tuple[Optional[str], Optional["web.Response"]]:
         raw = str(
             body.get("session_id")
@@ -880,6 +897,86 @@ class APIServerAdapter(BasePlatformAdapter):
         client_ip = self._request_client_ip(request)
         key = f"{self._fast_biff_session_prefix}:{self._audit_ip_hash(client_ip)}"
         return key[: self._MAX_SESSION_HEADER_LEN], None
+
+    async def _handle_fast_biff_ui(self, request: "web.Request") -> "web.Response":
+        """GET / — tiny iOS-friendly beta chat UI for the tailnet Fast Biff API."""
+        gate_err = self._check_fast_biff_ui_gate(request)
+        if gate_err is not None:
+            return gate_err
+
+        session_prefix = html.escape(self._fast_biff_session_prefix or "fast-biff", quote=True)
+        nonce = uuid.uuid4().hex
+        page = f'''<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Fast Biff Beta</title>
+  <style nonce="{nonce}">
+    :root {{ color-scheme: dark; --bg:#080b12; --panel:#111827; --line:#263044; --text:#f7f7fb; --muted:#a9b2c7; --accent:#8bd3ff; --bad:#ff9d9d; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; min-height:100dvh; font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:linear-gradient(180deg,#080b12,#101827); color:var(--text); }}
+    main {{ max-width:820px; margin:0 auto; min-height:100dvh; display:flex; flex-direction:column; padding:16px max(14px,env(safe-area-inset-right)) calc(14px + env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left)); gap:12px; }}
+    header {{ padding:8px 2px 2px; }} h1 {{ font-size:1.35rem; margin:.1rem 0; }} p {{ color:var(--muted); margin:.25rem 0 0; }}
+    #log {{ flex:1; overflow:auto; border:1px solid var(--line); border-radius:18px; background:rgba(17,24,39,.76); padding:12px; display:flex; flex-direction:column; gap:10px; }}
+    .msg {{ white-space:pre-wrap; padding:10px 12px; border-radius:14px; max-width:94%; }} .me {{ align-self:flex-end; background:#1d4f70; }} .biff {{ align-self:flex-start; background:#182236; }} .sys {{ align-self:center; color:var(--muted); font-size:.9rem; }} .err {{ color:var(--bad); }}
+    form {{ display:grid; grid-template-columns:1fr auto; gap:8px; }} textarea,input,button {{ font:inherit; border-radius:14px; border:1px solid var(--line); }} textarea,input {{ width:100%; background:#0f1726; color:var(--text); padding:11px; }} textarea {{ min-height:68px; resize:vertical; }}
+    .row {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }} button {{ background:var(--accent); color:#031421; font-weight:700; padding:0 16px; min-height:48px; }} button:disabled {{ opacity:.55; }}
+    small {{ color:var(--muted); }} @media (max-width:640px) {{ .row, form {{ grid-template-columns:1fr; }} button {{ width:100%; }} }}
+  </style>
+</head>
+<body>
+<main>
+  <header><h1>Fast Biff Beta</h1><p>Tailnet-only Safari chat shell. Token stays in this browser; Discord remains the fallback.</p></header>
+  <div class="row">
+    <input id="token" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Fast Biff API token" type="password">
+    <input id="session" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Session ID, optional" value="{session_prefix}:ios-beta">
+  </div>
+  <div id="log" aria-live="polite"><div class="sys">Ready. Paste token once, then ask Biff.</div></div>
+  <form id="chat"><textarea id="message" placeholder="Ask Biff…" required></textarea><button id="send" type="submit">Send</button></form>
+  <small>Beta: one-at-a-time requests, no attachments yet, no token is embedded in this page.</small>
+</main>
+<script nonce="{nonce}">
+const $ = (id) => document.getElementById(id);
+const log = $('log');
+const token = $('token');
+const session = $('session');
+const message = $('message');
+const send = $('send');
+token.value = localStorage.getItem('fastBiffToken') || '';
+session.value = localStorage.getItem('fastBiffSession') || session.value;
+function add(kind, text) {{ const el = document.createElement('div'); el.className = 'msg ' + kind; el.textContent = text; log.appendChild(el); log.scrollTop = log.scrollHeight; }}
+$('chat').addEventListener('submit', async (event) => {{
+  event.preventDefault();
+  const apiToken = token.value.trim(); const text = message.value.trim(); const sessionId = session.value.trim();
+  if (!apiToken) {{ add('sys err', 'Paste the Fast Biff API token first.'); return; }}
+  if (!text) return;
+  localStorage.setItem('fastBiffToken', apiToken); localStorage.setItem('fastBiffSession', sessionId);
+  add('me', text); message.value = ''; send.disabled = true; send.textContent = 'Thinking…';
+  try {{
+    const resp = await fetch('/biff/v1/chat', {{ method:'POST', headers: {{ 'Authorization':'Bearer ' + apiToken, 'Content-Type':'application/json', 'X-Hermes-Session-Key': sessionId || 'fast-biff:web-beta' }}, body: JSON.stringify({{ message: text, session_id: sessionId || undefined }}) }});
+    const data = await resp.json().catch(() => ({{ error: {{ message: 'Non-JSON response from server' }} }}));
+    if (!resp.ok) throw new Error(data?.error?.message || ('HTTP ' + resp.status));
+    if (data.session_id) {{ session.value = data.session_id; localStorage.setItem('fastBiffSession', data.session_id); }}
+    add('biff', data.message || '(empty response)');
+  }} catch (err) {{ add('sys err', 'Error: ' + (err?.message || err)); }}
+  finally {{ send.disabled = false; send.textContent = 'Send'; message.focus(); }}
+}});
+</script>
+</body>
+</html>'''
+        self._audit_fast_biff("ui_served", request, status=200)
+        csp = (
+            "default-src 'none'; "
+            f"script-src 'nonce-{nonce}'; "
+            f"style-src 'nonce-{nonce}'; "
+            "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+        )
+        return web.Response(
+            text=page,
+            content_type="text/html",
+            headers={"Cache-Control": "no-store", "Content-Security-Policy": csp},
+        )
 
     # ------------------------------------------------------------------
     # Auth helper
@@ -3666,6 +3763,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/", self._handle_fast_biff_ui)
+            self._app.router.add_get("/biff", self._handle_fast_biff_ui)
             self._app.router.add_post("/biff/v1/chat", self._handle_fast_biff_chat)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)

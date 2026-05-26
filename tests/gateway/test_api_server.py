@@ -450,6 +450,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_get("/", adapter._handle_fast_biff_ui)
+    app.router.add_get("/biff", adapter._handle_fast_biff_ui)
     app.router.add_post("/biff/v1/chat", adapter._handle_fast_biff_chat)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
@@ -475,9 +477,58 @@ def auth_adapter():
 
 class TestFastBiffEndpoint:
     @pytest.mark.asyncio
+    async def test_fast_biff_ui_disabled_by_default(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": False})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/")
+            text = await resp.text()
+        assert resp.status == 503
+        assert "disabled" in text.lower()
+        assert "fast_biff.audit event=ui_disabled" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_ui_serves_mobile_shell_without_embedding_secret(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/biff")
+            text = await resp.text()
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("text/html")
+        assert resp.headers["Cache-Control"] == "no-store"
+        csp = resp.headers["Content-Security-Policy"]
+        assert "default-src 'none'" in csp
+        assert "connect-src 'self'" in csp
+        assert "script-src 'nonce-" in csp
+        assert "style-src 'nonce-" in csp
+        assert "Fast Biff Beta" in text
+        assert "viewport-fit=cover" in text
+        assert "<script nonce=" in text
+        assert "<style nonce=" in text
+        assert "fetch('/biff/v1/chat'" in text
+        assert "Bearer " in text
+        assert "sk-secret" not in text
+        assert "fast_biff.audit event=ui_served" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_ui_tailnet_gate_rejects_untrusted_forwarded_client(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/", headers={"X-Forwarded-For": "8.8.8.8"})
+            text = await resp.text()
+        assert resp.status == 403
+        assert "Tailscale" in text
+        assert "fast_biff.audit event=ui_tailnet_denied" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_disabled_by_default_is_kill_switch(self, caplog):
         caplog.set_level(logging.INFO)
-        adapter = _make_adapter(api_key="sk-secret")
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": False})
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
