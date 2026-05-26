@@ -191,6 +191,26 @@ _GATEWAY_SECRET_PATTERNS = (
 )
 
 
+def _running_in_container() -> bool:
+    """Return True when the gateway is likely supervised by a container runtime."""
+    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+
+def _running_under_service_manager() -> bool:
+    """Return True when /restart should hand relaunch to the process manager.
+
+    systemd exposes INVOCATION_ID. macOS launchd does not set an equivalent
+    environment variable, but LaunchDaemon/LaunchAgent jobs run as direct
+    children of PID 1.  A gateway launched from a terminal normally has a shell
+    or Python parent, so it should keep using the detached restart watcher.
+    """
+    if os.getenv("INVOCATION_ID"):
+        return True
+    if sys.platform == "darwin" and os.getppid() == 1:
+        return True
+    return False
+
+
 async def _finalize_gateway_stream_task(
     stream_task: Optional[asyncio.Task],
     stream_consumer: Any,
@@ -11406,11 +11426,10 @@ class GatewayRunner:
         # Docker/Podman container, use the service restart path: exit with
         # code 75 so the service manager / container restart policy restarts
         # us.  The detached subprocess approach (setsid + bash) doesn't work
-        # under systemd (KillMode=mixed kills the cgroup) or Docker (tini
-        # exits when the gateway dies, taking the detached helper with it).
-        _under_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
-        _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
-        if _under_service or _in_container:
+        # under systemd (KillMode=mixed kills the cgroup), launchd (service
+        # children can outlive/compete with the supervised job), or Docker
+        # (tini exits when the gateway dies, taking the detached helper with it).
+        if _running_under_service_manager() or _running_in_container():
             self.request_restart(detached=False, via_service=True)
         else:
             self.request_restart(detached=True, via_service=False)
