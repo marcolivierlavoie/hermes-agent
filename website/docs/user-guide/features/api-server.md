@@ -51,6 +51,45 @@ Or connect Open WebUI, LobeChat, or any other frontend — see the [Open WebUI i
 
 ## Endpoints
 
+### POST /biff/v1/chat
+
+Minimal direct Biff chat endpoint for trusted tailnet devices. This is intentionally not a dashboard/PWA/Cockpit UI: it is a small JSON API for fast phone/work-PC command/chat over Tailscale, with Discord still recommended as the fallback for notifications and non-tailnet contexts.
+
+Disabled by default. Enable only on a host reachable inside the tailnet, with a real bearer token:
+
+```bash
+API_SERVER_ENABLED=true
+API_SERVER_FAST_BIFF_ENABLED=true
+API_SERVER_HOST=100.x.y.z        # Prefer this host's Tailscale IP or MagicDNS-bound listener; avoid public 0.0.0.0.
+API_SERVER_KEY=$(openssl rand -hex 32)
+```
+
+Request:
+
+```bash
+curl http://biff-host.tailnet-name.ts.net:8642/biff/v1/chat \
+  -H "Authorization: Bearer <FAST_BIFF_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"what needs my attention?","session_id":"phone-fast-biff"}'
+```
+
+Response:
+
+```json
+{
+  "object": "biff.chat.completion",
+  "session_id": "phone-fast-biff",
+  "message": "..."
+}
+```
+
+Safety defaults:
+- Kill switch: `API_SERVER_FAST_BIFF_ENABLED=false` (or remove it) makes `/biff/v1/chat` return `503 fast_biff_disabled` without running an agent.
+- Auth: `/biff/v1/chat` always requires the configured API bearer token, even from loopback.
+- Tailnet guard: `API_SERVER_FAST_BIFF_TAILNET_ONLY=true` by default accepts only loopback or Tailscale CGNAT clients (`100.64.0.0/10`).
+- Trusted proxy assumption: `X-Forwarded-For` is honored only when the TCP peer is loopback or in `API_SERVER_FAST_BIFF_TRUSTED_PROXIES`; otherwise the direct peer address is used. If you put Caddy/nginx in front, terminate it on tailnet/loopback and list only that proxy IP/CIDR.
+- Audit: every gate/accept/completion path logs `fast_biff.audit` with event, status, path, a short hash of the session id, and a short hash of the client IP (not the raw IP).
+
 ### POST /v1/chat/completions
 
 Standard OpenAI Chat Completions format. Stateless — the full conversation is included in each request via the `messages` array.
@@ -340,6 +379,10 @@ The default bind address (`127.0.0.1`) is for local-only use. Browser access is 
 | `API_SERVER_KEY` | _(none)_ | Bearer token for auth |
 | `API_SERVER_CORS_ORIGINS` | _(none)_ | Comma-separated allowed browser origins |
 | `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models`. Defaults to profile name, or `hermes-agent` for default profile. |
+| `API_SERVER_FAST_BIFF_ENABLED` | `false` | Kill switch for the minimal `/biff/v1/chat` direct Biff endpoint |
+| `API_SERVER_FAST_BIFF_TAILNET_ONLY` | `true` | Require loopback or Tailscale CGNAT (`100.64.0.0/10`) client IPs for `/biff/v1/chat` |
+| `API_SERVER_FAST_BIFF_TRUSTED_PROXIES` | _(none)_ | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For` may be trusted for the tailnet guard |
+| `API_SERVER_FAST_BIFF_SESSION_PREFIX` | `fast-biff` | Prefix for derived sessions when the caller does not provide `session_id` or `X-Hermes-Session-Id` |
 
 ### config.yaml
 

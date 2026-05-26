@@ -13,7 +13,9 @@ Tests cover:
 """
 
 import asyncio
+import ipaddress
 import json
+import logging
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -427,9 +429,9 @@ class TestAuth:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
+def _make_adapter(api_key: str = "", cors_origins=None, extra_overrides=None) -> APIServerAdapter:
     """Create an adapter with optional API key."""
-    extra = {}
+    extra = dict(extra_overrides or {})
     if api_key:
         extra["key"] = api_key
     if cors_origins is not None:
@@ -448,6 +450,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_post("/biff/v1/chat", adapter._handle_fast_biff_chat)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -463,6 +466,145 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+# ---------------------------------------------------------------------------
+# Fast Biff direct tailnet endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestFastBiffEndpoint:
+    @pytest.mark.asyncio
+    async def test_disabled_by_default_is_kill_switch(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/biff/v1/chat",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"message": "ping"},
+            )
+            body = await resp.json()
+        assert resp.status == 503
+        assert body["error"]["code"] == "fast_biff_disabled"
+        assert "fast_biff.audit event=disabled" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_requires_bearer_auth_even_on_loopback(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/biff/v1/chat", json={"message": "ping"})
+            body = await resp.json()
+        assert resp.status == 401
+        assert body["error"]["code"] == "invalid_api_key"
+        assert "fast_biff.audit event=auth_denied" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_tailnet_guard_rejects_untrusted_forwarded_client(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/biff/v1/chat",
+                headers={"Authorization": "Bearer sk-secret", "X-Forwarded-For": "8.8.8.8"},
+                json={"message": "ping"},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["error"]["code"] == "fast_biff_tailnet_required"
+        assert "fast_biff.audit event=tailnet_denied" in caplog.text
+
+    def test_fast_biff_honors_xff_only_from_configured_trusted_proxy(self):
+        adapter = _make_adapter(
+            api_key="sk-secret",
+            extra_overrides={"fast_biff_enabled": True, "fast_biff_trusted_proxies": "10.0.0.0/24"},
+        )
+        request = MagicMock()
+        request.headers = {"X-Forwarded-For": "100.90.78.109"}
+        request.transport.get_extra_info.return_value = ("10.0.0.5", 12345)
+
+        client_ip = adapter._request_client_ip(request)
+
+        assert client_ip == ipaddress.ip_address("100.90.78.109")
+        assert adapter._ip_allowed_for_fast_biff(client_ip) is True
+
+    def test_fast_biff_ignores_xff_from_untrusted_direct_peer(self):
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        request = MagicMock()
+        request.headers = {"X-Forwarded-For": "100.90.78.109"}
+        request.transport.get_extra_info.return_value = ("8.8.8.8", 12345)
+
+        client_ip = adapter._request_client_ip(request)
+
+        assert client_ip == ipaddress.ip_address("8.8.8.8")
+        assert adapter._ip_allowed_for_fast_biff(client_ip) is False
+
+    def test_fast_biff_audit_hashes_client_ip_and_session_id(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        request = MagicMock()
+        request.path = "/biff/v1/chat"
+        request.headers = {}
+        request.transport.get_extra_info.return_value = ("100.90.78.109", 12345)
+
+        adapter._audit_fast_biff("completed", request, status=200, session_id="phone-session")
+
+        assert "client_ip_hash=" in caplog.text
+        assert "session_hash=" in caplog.text
+        assert "100.90.78.109" not in caplog.text
+        assert "phone-session" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_rejects_non_object_json_body(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/biff/v1/chat",
+                headers={"Authorization": "Bearer sk-secret"},
+                json=["ping"],
+            )
+            body = await resp.json()
+        assert resp.status == 400
+        assert body["error"]["message"] == "Request body must be a JSON object"
+        assert "fast_biff.audit event=bad_request" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_routes_to_agent_and_audits_success(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        captured = {}
+
+        async def fake_run_agent(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "pong", "completed": True, "session_id": kwargs["session_id"]}, {"total_tokens": 3}
+
+        with patch.object(adapter, "_run_agent", side_effect=fake_run_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/biff/v1/chat",
+                    headers={"Authorization": "Bearer sk-secret", "X-Hermes-Session-Key": "fast-biff:phone"},
+                    json={"message": " ping ", "session_id": "phone-session"},
+                )
+                body = await resp.json()
+        assert resp.status == 200
+        assert body["object"] == "biff.chat.completion"
+        assert body["message"] == "pong"
+        assert captured["user_message"] == "ping"
+        assert captured["conversation_history"] == []
+        assert captured["session_id"] == "phone-session"
+        assert captured["gateway_session_key"] == "fast-biff:phone"
+        assert "Fast Biff direct tailnet API turn" in captured["ephemeral_system_prompt"]
+        assert "fast_biff.audit event=accepted" in caplog.text
+        assert "fast_biff.audit event=completed" in caplog.text
+        assert "session_hash=" in caplog.text
+        assert "phone-session" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -61,6 +62,8 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+_TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -98,6 +101,33 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _coerce_config_bool(value: Any, default: bool = False) -> bool:
+    """Normalize bool-ish config/env values without treating arbitrary strings as true."""
+    return _coerce_request_bool(value, default=default)
+
+
+def _parse_ip_networks(value: Any) -> tuple[Any, ...]:
+    """Parse comma/list IPs or CIDRs; invalid entries are ignored fail-closed by callers."""
+    if not value:
+        return ()
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        items = [value]
+    networks = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(text, strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid API server IP/CIDR entry: %s", text)
+    return tuple(networks)
 
 
 def _normalize_chat_content(
@@ -645,6 +675,21 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._fast_biff_enabled: bool = _coerce_config_bool(
+            extra.get("fast_biff_enabled", os.getenv("API_SERVER_FAST_BIFF_ENABLED")),
+            default=False,
+        )
+        self._fast_biff_tailnet_only: bool = _coerce_config_bool(
+            extra.get("fast_biff_tailnet_only", os.getenv("API_SERVER_FAST_BIFF_TAILNET_ONLY")),
+            default=True,
+        )
+        self._fast_biff_trusted_proxies = _parse_ip_networks(
+            extra.get("fast_biff_trusted_proxies", os.getenv("API_SERVER_FAST_BIFF_TRUSTED_PROXIES", ""))
+        )
+        self._fast_biff_session_prefix: str = str(
+            extra.get("fast_biff_session_prefix", os.getenv("API_SERVER_FAST_BIFF_SESSION_PREFIX", "fast-biff"))
+            or "fast-biff"
+        ).strip()
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -734,6 +779,107 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         return "*" in self._cors_origins or origin in self._cors_origins
+
+    # ------------------------------------------------------------------
+    # Fast Biff tailnet helper
+    # ------------------------------------------------------------------
+
+    def _request_peer_ip(self, request: "web.Request") -> Optional[Any]:
+        transport = getattr(request, "transport", None)
+        if transport is None:
+            return None
+        peername = transport.get_extra_info("peername")
+        if isinstance(peername, tuple) and peername:
+            try:
+                return ipaddress.ip_address(str(peername[0]))
+            except ValueError:
+                return None
+        return None
+
+    def _request_client_ip(self, request: "web.Request") -> Optional[Any]:
+        peer_ip = self._request_peer_ip(request)
+        forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        if forwarded_for and peer_ip is not None:
+            trusted_proxy = peer_ip.is_loopback or any(peer_ip in network for network in self._fast_biff_trusted_proxies)
+            if trusted_proxy:
+                try:
+                    return ipaddress.ip_address(forwarded_for)
+                except ValueError:
+                    return None
+        return peer_ip
+
+    @staticmethod
+    def _ip_allowed_for_fast_biff(client_ip: Optional[Any]) -> bool:
+        if client_ip is None:
+            return False
+        return client_ip.is_loopback or client_ip in _TAILSCALE_CGNAT
+
+    @staticmethod
+    def _audit_ip_hash(client_ip: Optional[Any]) -> str:
+        if client_ip is None:
+            return "unknown"
+        return hashlib.sha256(str(client_ip).encode()).hexdigest()[:12]
+
+    @staticmethod
+    def _audit_session_hash(session_id: str) -> str:
+        if not session_id:
+            return "-"
+        return hashlib.sha256(session_id.encode()).hexdigest()[:12]
+
+    def _audit_fast_biff(self, event: str, request: "web.Request", *, status: int, session_id: str = "") -> None:
+        client_ip = self._request_client_ip(request)
+        logger.info(
+            "fast_biff.audit event=%s status=%s client_ip_hash=%s session_hash=%s path=%s",
+            event,
+            status,
+            self._audit_ip_hash(client_ip),
+            self._audit_session_hash(session_id),
+            request.path,
+        )
+
+    def _check_fast_biff_gate(self, request: "web.Request") -> Optional["web.Response"]:
+        if not self._fast_biff_enabled:
+            self._audit_fast_biff("disabled", request, status=503)
+            return web.json_response(
+                _openai_error("Fast Biff API is disabled by configuration.", code="fast_biff_disabled"),
+                status=503,
+            )
+        if not self._api_key:
+            self._audit_fast_biff("auth_missing", request, status=401)
+            return web.json_response(
+                _openai_error("Fast Biff API requires API_SERVER_KEY bearer authentication.", code="fast_biff_auth_required"),
+                status=401,
+            )
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            self._audit_fast_biff("auth_denied", request, status=401)
+            return auth_err
+        if self._fast_biff_tailnet_only:
+            client_ip = self._request_client_ip(request)
+            if not self._ip_allowed_for_fast_biff(client_ip):
+                self._audit_fast_biff("tailnet_denied", request, status=403)
+                return web.json_response(
+                    _openai_error(
+                        "Fast Biff API accepts only loopback or Tailscale 100.64.0.0/10 clients.",
+                        code="fast_biff_tailnet_required",
+                    ),
+                    status=403,
+                )
+        return None
+
+    def _fast_biff_session_id(self, request: "web.Request", body: Dict[str, Any]) -> tuple[Optional[str], Optional["web.Response"]]:
+        raw = str(
+            body.get("session_id")
+            or request.headers.get("X-Hermes-Session-Id", "")
+            or ""
+        ).strip()
+        if raw:
+            if re.search(r'[\r\n\x00]', raw) or len(raw) > self._MAX_SESSION_HEADER_LEN:
+                return None, web.json_response(_openai_error("Invalid session ID"), status=400)
+            return raw, None
+        client_ip = self._request_client_ip(request)
+        key = f"{self._fast_biff_session_prefix}:{self._audit_ip_hash(client_ip)}"
+        return key[: self._MAX_SESSION_HEADER_LEN], None
 
     # ------------------------------------------------------------------
     # Auth helper
@@ -972,6 +1118,81 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    async def _handle_fast_biff_chat(self, request: "web.Request") -> "web.Response":
+        """POST /biff/v1/chat — small direct Biff chat surface for tailnet clients."""
+        gate_err = self._check_fast_biff_gate(request)
+        if gate_err is not None:
+            return gate_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            self._audit_fast_biff("bad_json", request, status=400)
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+        if not isinstance(body, dict):
+            self._audit_fast_biff("bad_request", request, status=400)
+            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+
+        message = body.get("message") or body.get("input")
+        if not isinstance(message, str) or not message.strip():
+            self._audit_fast_biff("bad_request", request, status=400)
+            return web.json_response(_openai_error("Missing non-empty 'message' field"), status=400)
+
+        session_id, session_err = self._fast_biff_session_id(request, body)
+        if session_err is not None:
+            self._audit_fast_biff("bad_session", request, status=400)
+            return session_err
+
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            self._audit_fast_biff("bad_session_key", request, status=403, session_id=session_id or "")
+            return key_err
+
+        instructions = body.get("instructions")
+        if instructions is not None and not isinstance(instructions, str):
+            self._audit_fast_biff("bad_request", request, status=400, session_id=session_id or "")
+            return web.json_response(_openai_error("'instructions' must be a string when provided"), status=400)
+
+        prompt = (
+            "Fast Biff direct tailnet API turn. Treat this as Marco talking to Biff from a trusted tailnet device. "
+            "Keep Discord as the fallback for notifications and locked-down/non-tailnet contexts."
+        )
+        if instructions:
+            prompt = f"{prompt}\n\nCaller instructions:\n{instructions.strip()}"
+
+        self._audit_fast_biff("accepted", request, status=202, session_id=session_id or "")
+        try:
+            result, usage = await self._run_agent(
+                user_message=message.strip(),
+                conversation_history=[],
+                ephemeral_system_prompt=prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+        except Exception as e:
+            logger.error("Error running Fast Biff chat: %s", e, exc_info=True)
+            self._audit_fast_biff("failed", request, status=500, session_id=session_id or "")
+            return web.json_response(_openai_error(f"Internal server error: {e}", err_type="server_error"), status=500)
+
+        completed = bool(result.get("completed", True))
+        failed = bool(result.get("failed"))
+        partial = bool(result.get("partial"))
+        status = 200 if completed and not failed else 502
+        self._audit_fast_biff("completed" if status == 200 else "incomplete", request, status=status, session_id=session_id or "")
+        return web.json_response(
+            {
+                "id": f"biffchat-{uuid.uuid4().hex[:24]}",
+                "object": "biff.chat.completion",
+                "created": int(time.time()),
+                "session_id": result.get("session_id", session_id),
+                "message": result.get("final_response") or "",
+                "usage": usage,
+                "hermes": {"completed": completed, "failed": failed, "partial": partial, "error": result.get("error")},
+            },
+            status=status,
+            headers={"X-Hermes-Session-Id": result.get("session_id", session_id or "")},
+        )
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
         auth_err = self._check_auth(request)
@@ -1032,6 +1253,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "fast_biff_chat": self._fast_biff_enabled,
+                "fast_biff_tailnet_only": self._fast_biff_tailnet_only,
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -1043,6 +1266,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
+                "fast_biff_chat": {"method": "POST", "path": "/biff/v1/chat"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
@@ -3442,6 +3666,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_post("/biff/v1/chat", self._handle_fast_biff_chat)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
