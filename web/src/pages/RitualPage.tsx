@@ -6,30 +6,31 @@ import { Card, CardContent } from "@/components/ui/card";
 import { selectRitualSuggestions } from "@/lib/ritualSuggestionProvider";
 import { cn } from "@/lib/utils";
 
-const STORAGE_KEY = "biff.daily_distortion_ritual.v1";
+const STORAGE_KEY = "biff.daily_practice_ritual.v1";
+const LEGACY_STORAGE_KEY = "biff.daily_distortion_ritual.v1";
 const INACTIVITY_TIMEOUT_MINUTES = 30;
 const INACTIVITY_TIMEOUT_MS = INACTIVITY_TIMEOUT_MINUTES * 60 * 1000;
 
-const INTRO = "Daily Distortion Ritual (60-180 sec)\n\nPause gently. Pick one current worry and keep it broad enough for a public-safe note.";
+const INTRO = "Daily Practice (60-180 sec)\n\nOne focused rep: cue, agency sort, pattern, balanced thought, two-minute action, closure.";
 const QUESTIONS = [
-  "1. Control: What is one part I directly control?",
-  "2. Influence: What is one part I can nudge, ask for, or prepare?",
-  "3. No Control: What part can I release for now?",
-  "4. Distortion check: Am I mind-reading, catastrophizing, all-or-nothing thinking, should-ing, or discounting positives?",
-  "5. Pattern to watch: Which thinking pattern do I want to notice today?",
-  "6. Cue to catch it: What cue will tell me this pattern is starting? Pick, edit, or write my own.",
-  "7. Pause/name/reset: What simple move will I use when the selected pattern and cue show up?",
+  "1. Cue / habit stack: After I open this page, what tiny start will I do?",
+  "2. Control / Influence / No-control: What is one piece in each bucket?",
+  "3. Distortion or body cue: Which pattern or activation cue should I notice today?",
+  "4. Cue to catch it: What will tell me the pattern is starting? Pick, edit, or write my own.",
+  "5. Balanced truthful thought: What is a fairer thought that is not forced positivity?",
+  "6. Two-minute agency action: What tiny response will I take, and what friction can I reduce?",
+  "7. Reward / closure / private evidence: What small receipt will I notice, capture, or skip with no shame?",
 ] as const;
-const CLOSE = "Close: use the pause/name/reset move, then stop the loop.";
+const CLOSE = "Close: one breath, one tiny response counted, then stop the loop.";
 
 const EXPLANATIONS = [
-  "Name the part that is genuinely inside your next choices: a boundary, a message, a tiny action, a breath, or how you frame the problem.",
-  "Name a gentle lever: something you can ask, prepare, clarify, schedule, or make easier, without pretending you control the outcome.",
-  "Name the piece that is not yours to solve right now. Releasing is not approval; it is refusing to keep carrying what cannot be moved by rumination.",
-  "Look for common brain shortcuts: mind-reading, catastrophizing, all-or-nothing thinking, should-ing, or ignoring evidence that things are not all bad.",
-  "Choose one pattern to watch without arguing with it. Naming it early is the practice.",
-  "Pick a cue that is easy to notice in real time. You can use a suggestion as-is, edit it, or write a custom cue.",
-  "Keep the reset tiny: pause, name the pattern, then do one grounding move or next-right action.",
+  "Make the cue obvious and the response tiny. The whole practice can be one breath if that is the right-sized rep.",
+  "Sort locus of control without pretending you own every outcome: one direct choice, one influence lever, and one thing to release for now.",
+  "Name a mechanism-level pattern or body cue early: mind-reading, catastrophizing, all-or-nothing, should-ing, discounting positives, urgency, or tightness.",
+  "Pick a cue that is easy to notice in real time. Suggestions are sanitized chips only; raw details stay in the answer box and this browser.",
+  "Aim for truthful nuance, not positivity. Separate fact, story, uncertainty, and one balanced thought you can act from.",
+  "Use the two-minute rule: choose the smallest useful action, then make it easier by removing one bit of friction.",
+  "Reward closure by noticing that the rep happened. Capture private evidence only if useful; skipping or stopping still counts.",
 ] as const;
 
 type RitualAnswer = {
@@ -131,7 +132,8 @@ function suggestionOptions(state: RitualState): string[] {
 export default function RitualPage() {
   const [state, setState] = useState<RitualState>(() => {
     if (typeof window === "undefined") return freshState();
-    return safeStoredState(window.localStorage.getItem(STORAGE_KEY)) ?? freshState();
+    const stored = window.localStorage.getItem(STORAGE_KEY) ?? window.localStorage.getItem(LEGACY_STORAGE_KEY);
+    return safeStoredState(stored) ?? freshState();
   });
   const [draft, setDraft] = useState("");
   const [showExplain, setShowExplain] = useState(false);
@@ -260,8 +262,8 @@ export default function RitualPage() {
                   <Moon className="h-5 w-5" />
                 </div>
                 <div className="min-w-0">
-                  <p className="text-xs uppercase tracking-[0.22em] text-[var(--cockpit-muted)]">Biff ritual surface</p>
-                  <h1 className="mt-2 text-2xl font-semibold tracking-[-0.03em] text-[var(--cockpit-text)] sm:text-3xl">Daily Distortion Ritual</h1>
+                  <p className="text-xs uppercase tracking-[0.22em] text-[var(--cockpit-muted)]">Daily Practice home</p>
+                  <h1 className="mt-2 text-2xl font-semibold tracking-[-0.03em] text-[var(--cockpit-text)] sm:text-3xl">Mental Health Daily Ritual</h1>
                   <p className="mt-3 whitespace-pre-line text-sm leading-6 text-[color-mix(in_srgb,var(--cockpit-text)_74%,transparent)]">{INTRO}</p>
                 </div>
               </div>
@@ -337,7 +339,7 @@ export default function RitualPage() {
                     </Button>
                     <Button ghost onClick={handleSkip} className="min-h-12 rounded-2xl border border-[var(--cockpit-border)] text-[var(--cockpit-text)]">
                       <SkipForward className="mr-2 h-4 w-4" />
-                      Skip
+                      Too much / skip
                     </Button>
                     <Button ghost onClick={handleStop} className="min-h-12 rounded-2xl border border-[var(--cockpit-border)] text-[var(--cockpit-text)]">
                       <Square className="mr-2 h-4 w-4" />
@@ -357,14 +359,14 @@ export default function RitualPage() {
                       <p className="text-xs uppercase tracking-[0.2em]">{state.exitReason === "completed" ? "Ritual complete" : state.exitReason === "inactivity_timeout" ? "Ritual timed out" : "Ritual stopped"}</p>
                     </div>
                     <h2 className="mt-4 text-xl font-semibold text-[var(--cockpit-text)]">{state.exitReason === "completed" ? CLOSE : state.exitReason === "inactivity_timeout" ? `Timed out after ${INACTIVITY_TIMEOUT_MINUTES} minutes of inactivity. Nothing else is required.` : "Stopped. Nothing else is required."}</h2>
-                    <p className="mt-3 text-sm leading-6 text-[color-mix(in_srgb,var(--cockpit-text)_74%,transparent)]">Answers remain only in this browser unless Marco chooses to copy them elsewhere. n8n can stay the scheduler/notification owner; Discord should only point here or act as fallback. In-progress sessions time out locally after {INACTIVITY_TIMEOUT_MINUTES} minutes of inactivity.</p>
+                    <p className="mt-3 text-sm leading-6 text-[color-mix(in_srgb,var(--cockpit-text)_74%,transparent)]">Raw answers remain local to this browser and are not re-displayed on the completion screen. Use private evidence capture only by explicit choice. In-progress sessions time out locally after {INACTIVITY_TIMEOUT_MINUTES} minutes of inactivity.</p>
                   </div>
 
                   <div className="space-y-3">
                     {state.answers.map((answer) => (
                       <article key={`${answer.questionIndex}-${answer.answeredAt}`} className="rounded-2xl border border-[var(--cockpit-border)] bg-[var(--cockpit-panel)] p-4">
                         <p className="text-xs text-[var(--cockpit-muted)]">{answer.question}</p>
-                        <p className={cn("mt-2 text-sm leading-6", answer.skipped ? "text-[var(--cockpit-muted)]" : "text-[var(--cockpit-text)]")}>{answer.skipped ? "Skipped" : answer.answer}</p>
+                        <p className={cn("mt-2 text-sm leading-6", answer.skipped ? "text-[var(--cockpit-muted)]" : "text-[var(--cockpit-text)]")}>{answer.skipped ? "Skipped — no-shame path used" : "Response captured locally"}</p>
                       </article>
                     ))}
                   </div>

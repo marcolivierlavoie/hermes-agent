@@ -276,3 +276,71 @@ def test_explicit_ranger_correction_does_not_route_to_forge_direct_lane():
 def test_explicit_quill_and_vex_corrections_route_to_named_specialist():
     assert plan_biff_turn("this is for quill, not forge").specialist == "quill"
     assert plan_biff_turn("this is for vex, not forge").specialist == "vex"
+
+
+def test_explicit_moment_coach_triggers_route_to_mental_health_runtime():
+    for prompt in (
+        "coach me through this",
+        "distortion check",
+        "help me step back",
+        "I am spiraling",
+        "I need perspective",
+        "mental health check",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action == "mental_health_coach"
+        assert plan.runtime == "mental_health_moment"
+        assert plan.toolset_profile == "mental_health"
+        assert plan.allow_bundle_selection is False
+        assert plan.max_live_tool_calls == 0
+        assert plan.background is False
+        assert plan.specialist is None
+        assert plan.to_dict()["moment_semantics"] == "decline_safe_opt_in"
+        assert "mechanism_map" in plan.to_dict()
+        assert all("private" not in label.lower() for label in plan.to_dict()["mechanism_map"])
+
+
+def test_ambient_high_confidence_activation_returns_opt_in_not_forced_coaching():
+    plan = plan_biff_turn("I am looping hard, activated, and everything feels urgent right now.")
+
+    assert plan.action == "mental_health_opt_in"
+    assert plan.runtime == "mental_health_routing_prompt"
+    assert plan.toolset_profile == "mental_health"
+    assert plan.allow_bundle_selection is False
+    assert plan.max_live_tool_calls == 0
+    assert plan.background is False
+    assert plan.specialist is None
+    assert plan.to_dict()["moment_semantics"] == "opt_in_routing_only"
+
+
+def test_decline_or_stay_tactical_does_not_route_to_coaching():
+    for prompt in (
+        "I am spiraling but don't coach me; just help me draft the reply.",
+        "mental health check later, stay tactical right now",
+        "not coaching, just tell me the next practical step",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action == "answer_now"
+        assert plan.runtime == "direct_answer"
+        assert plan.allow_bundle_selection is False
+        assert plan.to_dict()["moment_semantics"] == "declined_or_tactical"
+
+
+def test_daily_ritual_handoff_routes_to_dashboard_ritual_entry():
+    for prompt in (
+        "start the daily ritual",
+        "open the mental health daily ritual",
+        "take me to the ritual page",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action == "ritual_entry"
+        assert plan.runtime == "dashboard_ritual_entry"
+        assert plan.toolset_profile == "dashboard"
+        assert plan.allow_bundle_selection is False
+        assert plan.max_live_tool_calls == 0
+        assert plan.background is False
+        assert plan.specialist is None
+        assert plan.to_dict()["dashboard_handoff"] == "BIF-1425 ritual page"

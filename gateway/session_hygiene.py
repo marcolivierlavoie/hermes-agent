@@ -232,6 +232,12 @@ BIFF_TURN_TOOLSET_PROFILES: dict[str, frozenset[str]] = {
     "resume": frozenset({"session_search", "terminal", "file", "kanban"}),
     "secondbrain": frozenset({"terminal", "file"}),
     "web": frozenset({"web", "search", "browser", "terminal", "file"}),
+    # Mental-health moment and dashboard ritual routing is intentionally
+    # zero-tool at the planner layer: the live turn should present a focused
+    # opt-in/handoff surface, not broaden into general agent tools or private
+    # source retrieval.
+    "mental_health": frozenset(),
+    "dashboard": frozenset(),
     "base": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
     "specialist": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
     "command": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
@@ -823,8 +829,6 @@ def apply_biff_turn_toolset_plan(
 
     original = [str(toolset) for toolset in (enabled_toolsets or []) if str(toolset).strip()]
     configured = {str(toolset) for toolset in (configured_toolsets or original) if str(toolset).strip()}
-    if str(platform_key or "").strip().lower() != "discord":
-        return sorted(dict.fromkeys(original))
     if extract_biff_bundle_key(message):
         return sorted(dict.fromkeys(original))
     try:
@@ -835,6 +839,8 @@ def apply_biff_turn_toolset_plan(
     except Exception:
         allowed = None
     if allowed is None:
+        return sorted(dict.fromkeys(original))
+    if str(platform_key or "").strip().lower() != "discord" and allowed:
         return sorted(dict.fromkeys(original))
     selected = {toolset for toolset in original if toolset in allowed}
     # Web/status/board plans may need a narrow toolset that the base v3 profile

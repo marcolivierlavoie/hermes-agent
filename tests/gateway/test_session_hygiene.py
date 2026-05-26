@@ -148,6 +148,35 @@ def test_turn_toolset_plan_grants_web_and_browser_for_links():
     assert enabled == ["browser", "file", "search", "terminal", "web"]
 
 
+def test_turn_toolset_plan_zero_tools_for_mental_health_moment_and_dashboard_handoff():
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search", "browser"]
+
+    assert apply_biff_turn_toolset_plan({}, "discord", configured, message="distortion check") == []
+    assert apply_biff_turn_toolset_plan({}, "discord", configured, message="open the mental health daily ritual") == []
+
+
+def test_turn_toolset_plan_applies_zero_tool_mental_health_surfaces_across_platforms():
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search", "browser"]
+
+    assert apply_biff_turn_toolset_plan({}, "telegram", configured, message="distortion check") == []
+    assert apply_biff_turn_toolset_plan({}, "api_server", configured, message="start the daily ritual") == []
+
+
+def test_turn_toolset_plan_preserves_non_discord_for_regular_tool_profiles():
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search", "browser"]
+
+    assert apply_biff_turn_toolset_plan({}, "telegram", configured, message="Status check only: tell me what K-1346 says") == sorted(configured)
+
+
+def test_turn_toolset_plan_bundle_messages_still_bypass_planner():
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
+    message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'
+
+    enabled = apply_biff_turn_toolset_plan({}, "discord", configured, message=message)
+
+    assert enabled == sorted(configured)
+
+
 def test_turn_toolset_plan_keeps_specialist_base_for_bundle_message():
     configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
     message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'

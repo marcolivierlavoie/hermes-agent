@@ -154,6 +154,37 @@ _NOT_FORGE_RE = re.compile(
     r"\bnot\s+forge\b|\bfor\s+(?:ranger|quill|vex)\b",
     re.IGNORECASE,
 )
+_MENTAL_HEALTH_DECLINE_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|no|not)\s+(?:coach|coaching|mental\s+health|therapy)\b"
+    r"|\b(?:stay|keep\s+it)\s+(?:tactical|practical)\b"
+    r"|\b(?:just|only)\s+(?:help\s+me\s+)?(?:draft|write|tell|give)\b",
+    re.IGNORECASE,
+)
+_RITUAL_ENTRY_RE = re.compile(
+    r"\b(?:start|open|launch|show|take\s+me\s+to|handoff\s+to|hand\s+off\s+to)\b"
+    r".*\b(?:daily\s+)?(?:mental\s+health\s+)?ritual(?:\s+(?:page|entry|surface|practice))?\b"
+    r"|\b(?:daily\s+practice|daily\s+ritual|ritual\s+page|ritual\s+entry)\b",
+    re.IGNORECASE,
+)
+_MENTAL_HEALTH_EXPLICIT_RE = re.compile(
+    r"\b(?:coach\s+me\s+through\s+this|distortion\s+check|help\s+me\s+step\s+back|"
+    r"i\s+am\s+spiraling|i'm\s+spiraling|i\s+need\s+perspective|mental\s+health\s+check)\b",
+    re.IGNORECASE,
+)
+_AMBIENT_ACTIVATION_RE = re.compile(
+    r"(?=.*\b(?:looping|activated|spiral(?:ing)?|ruminating|stuck\s+in\s+a\s+loop)\b)"
+    r"(?=.*\b(?:urgent|urgency|hard|everything|overwhelmed|tight|flooded)\b)",
+    re.IGNORECASE,
+)
+
+_MENTAL_HEALTH_MECHANISM_MAP = (
+    "activation-noticing",
+    "cognitive-distortion-check",
+    "locus-of-control-sort",
+    "balanced-thought-reframe",
+    "two-minute-agency-step",
+    "decline-safe-close",
+)
 
 
 @dataclass(frozen=True)
@@ -191,6 +222,9 @@ class BiffTurnPlan:
     background: bool = False
     specialist: str | None = None
     requires_current_info: bool = False
+    moment_semantics: str | None = None
+    mechanism_map: tuple[str, ...] = ()
+    dashboard_handoff: str | None = None
 
     def to_route(self) -> BiffIntentRoute:
         return BiffIntentRoute(
@@ -211,6 +245,9 @@ class BiffTurnPlan:
             "background": self.background,
             "specialist": self.specialist,
             "requires_current_info": self.requires_current_info,
+            "moment_semantics": self.moment_semantics,
+            "mechanism_map": list(self.mechanism_map),
+            "dashboard_handoff": self.dashboard_handoff,
         }
 
 
@@ -230,6 +267,55 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("answer_now", "empty or whitespace-only prompt", "direct_answer", 0, False, "none")
     if re.fullmatch(r"(?i)\s*(?:hi|hello|hey|yo|sup|thanks|thank you|ok|okay|gm|gn)[.!?\s]*", body):
         return BiffTurnPlan("answer_now", "casual greeting or acknowledgement", "direct_answer", 0, False, "none")
+    if _MENTAL_HEALTH_DECLINE_RE.search(body) and (
+        _MENTAL_HEALTH_EXPLICIT_RE.search(body)
+        or _AMBIENT_ACTIVATION_RE.search(body)
+        or re.search(r"\b(?:coach|coaching|mental\s+health|therapy)\b", body, re.IGNORECASE)
+    ):
+        return BiffTurnPlan(
+            "answer_now",
+            "moment-coach declined or tactical-only request; keep #hermes in direct practical support, not coaching",
+            "direct_answer",
+            0,
+            False,
+            "none",
+            moment_semantics="declined_or_tactical",
+            mechanism_map=_MENTAL_HEALTH_MECHANISM_MAP,
+        )
+    if _RITUAL_ENTRY_RE.search(body):
+        return BiffTurnPlan(
+            "ritual_entry",
+            "dashboard ritual-entry handoff to BIF-1425 ritual page",
+            "dashboard_ritual_entry",
+            0,
+            False,
+            "dashboard",
+            moment_semantics="dashboard_handoff_only",
+            mechanism_map=_MENTAL_HEALTH_MECHANISM_MAP,
+            dashboard_handoff="BIF-1425 ritual page",
+        )
+    if _MENTAL_HEALTH_EXPLICIT_RE.search(body):
+        return BiffTurnPlan(
+            "mental_health_coach",
+            "explicit moment-coach trigger routes to decline-safe mental-health moment runtime",
+            "mental_health_moment",
+            0,
+            False,
+            "mental_health",
+            moment_semantics="decline_safe_opt_in",
+            mechanism_map=_MENTAL_HEALTH_MECHANISM_MAP,
+        )
+    if _AMBIENT_ACTIVATION_RE.search(body):
+        return BiffTurnPlan(
+            "mental_health_opt_in",
+            "ambient high-confidence activation noticing returns opt-in/routing prompt only, not forced coaching",
+            "mental_health_routing_prompt",
+            0,
+            False,
+            "mental_health",
+            moment_semantics="opt_in_routing_only",
+            mechanism_map=_MENTAL_HEALTH_MECHANISM_MAP,
+        )
     if _SPECIALIST_CONTROL_RE.search(body):
         return BiffTurnPlan("one_tool", "specialist control request must stay in Biff/controller, not route to the specialist being controlled", "status_read", 2, False, "status")
     if _SPECIALIST_REVIEW_BEFORE_SEND_RE.search(body):
