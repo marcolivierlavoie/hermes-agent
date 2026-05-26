@@ -256,6 +256,42 @@ def test_specialist_misroute_feedback_stays_with_biff_controller():
         assert plan.specialist is None
 
 
+def test_specialist_keyword_mentions_without_assignment_do_not_dispatch():
+    for prompt in (
+        "I feel like Forge might be overkill here.",
+        "Ranger will still be needed if we use the native dispatcher, right?",
+        "Quill is probably just documentation, not execution.",
+        "Vex verification seems important before done.",
+        "The native Kanban dispatcher may have too much access.",
+        "The runtime and gateway should stay stable during this change.",
+        "The gateway change seems risky.",
+        "The runtime change seems risky.",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.runtime != "specialist_work"
+        assert plan.background is False
+        assert plan.specialist is None
+
+
+def test_role_keyword_with_clear_assignment_still_dispatches():
+    cases = {
+        "Ask Forge to fix the gateway routing bug.": "forge",
+        "Have Vex verify the live UI actually works.": "vex",
+        "Route this to Ranger for board cleanup.": "ranger",
+        "Dispatch this to Vex for verification.": "vex",
+        "Delegate this to Forge for implementation.": "forge",
+        "Send this to Quill for the runbook.": "quill",
+    }
+    for prompt, expected_role in cases.items():
+        plan = plan_biff_turn(prompt)
+
+        assert plan.runtime == "specialist_work"
+        assert plan.background is True
+        assert plan.specialist == expected_role
+
+
+
 def test_restart_done_followup_stays_with_biff_controller_continuation():
     for prompt in (
         "I'll just say restart done",

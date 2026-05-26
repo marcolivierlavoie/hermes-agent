@@ -108,9 +108,10 @@ _REPLY_FIX_FOLLOWUP_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _EXPLICIT_SPECIALIST_RE = re.compile(
-    r"\b(?:use|ask|have|send|hand(?:\s+this)?\s+(?:to|off\s+to)|route\s+(?:to|through)|for)\s+"
+    r"\b(?:use|ask|have|send|dispatch|delegate|hand(?:\s+this)?\s+(?:to|off\s+to)|route\s+(?:to|through)|for)\s+"
     r"(?P<role>forge|ranger|quill|vex)\b"
-    r"|\b(?P<role2>forge|ranger|quill|vex)\b\s+(?:should|can|please|pls|needs?\s+to|must|go\s+do)\b",
+    r"|\b(?:send|route|dispatch|delegate|hand\s+off)\b(?:\s+\w+){0,4}\s+(?:to|through)\s+(?P<role2>forge|ranger|quill|vex)\b"
+    r"|\b(?P<role3>forge|ranger|quill|vex)\b\s+(?:should|can|please|pls|needs?\s+to|must|go\s+do)\b",
     re.IGNORECASE,
 )
 _SPECIALIST_CONTROL_RE = re.compile(
@@ -153,6 +154,13 @@ _RANGER_TASK_CORRECTION_RE = re.compile(
 )
 _NOT_FORGE_RE = re.compile(
     r"\bnot\s+forge\b|\bfor\s+(?:ranger|quill|vex)\b",
+    re.IGNORECASE,
+)
+_CONCEPTUAL_ENGINEERING_COMMENTARY_RE = re.compile(
+    r"\b(?:gateway|runtime|repo|repository|code|bug|dashboard|api|workflow|flow|kanban|dispatcher)\b"
+    r".*\b(?:seems?|feels?|looks?|sounds?|might|may|probably|risky|risk|important|stable|overkill|needed)\b"
+    r"|\b(?:seems?|feels?|looks?|sounds?|might|may|probably|risky|risk|important|stable|overkill|needed)\b"
+    r".*\b(?:gateway|runtime|repo|repository|code|bug|dashboard|api|workflow|flow|kanban|dispatcher)\b",
     re.IGNORECASE,
 )
 _MENTAL_HEALTH_DECLINE_RE = re.compile(
@@ -343,7 +351,12 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         )
     explicit_specialist = _EXPLICIT_SPECIALIST_RE.search(body)
     if explicit_specialist:
-        role = (explicit_specialist.group("role") or explicit_specialist.group("role2") or "").lower()
+        role = (
+            explicit_specialist.group("role")
+            or explicit_specialist.group("role2")
+            or explicit_specialist.group("role3")
+            or ""
+        ).lower()
         if role in {"forge", "ranger", "quill", "vex"}:
             return BiffTurnPlan(
                 f"{role}_direct",
@@ -435,6 +448,8 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("route_bundle", "QA/validation work should stay in the live Biff turn unless Vex is explicit", "workflow", 4, True, "base")
     if _VEX_QA_RE.search(body) and not _IMPLEMENTATION_ACTION_RE.search(body):
         return BiffTurnPlan("route_bundle", "QA/validation work should stay in the live Biff turn unless Vex is explicit", "workflow", 4, True, "base")
+    if _CONCEPTUAL_ENGINEERING_COMMENTARY_RE.search(body):
+        return BiffTurnPlan("route_bundle", "engineering/runtime concept mention without explicit assignment should stay with Biff", "workflow", 2, True, "base")
     if _FORGE_DIRECT_RE.search(body) and _ACTION_RE.search(body):
         return BiffTurnPlan("forge_direct", "engineering action should route to Forge's nonblocking implementation lane", "specialist_work", 2, False, "specialist", background=True, specialist="forge")
     if _SLOW_WORK_RE.search(body):
@@ -451,8 +466,6 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("route_bundle", "explicit specialist correction should not force Forge", "workflow", 2, True, "base")
     if is_direct_question_without_action(body):
         return BiffTurnPlan("answer_now", "direct question without action request", "direct_answer", 0, False, "none")
-    if _FORGE_DIRECT_RE.search(body):
-        return BiffTurnPlan("forge_direct", "engineering work should route to Forge's nonblocking implementation lane", "specialist_work", 2, False, "specialist", background=True, specialist="forge")
     return BiffTurnPlan("route_bundle", "workflow request may benefit from bundle context", "workflow", 2, True, "base")
 
 

@@ -603,7 +603,7 @@ def test_create_triage_lands_in_triage_column(client):
         "/api/plugins/kanban/tasks",
         json={"title": "rough idea, spec me", "triage": True},
     )
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     task = r.json()["task"]
     assert task["status"] == "triage"
 
@@ -613,8 +613,81 @@ def test_create_triage_lands_in_triage_column(client):
     assert triage["tasks"][0]["title"] == "rough idea, spec me"
 
 
+def test_dashboard_triage_capture_returns_guardrail_notes(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "rough dashboard capture", "triage": True},
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    task = data["task"]
+    assert task["status"] == "triage"
+    assert task["assignee"] is None
+    assert data.get("guardrail_notes") == [
+        "created in triage because no assignee was provided",
+        "add a description/acceptance criteria before promoting from triage",
+    ]
+
+
+def test_dashboard_assigned_create_is_ready_dispatchable_work(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "routed dashboard card", "assignee": "forge"},
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    task = data["task"]
+    assert task["status"] == "ready"
+    assert task["assignee"] == "forge"
+    assert "guardrail_notes" not in data
+
+
+def test_dashboard_refuses_explicit_ready_without_assignee(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "unsafe ready card", "triage": False},
+    )
+
+    assert r.status_code == 400
+    assert "cannot be created as ready without an assignee" in r.json()["detail"]
+
+
+def test_dashboard_refuses_promoting_unassigned_triage_capture_to_ready(client):
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "rough capture", "triage": True},
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "ready"},
+    )
+
+    assert r.status_code == 400
+    assert "Cannot promote triage capture to ready without an assignee" in r.json()["detail"]
+
+
+def test_dashboard_can_assign_and_promote_triage_capture_to_ready(client):
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "routed capture", "triage": True},
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"assignee": "forge", "status": "ready"},
+    )
+
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["status"] == "ready"
+    assert task["assignee"] == "forge"
+
+
 def test_triage_task_not_promoted_to_ready(client):
-    """Triage tasks must stay in triage even when they have no parents."""
+
     client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "must stay put", "triage": True},

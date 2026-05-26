@@ -559,7 +559,7 @@ class CreateTaskBody(BaseModel):
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
-    triage: bool = False
+    triage: Optional[bool] = None
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
@@ -570,6 +570,16 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        # The dashboard inline-create UI sends an explicit triage flag based on
+        # the column. Preserve API compatibility for existing programmatic
+        # callers that omit it, but block explicit ready/unassigned dashboard
+        # creates below so rough captures stay non-executable.
+        effective_triage = bool(payload.triage) if payload.triage is not None else False
+        if payload.triage is False and not payload.assignee:
+            raise HTTPException(
+                status_code=400,
+                detail="Dashboard tasks cannot be created as ready without an assignee; set an assignee or leave triage enabled.",
+            )
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
@@ -581,13 +591,20 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,
-            triage=payload.triage,
+            triage=effective_triage,
             idempotency_key=payload.idempotency_key,
             max_runtime_seconds=payload.max_runtime_seconds,
             skills=payload.skills,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        guardrail_notes: list[str] = []
+        if task and task.status == "triage" and not payload.assignee:
+            guardrail_notes.append("created in triage because no assignee was provided")
+        if task and task.status == "triage" and not (payload.body or "").strip():
+            guardrail_notes.append("add a description/acceptance criteria before promoting from triage")
+        if guardrail_notes:
+            body["guardrail_notes"] = guardrail_notes
         # Surface a dispatcher-presence warning so the UI can show a
         # banner when a `ready` task would otherwise sit idle because no
         # gateway is running (or dispatch_in_gateway=false). Only emit
@@ -666,6 +683,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             elif s == "ready":
                 # Re-open a blocked/scheduled task, or just an explicit status set.
                 current = kanban_db.get_task(conn, task_id)
+                current_assignee = (current.assignee if current else None) or None
+                if current and current.status == "triage" and not current_assignee:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Cannot promote triage capture to ready without an assignee; assign it first or keep it in triage.",
+                    )
                 if current and current.status in ("blocked", "scheduled"):
                     ok = kanban_db.unblock_task(conn, task_id)
                 else:
