@@ -132,6 +132,51 @@ async def test_gateway_stop_interrupts_after_drain_timeout():
 
 
 @pytest.mark.asyncio
+async def test_gateway_signal_shutdown_pre_marks_resume_pending_before_drain():
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 0.05
+    runner._pre_mark_shutdown_resume_pending = True
+
+    adapter.disconnect = AsyncMock()
+    running_agent = MagicMock()
+    runner._running_agents = {"session": running_agent}
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    runner.session_store.mark_resume_pending.assert_any_call(
+        "session",
+        "shutdown_timeout",
+    )
+    running_agent.interrupt.assert_called_once_with("Gateway shutting down")
+
+
+@pytest.mark.asyncio
+async def test_gateway_signal_shutdown_clears_pre_mark_after_graceful_drain():
+    runner, adapter = make_restart_runner()
+    runner._pre_mark_shutdown_resume_pending = True
+    adapter.disconnect = AsyncMock()
+    running_agent = MagicMock()
+    runner._running_agents = {"session": running_agent}
+
+    async def finish_agent():
+        await asyncio.sleep(0.01)
+        runner._running_agents.clear()
+
+    asyncio.create_task(finish_agent())
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    runner.session_store.mark_resume_pending.assert_called_once_with(
+        "session",
+        "shutdown_timeout",
+    )
+    runner.session_store.clear_resume_pending.assert_called_once_with("session")
+    running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_service_restart_sets_named_exit_code():
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()

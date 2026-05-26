@@ -921,20 +921,25 @@ class APIServerAdapter(BasePlatformAdapter):
     #log {{ flex:1; overflow:auto; border:1px solid var(--line); border-radius:18px; background:rgba(17,24,39,.76); padding:12px; display:flex; flex-direction:column; gap:10px; }}
     .msg {{ white-space:pre-wrap; padding:10px 12px; border-radius:14px; max-width:94%; }} .me {{ align-self:flex-end; background:#1d4f70; }} .biff {{ align-self:flex-start; background:#182236; }} .sys {{ align-self:center; color:var(--muted); font-size:.9rem; }} .err {{ color:var(--bad); }}
     form {{ display:grid; grid-template-columns:1fr auto; gap:8px; }} textarea,input,button {{ font:inherit; border-radius:14px; border:1px solid var(--line); }} textarea,input {{ width:100%; background:#0f1726; color:var(--text); padding:11px; }} textarea {{ min-height:68px; resize:vertical; }}
-    .row {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }} button {{ background:var(--accent); color:#031421; font-weight:700; padding:0 16px; min-height:48px; }} button:disabled {{ opacity:.55; }}
+    .row {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }} .auth-row {{ grid-template-columns:1fr auto auto; }} button {{ background:var(--accent); color:#031421; font-weight:700; padding:0 16px; min-height:48px; }} button:disabled {{ opacity:.55; }}
     small {{ color:var(--muted); }} @media (max-width:640px) {{ .row, form {{ grid-template-columns:1fr; }} button {{ width:100%; }} }}
   </style>
 </head>
 <body>
 <main>
   <header><h1>Fast Biff Beta</h1><p>Tailnet-only Safari chat shell. Token stays in this browser; Discord remains the fallback.</p></header>
-  <div class="row">
+  <form id="auth" class="row auth-row" autocomplete="off">
     <input id="token" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Fast Biff API token" type="password">
+    <button id="saveToken" type="submit">Save key</button>
+    <button id="clearToken" type="button">Clear</button>
+  </form>
+  <div class="row">
     <input id="session" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Session ID, optional" value="{session_prefix}:ios-beta">
+    <small id="authStatus" role="status">Key not saved yet.</small>
   </div>
-  <div id="log" aria-live="polite"><div class="sys">Ready. Paste token once, then ask Biff.</div></div>
+  <div id="log" aria-live="polite"><div class="sys">Ready. Paste token once, press Enter or Save key, then ask Biff. Keep the same Session ID to continue after a gateway restart.</div></div>
   <form id="chat"><textarea id="message" placeholder="Ask Biff…" required></textarea><button id="send" type="submit">Send</button></form>
-  <small>Beta: one-at-a-time requests, no attachments yet, no token is embedded in this page.</small>
+  <small>Beta: one-at-a-time requests, no attachments yet, no token is embedded in this page. Restart continuity: if the gateway reloads mid-request, wait for it to come back and resend with the same Session ID.</small>
 </main>
 <script nonce="{nonce}">
 const $ = (id) => document.getElementById(id);
@@ -943,24 +948,87 @@ const token = $('token');
 const session = $('session');
 const message = $('message');
 const send = $('send');
-token.value = localStorage.getItem('fastBiffToken') || '';
-session.value = localStorage.getItem('fastBiffSession') || session.value;
+const authStatus = $('authStatus');
+const saveToken = $('saveToken');
+const clearToken = $('clearToken');
+const tokenStorageKey = 'fastBiffToken';
+const sessionStorageKey = 'fastBiffSession';
+let savedToken = localStorage.getItem(tokenStorageKey) || '';
+token.value = savedToken;
+session.value = localStorage.getItem(sessionStorageKey) || session.value;
 function add(kind, text) {{ const el = document.createElement('div'); el.className = 'msg ' + kind; el.textContent = text; log.appendChild(el); log.scrollTop = log.scrollHeight; }}
+function setAuthStatus(text, isError) {{ authStatus.textContent = text; authStatus.className = isError ? 'err' : ''; }}
+function refreshAuthState() {{ savedToken = localStorage.getItem(tokenStorageKey) || ''; setAuthStatus(savedToken ? 'Key saved in this browser.' : 'Key not saved yet.', !savedToken); }}
+function saveAuthToken(showMessage = true) {{
+  const apiToken = token.value.trim();
+  const sessionId = session.value.trim();
+  if (!apiToken) {{ setAuthStatus('Paste the API key, then press Enter or Save key.', true); token.focus(); return false; }}
+  localStorage.setItem(tokenStorageKey, apiToken);
+  localStorage.setItem(sessionStorageKey, sessionId);
+  savedToken = apiToken;
+  setAuthStatus('Key saved in this browser.', false);
+  if (showMessage) add('sys', 'API key saved for this browser.');
+  message.focus();
+  return true;
+}}
+refreshAuthState();
+$('auth').addEventListener('submit', (event) => {{ event.preventDefault(); saveAuthToken(true); }});
+clearToken.addEventListener('click', () => {{
+  localStorage.removeItem(tokenStorageKey);
+  savedToken = '';
+  token.value = '';
+  refreshAuthState();
+  add('sys', 'API key cleared from this browser.');
+  token.focus();
+}});
+token.addEventListener('keydown', (event) => {{
+  if (event.key === 'Enter') {{ event.preventDefault(); saveAuthToken(true); }}
+}});
+token.addEventListener('input', () => {{
+  if (token.value.trim() !== savedToken) setAuthStatus('Unsaved key — press Enter or Save key.', true);
+  else refreshAuthState();
+}});
+session.addEventListener('keydown', (event) => {{
+  if (event.key === 'Enter') {{ event.preventDefault(); localStorage.setItem(sessionStorageKey, session.value.trim()); message.focus(); }}
+}});
+session.addEventListener('change', () => localStorage.setItem(sessionStorageKey, session.value.trim()));
 $('chat').addEventListener('submit', async (event) => {{
   event.preventDefault();
-  const apiToken = token.value.trim(); const text = message.value.trim(); const sessionId = session.value.trim();
-  if (!apiToken) {{ add('sys err', 'Paste the Fast Biff API token first.'); return; }}
+  const text = message.value.trim(); const sessionId = session.value.trim();
   if (!text) return;
-  localStorage.setItem('fastBiffToken', apiToken); localStorage.setItem('fastBiffSession', sessionId);
-  add('me', text); message.value = ''; send.disabled = true; send.textContent = 'Thinking…';
+  let apiToken = savedToken || localStorage.getItem(tokenStorageKey) || '';
+  if (!apiToken) {{
+    if (!saveAuthToken(false)) {{ add('sys err', 'No API key saved. Paste it at the top and press Enter or Save key.'); return; }}
+    apiToken = savedToken;
+  }}
+  if (token.value.trim() && token.value.trim() !== apiToken) {{
+    if (!saveAuthToken(false)) return;
+    apiToken = savedToken;
+  }}
+  localStorage.setItem(sessionStorageKey, sessionId);
+  add('me', text); message.value = ''; send.disabled = true; saveToken.disabled = true; clearToken.disabled = true; send.textContent = 'Thinking…';
+  setAuthStatus('Request running…', false);
   try {{
     const resp = await fetch('/biff/v1/chat', {{ method:'POST', headers: {{ 'Authorization':'Bearer ' + apiToken, 'Content-Type':'application/json', 'X-Hermes-Session-Key': sessionId || 'fast-biff:web-beta' }}, body: JSON.stringify({{ message: text, session_id: sessionId || undefined }}) }});
     const data = await resp.json().catch(() => ({{ error: {{ message: 'Non-JSON response from server' }} }}));
-    if (!resp.ok) throw new Error(data?.error?.message || ('HTTP ' + resp.status));
-    if (data.session_id) {{ session.value = data.session_id; localStorage.setItem('fastBiffSession', data.session_id); }}
+    if (!resp.ok) {{
+      if (resp.status === 401) {{ localStorage.removeItem(tokenStorageKey); savedToken = ''; refreshAuthState(); setAuthStatus('Invalid API key. Paste the current key and Save again.', true); }}
+      else setAuthStatus('Server error: HTTP ' + resp.status, true);
+      throw new Error(data?.error?.message || ('HTTP ' + resp.status));
+    }}
+    if (data.session_id) {{ session.value = data.session_id; localStorage.setItem(sessionStorageKey, data.session_id); }}
+    refreshAuthState();
     add('biff', data.message || '(empty response)');
-  }} catch (err) {{ add('sys err', 'Error: ' + (err?.message || err)); }}
-  finally {{ send.disabled = false; send.textContent = 'Send'; message.focus(); }}
+  }} catch (err) {{
+    const msg = String(err?.message || err || '');
+    if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('Load failed')) {{
+      setAuthStatus('Gateway unavailable or restarting. Wait a moment, then resend with the same Session ID.', true);
+      add('sys err', 'Gateway unavailable or restarting. Your key and Session ID are still saved here; wait a moment, then resend to continue.');
+    }} else {{
+      add('sys err', 'Error: ' + (err?.message || err));
+    }}
+  }}
+  finally {{ send.disabled = false; saveToken.disabled = false; clearToken.disabled = false; send.textContent = 'Send'; message.focus(); }}
 }});
 </script>
 </body>
@@ -1276,18 +1344,30 @@ $('chat').addEventListener('submit', async (event) => {{
         partial = bool(result.get("partial"))
         status = 200 if completed and not failed else 502
         self._audit_fast_biff("completed" if status == 200 else "incomplete", request, status=status, session_id=session_id or "")
+        response_session_id = result.get("session_id", session_id)
+        response_headers = {"X-Hermes-Session-Id": response_session_id or ""}
+        if gateway_session_key:
+            response_headers["X-Hermes-Session-Key"] = gateway_session_key
         return web.json_response(
             {
                 "id": f"biffchat-{uuid.uuid4().hex[:24]}",
                 "object": "biff.chat.completion",
                 "created": int(time.time()),
-                "session_id": result.get("session_id", session_id),
+                "session_id": response_session_id,
                 "message": result.get("final_response") or "",
                 "usage": usage,
                 "hermes": {"completed": completed, "failed": failed, "partial": partial, "error": result.get("error")},
+                "continuity": {
+                    "session_id": response_session_id,
+                    "session_key": gateway_session_key or None,
+                    "restart_semantics": (
+                        "Reuse this session_id after a gateway restart. Completed turns are persisted; "
+                        "if a restart interrupts an in-flight request, retry the user message with the same session_id."
+                    ),
+                },
             },
             status=status,
-            headers={"X-Hermes-Session-Id": result.get("session_id", session_id or "")},
+            headers=response_headers,
         )
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":

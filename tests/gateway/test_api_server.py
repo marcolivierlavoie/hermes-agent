@@ -271,6 +271,44 @@ class TestAdapterInit:
         adapter = APIServerAdapter(config)
         assert adapter._port == 8642
 
+    @pytest.mark.asyncio
+    async def test_fast_biff_ui_has_explicit_key_save_and_chat_auth_flow(self, monkeypatch):
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"fast_biff_enabled": True, "key": "sk-test"},
+            )
+        )
+        monkeypatch.setattr(adapter, "_check_fast_biff_ui_gate", lambda request: None)
+        monkeypatch.setattr(adapter, "_audit_fast_biff", lambda *args, **kwargs: None)
+
+        request = MagicMock()
+        request.path = "/biff"
+        response = await adapter._handle_fast_biff_ui(request)
+        html_text = response.text
+
+        assert response.status == 200
+        assert response.content_type == "text/html"
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "<form id=\"auth\"" in html_text
+        assert "<button id=\"saveToken\" type=\"submit\">Save key</button>" in html_text
+        assert "<button id=\"clearToken\" type=\"button\">Clear</button>" in html_text
+        assert "clearToken.addEventListener('click'" in html_text
+        assert "token.addEventListener('keydown'" in html_text
+        assert "event.key === 'Enter'" in html_text
+        assert "localStorage.setItem(tokenStorageKey, apiToken)" in html_text
+        assert "No API key saved. Paste it at the top and press Enter or Save key." in html_text
+        assert "'Authorization':'Bearer ' + apiToken" in html_text
+        assert "fetch('/biff/v1/chat'" in html_text
+        assert "localStorage.removeItem(tokenStorageKey)" in html_text
+        assert "Invalid API key. Paste the current key and Save again." in html_text
+        assert "Server error: HTTP " in html_text
+        assert "Request running…" in html_text
+        assert "Keep the same Session ID to continue after a gateway restart." in html_text
+        assert "Gateway unavailable or restarting. Your key and Session ID are still saved here" in html_text
+        assert "API_SERVER_KEY" not in html_text
+        assert "sk-test" not in html_text
+
     def test_create_agent_forwards_config_reasoning_effort(self, monkeypatch):
         captured = {}
 
@@ -510,6 +548,8 @@ class TestFastBiffEndpoint:
         assert "<style nonce=" in text
         assert "fetch('/biff/v1/chat'" in text
         assert "Bearer " in text
+        assert "Restart continuity: if the gateway reloads mid-request" in text
+        assert "same Session ID" in text
         assert "sk-secret" not in text
         assert "fast_biff.audit event=ui_served" in caplog.text
 
@@ -647,6 +687,12 @@ class TestFastBiffEndpoint:
         assert resp.status == 200
         assert body["object"] == "biff.chat.completion"
         assert body["message"] == "pong"
+        assert body["session_id"] == "phone-session"
+        assert body["continuity"]["session_id"] == "phone-session"
+        assert body["continuity"]["session_key"] == "fast-biff:phone"
+        assert "Reuse this session_id after a gateway restart" in body["continuity"]["restart_semantics"]
+        assert resp.headers["X-Hermes-Session-Id"] == "phone-session"
+        assert resp.headers["X-Hermes-Session-Key"] == "fast-biff:phone"
         assert captured["user_message"] == "ping"
         assert captured["conversation_history"] == []
         assert captured["session_id"] == "phone-session"

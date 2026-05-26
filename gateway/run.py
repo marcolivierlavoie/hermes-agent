@@ -196,17 +196,64 @@ def _running_in_container() -> bool:
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
 
 
+def _gateway_launchd_label() -> str:
+    """Return the launchd label for the current HERMES_HOME/profile."""
+    import hashlib
+
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    home = get_hermes_home().resolve()
+    default = get_default_hermes_root().resolve()
+    suffix = ""
+    if home != default:
+        profiles_root = (default / "profiles").resolve()
+        try:
+            rel = home.relative_to(profiles_root)
+            parts = rel.parts
+            if len(parts) == 1 and re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", parts[0]):
+                suffix = parts[0]
+        except ValueError:
+            pass
+        if not suffix:
+            suffix = hashlib.sha256(str(home).encode()).hexdigest()[:8]
+    return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+
+
+def _running_under_launchd_service_manager() -> bool:
+    """Return True only when launchd is supervising this exact gateway PID."""
+    if sys.platform != "darwin" or os.getppid() != 1:
+        return False
+    label = _gateway_launchd_label()
+    targets = [f"system/{label}", f"gui/{os.getuid()}/{label}"]
+    for target in targets:
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", target],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        if result.returncode != 0:
+            continue
+        match = re.search(r"\bpid\s*=\s*(\d+)\b", result.stdout or "")
+        if match is not None and int(match.group(1)) == os.getpid():
+            return True
+    return False
+
+
 def _running_under_service_manager() -> bool:
     """Return True when /restart should hand relaunch to the process manager.
 
     systemd exposes INVOCATION_ID. macOS launchd does not set an equivalent
-    environment variable, but LaunchDaemon/LaunchAgent jobs run as direct
-    children of PID 1.  A gateway launched from a terminal normally has a shell
-    or Python parent, so it should keep using the detached restart watcher.
+    environment variable, and orphaned manual gateways can also have PPID 1.
+    For launchd, verify the profile-scoped launchd job is loaded and points at
+    this exact PID; otherwise use the detached restart watcher.
     """
     if os.getenv("INVOCATION_ID"):
         return True
-    if sys.platform == "darwin" and os.getppid() == 1:
+    if _running_under_launchd_service_manager():
         return True
     return False
 
@@ -2091,6 +2138,7 @@ class GatewayRunner:
     _restart_task_started: bool = False
     _restart_detached: bool = False
     _restart_via_service: bool = False
+    _pre_mark_shutdown_resume_pending: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
@@ -2133,6 +2181,7 @@ class GatewayRunner:
         self._restart_task_started = False
         self._restart_detached = False
         self._restart_via_service = False
+        self._pre_mark_shutdown_resume_pending = False
         self._stop_task: Optional[asyncio.Task] = None
         
         # Track running agents per session for interrupt support
@@ -4395,7 +4444,17 @@ class GatewayRunner:
 
         async def _run_restart() -> None:
             await asyncio.sleep(0.05)
-            await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
+            # Keep the teardown task alive even if shutdown later cancels this
+            # restart-driver task while sweeping gateway background tasks.  A
+            # plain await lets cancellation propagate into self._stop_task,
+            # leaving adapters disconnected but the old process still alive.
+            await asyncio.shield(
+                self.stop(
+                    restart=True,
+                    detached_restart=detached,
+                    service_restart=via_service,
+                )
+            )
 
         task = asyncio.create_task(_run_restart())
         self._background_tasks.add(task)
@@ -6547,6 +6606,32 @@ class GatewayRunner:
             self._running = False
             self._draining = True
 
+            # Pre-mark restart/signalled-shutdown sessions as resume_pending
+            # before any awaited shutdown work. Service managers can SIGKILL
+            # the process before our configured drain timeout elapses (launchd's
+            # default ExitTimeOut is especially short), so timeout-only marking
+            # below can be too late. If the drain finishes cleanly we clear
+            # these speculative markers immediately, leaving no stale resume flag.
+            _pre_drain_keys: list[str] = []
+            _pre_mark_resume_pending = bool(
+                self._restart_requested or self._pre_mark_shutdown_resume_pending
+            )
+            if _pre_mark_resume_pending:
+                _pre_drain_reason = (
+                    "restart_timeout" if self._restart_requested else "shutdown_timeout"
+                )
+                for _sk, _agent in list(self._running_agents.items()):
+                    if _agent is _AGENT_PENDING_SENTINEL:
+                        continue
+                    try:
+                        self.session_store.mark_resume_pending(
+                            _sk,
+                            _pre_drain_reason,
+                        )
+                        _pre_drain_keys.append(_sk)
+                    except Exception as _e:
+                        logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
+
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
@@ -6556,27 +6641,6 @@ class GatewayRunner:
             )
 
             timeout = self._restart_drain_timeout
-
-            # Pre-mark restart sessions as resume_pending BEFORE the drain wait.
-            # If the process is killed by the service manager during a restart
-            # drain, the durable marker is already written so the next gateway
-            # boot can recover in-flight sessions (#27856). Plain shutdowns do
-            # not pre-mark: if their drain finishes cleanly they should leave no
-            # stale resume flag, and timeout handling below marks only sessions
-            # that are still running at the deadline.
-            _pre_drain_keys: list[str] = []
-            if self._restart_requested:
-                for _sk, _agent in list(self._running_agents.items()):
-                    if _agent is _AGENT_PENDING_SENTINEL:
-                        continue
-                    try:
-                        self.session_store.mark_resume_pending(
-                            _sk,
-                            "restart_timeout",
-                        )
-                        _pre_drain_keys.append(_sk)
-                    except Exception as _e:
-                        logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
@@ -20742,6 +20806,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             )
         else:
             _signal_initiated_shutdown = True
+            runner._pre_mark_shutdown_resume_pending = True
             logger.info(
                 "Received %s — initiating shutdown",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",

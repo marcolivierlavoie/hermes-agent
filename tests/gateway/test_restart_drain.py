@@ -14,6 +14,76 @@ from gateway.session import SessionEntry, build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
+def test_macos_orphan_gateway_uses_detached_restart_not_service(monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.setattr(gateway_run.sys, "platform", "darwin")
+    monkeypatch.setattr(gateway_run.os, "getppid", lambda: 1)
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 113, stdout="", stderr="not loaded")
+
+    monkeypatch.setattr(gateway_run.subprocess, "run", fake_run)
+
+    assert gateway_run._running_under_service_manager() is False
+
+
+def test_macos_launchd_gateway_uses_service_restart(monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.setattr(gateway_run.sys, "platform", "darwin")
+    monkeypatch.setattr(gateway_run.os, "getppid", lambda: 1)
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 1234)
+    monkeypatch.setattr(gateway_run.os, "getuid", lambda: 501)
+    monkeypatch.setattr(gateway_run, "_gateway_launchd_label", lambda: "ai.hermes.gateway-biff")
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args[0], 0, stdout='\tpid = 1234\n', stderr="")
+
+    monkeypatch.setattr(gateway_run.subprocess, "run", fake_run)
+
+    assert gateway_run._running_under_service_manager() is True
+    assert calls == [["launchctl", "print", "system/ai.hermes.gateway-biff"]]
+
+
+def test_macos_launchagent_gateway_uses_service_restart_after_system_miss(monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.setattr(gateway_run.sys, "platform", "darwin")
+    monkeypatch.setattr(gateway_run.os, "getppid", lambda: 1)
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 1234)
+    monkeypatch.setattr(gateway_run.os, "getuid", lambda: 501)
+    monkeypatch.setattr(gateway_run, "_gateway_launchd_label", lambda: "ai.hermes.gateway-biff")
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        if args[0][-1].startswith("system/"):
+            return subprocess.CompletedProcess(args[0], 113, stdout="", stderr="not loaded")
+        return subprocess.CompletedProcess(args[0], 0, stdout='\tpid = 1234\n', stderr="")
+
+    monkeypatch.setattr(gateway_run.subprocess, "run", fake_run)
+
+    assert gateway_run._running_under_service_manager() is True
+    assert calls == [
+        ["launchctl", "print", "system/ai.hermes.gateway-biff"],
+        ["launchctl", "print", "gui/501/ai.hermes.gateway-biff"],
+    ]
+
+
+def test_macos_launchd_pid_mismatch_uses_detached_restart(monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.setattr(gateway_run.sys, "platform", "darwin")
+    monkeypatch.setattr(gateway_run.os, "getppid", lambda: 1)
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 1234)
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, stdout='\tpid = 9999\n', stderr="")
+
+    monkeypatch.setattr(gateway_run.subprocess, "run", fake_run)
+
+    assert gateway_run._running_under_service_manager() is False
+
+
 @pytest.mark.asyncio
 async def test_restart_command_while_busy_requests_drain_without_interrupt(monkeypatch):
     # Ensure INVOCATION_ID is NOT set — systemd sets this in service mode,
@@ -160,6 +230,52 @@ async def test_request_restart_is_idempotent():
     runner.stop.assert_awaited_once_with(
         restart=True, detached_restart=True, service_restart=False
     )
+
+
+@pytest.mark.asyncio
+async def test_request_restart_driver_cancellation_does_not_cancel_stop(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    stop_started = asyncio.Event()
+    stop_may_finish = asyncio.Event()
+    stop_completed = asyncio.Event()
+
+    async def fake_stop(**_kwargs):
+        stop_started.set()
+        await stop_may_finish.wait()
+        stop_completed.set()
+
+    runner.stop = fake_stop
+
+    assert runner.request_restart(detached=True, via_service=False) is True
+    restart_task = next(iter(runner._background_tasks))
+
+    await asyncio.wait_for(stop_started.wait(), timeout=1)
+    restart_task.cancel()
+    await asyncio.sleep(0)
+
+    assert stop_completed.is_set() is False
+    stop_may_finish.set()
+    await asyncio.wait_for(stop_completed.wait(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await restart_task
+
+
+@pytest.mark.asyncio
+async def test_restart_stop_cancels_restart_driver_without_aborting_teardown(monkeypatch, tmp_path):
+    runner, _adapter = make_restart_runner()
+    runner.stop = gateway_run.GatewayRunner.stop.__get__(runner, gateway_run.GatewayRunner)
+    runner._drain_active_agents = AsyncMock(return_value=({}, False))
+    runner._finalize_shutdown_agents = MagicMock()
+    runner._launch_detached_restart_command = AsyncMock()
+    runner._cleanup_agent_resources = MagicMock()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    assert runner.request_restart(detached=False, via_service=True) is True
+
+    await asyncio.wait_for(runner._shutdown_event.wait(), timeout=2)
+    assert runner._draining is False
+    assert runner._exit_code == gateway_run.GATEWAY_SERVICE_RESTART_EXIT_CODE
+    assert runner._shutdown_event.is_set()
 
 
 @pytest.mark.asyncio

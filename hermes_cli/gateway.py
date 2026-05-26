@@ -2773,6 +2773,10 @@ def generate_launchd_plist() -> str:
     sane_path = ":".join(
         dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p])
     )
+    # launchd's default ExitTimeOut is short enough to SIGKILL a gateway in
+    # the middle of its restart/shutdown drain. Match systemd's headroom.
+    _drain_timeout = int(_get_restart_drain_timeout() or 0)
+    exit_timeout = max(60, _drain_timeout) + 30
 
     # Build ProgramArguments array, including --profile when using a named profile
     prog_args = [
@@ -2817,6 +2821,9 @@ def generate_launchd_plist() -> str:
     
     <key>RunAtLoad</key>
     <true/>
+
+    <key>ExitTimeOut</key>
+    <integer>{exit_timeout}</integer>
     
     <key>KeepAlive</key>
     <dict>
