@@ -21,8 +21,8 @@ RUN_PY = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
 def test_specialist_direct_dispatch_ack_keeps_hermes_free():
     source = RUN_PY.read_text()
 
-    assert "I’m sending this to {_specialist_role.title()} now" in source
-    assert "I’ll keep chatting here and post progress in #biff-ops" in source
+    assert "I’m sending this to {_specialist_role.title()} via Kanban now" in source
+    assert "Plain follow-ups queue for my next turn; use `/steer ...`" in source
     assert "I asked {_specialist_role.title()} to take this in the background" not in source
     assert "It will keep #biff-ops updated with useful summaries and leave full detail in #{_specialist_role}" not in source
     assert "I’ll bring the final done/blocked result back here" not in source

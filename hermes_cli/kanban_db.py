@@ -1838,6 +1838,81 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         return True
 
 
+def admin_update_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: Optional[str] = None,
+    assignee: Optional[str] = None,
+    priority: Optional[int] = None,
+    author: Optional[str] = None,
+    comment: Optional[str] = None,
+) -> Optional[Task]:
+    """Apply an audited operator/admin edit to a Kanban task.
+
+    This is the deliberately-small board-hygiene primitive used by Ranger-style
+    orchestrator profiles: direct status moves, assignee correction, priority
+    correction, and an optional explanatory comment. It refuses active running
+    claims so operators use the explicit reclaim path before mutating a live
+    worker.
+    """
+    task_id = _coerce_task_id(conn, task_id)
+    if status is not None and status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+    if status == "running":
+        raise ValueError("admin_update_task cannot move a task directly to running; use claim/dispatch")
+    if status == "done":
+        raise ValueError("admin_update_task cannot mark done; use complete_task so run metadata is preserved")
+    next_assignee = _canonical_assignee(assignee) if assignee is not None else None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, priority, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] == "running" or row["claim_lock"] is not None:
+            raise RuntimeError(
+                f"cannot admin-update {task_id}: currently running/claimed; reclaim it first"
+            )
+
+        updates: list[str] = []
+        params: list[Any] = []
+        changes: dict[str, dict[str, Any]] = {}
+        if status is not None and status != row["status"]:
+            updates.append("status = ?")
+            params.append(status)
+            changes["status"] = {"from": row["status"], "to": status}
+        if assignee is not None and next_assignee != row["assignee"]:
+            updates.append("assignee = ?")
+            params.append(next_assignee)
+            updates.append("consecutive_failures = 0")
+            updates.append("last_failure_error = NULL")
+            changes["assignee"] = {"from": row["assignee"], "to": next_assignee}
+        if priority is not None and int(priority) != int(row["priority"] or 0):
+            updates.append("priority = ?")
+            params.append(int(priority))
+            changes["priority"] = {"from": row["priority"], "to": int(priority)}
+
+        if updates:
+            params.append(task_id)
+            conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?", tuple(params))
+        if comment:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, author or "operator", str(comment), int(time.time())),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "admin_updated",
+            {"author": author, "changes": changes, "commented": bool(comment)},
+        )
+    if status == "archived":
+        recompute_ready(conn)
+    return get_task(conn, task_id)
+
+
 # ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
@@ -2165,17 +2240,21 @@ def _synthesize_ended_run(
 def recompute_ready(conn: sqlite3.Connection) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
+    ``blocked`` is an explicit human/operator gate, not a dependency-waiting
+    state.  A blocked task must stay blocked until ``unblock_task`` (or another
+    explicit status action) moves it out; otherwise parent-free blocked cards
+    satisfy ``all([])`` and silently re-enter the dispatch queue.
+
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
     """
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status FROM tasks WHERE status IN ('todo', 'blocked')"
+            "SELECT id FROM tasks WHERE status = 'todo'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
-            cur_status = row["status"]
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -2183,20 +2262,10 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
-                # Blocked tasks also get their failure counters reset —
-                # this is effectively an auto-unblock.
-                if cur_status == "blocked":
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready', "
-                        "consecutive_failures = 0, last_failure_error = NULL "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                    (task_id,),
+                )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted

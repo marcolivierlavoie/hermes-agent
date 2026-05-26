@@ -748,6 +748,51 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_admin(args: dict, **kw) -> str:
+    """Apply Ranger/orchestrator board-hygiene edits to a known task."""
+    guard = _require_orchestrator_tool("kanban_admin")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    status = args.get("status")
+    assignee = args.get("assignee") if "assignee" in args else None
+    priority = args.get("priority") if "priority" in args else None
+    comment = args.get("comment")
+    if status is None and assignee is None and priority is None and not comment:
+        return tool_error("pass at least one of status, assignee, priority, or comment")
+    board = args.get("board")
+    author = os.environ.get("HERMES_PROFILE") or "orchestrator"
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.admin_update_task(
+                conn,
+                str(tid),
+                status=str(status) if status is not None else None,
+                assignee=_normalize_profile(assignee) if "assignee" in args else None,
+                priority=int(priority) if priority is not None else None,
+                author=author,
+                comment=str(comment) if comment else None,
+            )
+            if task is None:
+                return tool_error(f"no such task: {tid}")
+            return _ok(
+                task_id=task.id,
+                status=task.status,
+                assignee=task.assignee,
+                priority=task.priority,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_admin: {e}")
+    except Exception as e:
+        logger.exception("kanban_admin failed")
+        return tool_error(f"kanban_admin: {e}")
+
+
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
     parent_id = args.get("parent_id")
@@ -1192,6 +1237,32 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_ADMIN_SCHEMA = {
+    "name": "kanban_admin",
+    "description": (
+        "Apply audited Kanban board-hygiene edits for an orchestrator/admin "
+        "profile such as Ranger: status move, assignee correction, priority "
+        "correction, and/or explanatory comment. Orchestrator-only; "
+        "dispatcher-spawned workers never see this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Task id to update."},
+            "status": {
+                "type": "string",
+                "enum": ["triage", "todo", "scheduled", "ready", "blocked", "review", "archived"],
+                "description": "Optional new status. Use complete_task/kanban_complete for done.",
+            },
+            "assignee": {"type": "string", "description": "Optional new assignee; pass 'none' to unassign."},
+            "priority": {"type": "integer", "description": "Optional new priority."},
+            "comment": {"type": "string", "description": "Optional audit comment explaining the admin action."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -1285,6 +1356,15 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_admin",
+    toolset="kanban",
+    schema=KANBAN_ADMIN_SCHEMA,
+    handler=_handle_admin,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🛠",
 )
 
 registry.register(

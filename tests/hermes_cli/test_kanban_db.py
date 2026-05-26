@@ -221,32 +221,88 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
-def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
-    """blocked tasks with all parents done should be promoted to ready."""
+def test_recompute_ready_does_not_promote_blocked_without_explicit_unblock(kanban_home):
+    """blocked tasks are human/ops gated and must not auto-unblock."""
+    with kb.connect() as conn:
+        blocked = kb.create_task(
+            conn,
+            title="needs source material",
+            assignee="quill",
+            initial_status="blocked",
+        )
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=5, "
+            "last_failure_error='needs source material' WHERE id=?",
+            (blocked,),
+        )
+        conn.commit()
+
+        promoted = kb.recompute_ready(conn)
+
+        task = kb.get_task(conn, blocked)
+        assert promoted == 0
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 5
+        assert task.last_failure_error == "needs source material"
+        assert not any(e.kind == "promoted" for e in kb.list_events(conn, blocked))
+
+
+def test_recompute_ready_preserves_blocked_even_after_parents_done(kanban_home):
+    """parent completion alone is not an explicit unblock action."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
         child = kb.create_task(
             conn, title="child", assignee="a", parents=[parent],
         )
-        # Complete the parent
         kb.claim_task(conn, parent)
         kb.complete_task(conn, parent, result="ok")
-        # Manually block the child (simulates a worker that failed
-        # after the parent finished)
         conn.execute(
             "UPDATE tasks SET status='blocked', consecutive_failures=5, "
             "last_failure_error='persistent error' WHERE id=?",
             (child,),
         )
         conn.commit()
-        assert kb.get_task(conn, child).status == "blocked"
-        # recompute_ready should promote blocked → ready and reset failures
+
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
+
+        task = kb.get_task(conn, child)
+        assert promoted == 0
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 5
+        assert task.last_failure_error == "persistent error"
+
+
+def test_recompute_ready_still_promotes_todo_with_done_parents(kanban_home):
+    """eligible todo stories still auto-promote when dependencies close."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(conn, title="child", assignee="a", parents=[parent])
+        assert kb.get_task(conn, child).status == "todo"
+
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="ok")
+
         task = kb.get_task(conn, child)
         assert task.status == "ready"
-        assert task.consecutive_failures == 0
-        assert task.last_failure_error is None
+        assert any(e.kind == "promoted" for e in kb.list_events(conn, child))
+
+
+def test_dispatch_once_does_not_spawn_blocked_parent_free_cards(kanban_home):
+    """dispatcher recompute must not silently move blocked no-parent cards to ready."""
+    spawned = []
+    with kb.connect() as conn:
+        blocked = kb.create_task(
+            conn,
+            title="needs human input",
+            assignee="quill",
+            initial_status="blocked",
+        )
+
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: spawned.append(task.id))
+
+        assert res.promoted == 0
+        assert spawned == []
+        assert kb.get_task(conn, blocked).status == "blocked"
 
 
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):

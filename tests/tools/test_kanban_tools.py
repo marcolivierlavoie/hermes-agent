@@ -137,7 +137,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
-        "kanban_unblock",
+        "kanban_unblock", "kanban_admin",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -1690,7 +1690,7 @@ def test_board_param_rejects_invalid_slug(multi_board_env):
 
 
 def test_board_param_in_all_schemas():
-    """All nine kanban_* tool schemas must expose an optional ``board``
+    """All ten kanban_* tool schemas must expose an optional ``board``
     parameter. This pins the contract surfaced to the LLM — adding a
     new kanban tool without ``board`` will fail CI immediately."""
     from tools import kanban_tools as kt
@@ -1704,6 +1704,7 @@ def test_board_param_in_all_schemas():
         kt.KANBAN_COMMENT_SCHEMA,
         kt.KANBAN_CREATE_SCHEMA,
         kt.KANBAN_UNBLOCK_SCHEMA,
+        kt.KANBAN_ADMIN_SCHEMA,
         kt.KANBAN_LINK_SCHEMA,
     ]
     for schema in schemas:
@@ -1716,3 +1717,62 @@ def test_board_param_in_all_schemas():
         assert "board" not in schema["parameters"].get("required", []), (
             f"{schema['name']} marks board as required; must be optional"
         )
+
+
+def test_orchestrator_admin_updates_status_assignee_priority_and_archives(monkeypatch, tmp_path):
+    """Ranger-style direct Kanban admin can make audited hygiene edits without file/system tools."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "ranger")
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="board hygiene", assignee="forge", triage=True, priority=1)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_admin({
+        "task_id": tid,
+        "status": "ready",
+        "assignee": "vex",
+        "priority": 42,
+        "comment": "authorized cleanup",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    assert d["task_id"] == tid
+    assert d["status"] == "ready"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.assignee == "vex"
+        assert task.priority == 42
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "admin_updated" for e in events)
+        assert any(c.author == "ranger" and c.body == "authorized cleanup" for c in kb.list_comments(conn, tid))
+
+    archived = kt._handle_admin({"task_id": tid, "status": "archived"})
+    assert json.loads(archived).get("ok") is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "archived"
+
+
+def test_worker_admin_rejects_foreign_task_id(worker_env):
+    """Dispatcher workers must not gain Ranger's broad board-hygiene mutation surface."""
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        other = kb.create_task(conn, title="foreign", assignee="peer", triage=True)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_admin({"task_id": other, "status": "ready"})
+    err = json.loads(out).get("error", "")
+    assert "orchestrator-only" in err
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, other).status == "triage"

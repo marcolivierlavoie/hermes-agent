@@ -8674,6 +8674,41 @@ class GatewayRunner:
                                 "I’ll keep chatting here and post progress in #biff-ops."
                             )
                         _task_id = f"{_specialist_role}_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+                        if os.getenv("HERMES_BIFF_SPECIALISTS_USE_KANBAN", "1").lower() not in {"0", "false", "no", "off"}:
+                            try:
+                                _kanban_ref = self._create_specialist_kanban_task(
+                                    role=_specialist_role,
+                                    prompt=_specialist_instruction,
+                                    original_text=_original_text,
+                                    dispatch_key=_dispatch_key,
+                                    source=source,
+                                )
+                            except Exception as _dispatch_exc:
+                                logger.warning(
+                                    "biff_kanban_specialist_dispatch_blocked: platform=%s role=%s task=%s error=%s",
+                                    source.platform.value if source.platform else "gateway",
+                                    _specialist_role,
+                                    _task_id,
+                                    _dispatch_exc,
+                                )
+                                return (
+                                    f"{_specialist_role.title()} dispatch is temporarily degraded, so I did not run this live. "
+                                    "I’ll keep chatting here; Biff can retry once Kanban is healthy."
+                                )
+                            _done = asyncio.get_running_loop().create_future()
+                            _done.set_result(_kanban_ref)
+                            _done._hermes_task_id = _kanban_ref  # type: ignore[attr-defined]
+                            _active_specialist[_dispatch_key] = _done
+                            logger.info(
+                                "biff_kanban_specialist_dispatch: platform=%s role=%s task=%s",
+                                source.platform.value if source.platform else "gateway",
+                                _specialist_role,
+                                _kanban_ref,
+                            )
+                            return (
+                                f"I’m sending this to {_specialist_role.title()} via Kanban now ({_kanban_ref}); "
+                                "I’ll keep chatting here. Plain follow-ups queue for my next turn; use `/steer ...` to guide the active run."
+                            )
                         try:
                             _task = asyncio.create_task(
                                 self._run_specialist_direct_background_task(
@@ -13344,6 +13379,59 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
+
+    def _create_specialist_kanban_task(
+        self,
+        *,
+        role: str,
+        prompt: str,
+        original_text: str,
+        dispatch_key: str,
+        source: "SessionSource",
+    ) -> str:
+        """Create the native Kanban card backing a Biff specialist handoff."""
+        from hermes_cli import kanban_db as _kanban_db
+
+        normalized_role = str(role or "forge").strip().lower()
+        board = os.getenv("HERMES_BIFF_KANBAN_BOARD", "biff-os")
+        repo = Path(os.getenv("HERMES_BIFF_RUNTIME_DIR", "/Users/marco/.hermes/hermes-agent-biff-runtime"))
+        title_prefix = normalized_role.title()
+        title_text = " ".join(str(original_text or prompt).strip().split())
+        if len(title_text) > 96:
+            title_text = title_text[:93].rstrip() + "..."
+        body = (
+            f"Biff routed this user-facing request to {title_prefix} through native Hermes Kanban.\n\n"
+            "User request:\n"
+            f"{original_text}\n\n"
+            "Specialist execution contract:\n"
+            f"{prompt}\n\n"
+            "Control plane: keep Biff's current chat responsive. Plain follow-ups queue for the next turn; "
+            "`/steer ...` injects mid-run guidance without interrupting active work. Role-channel updates are observability only."
+        )
+        skill_map = {
+            "forge": ["hermes-agent"],
+            "vex": [],
+            "quill": [],
+            "ranger": ["kanban-worker"],
+        }
+        with _kanban_db.connect(board=board) as conn:
+            task_id = _kanban_db.create_task(
+                conn,
+                title=f"{title_prefix}: {title_text or 'specialist handoff'}",
+                body=body,
+                assignee=normalized_role,
+                created_by="biff",
+                workspace_kind="dir",
+                workspace_path=str(repo),
+                tenant=board,
+                priority=100,
+                triage=False,
+                idempotency_key=f"biff-specialist:{normalized_role}:{dispatch_key}",
+                max_runtime_seconds=int(os.getenv("HERMES_BIFF_SPECIALIST_KANBAN_TIMEOUT", "1800")),
+                skills=skill_map.get(normalized_role) or None,
+            )
+            task = _kanban_db.get_task(conn, task_id)
+        return (task.display_id or task.id) if task else task_id
 
     async def _run_forge_direct_background_task(
         self,
