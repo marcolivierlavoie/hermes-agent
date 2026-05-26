@@ -216,6 +216,8 @@ BIFF_DISCORD_V2_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
 # and skill editing.
 BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
     {
+        "web",
+        "search",
         "terminal",
         "file",
         "memory",

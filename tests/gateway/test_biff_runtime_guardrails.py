@@ -129,6 +129,19 @@ def test_loop_bounding_synthetic_scenarios_cover_empty_or_broad_searches():
     assert scenarios["refresh_resume_context_recovery"].max_tool_calls == 3
 
 
+def test_biff_v3_discord_profile_keeps_web_search_available():
+    from gateway.session_hygiene import apply_biff_tool_schema_profile
+
+    enabled = apply_biff_tool_schema_profile(
+        {},
+        "discord",
+        ["terminal", "file", "memory", "skills", "todo", "kanban", "web", "search"],
+    )
+
+    assert "web" in enabled
+    assert "search" in enabled
+
+
 def test_operator_note_exists_for_gateway_queue_update_changes():
     note = RUN_PY.parents[1] / "docs" / "biff-runtime-guardrails-operator-note.md"
     text = note.read_text()

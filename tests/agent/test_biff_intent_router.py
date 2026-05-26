@@ -70,6 +70,14 @@ def test_explicit_fresh_or_online_lookup_routes_quick_web():
     assert route.max_live_tool_calls == 3
 
 
+def test_live_sports_score_routes_quick_web():
+    route = route_biff_live_intent("What's the score for the Habs game btw?")
+
+    assert route.action == "quick_web"
+    assert route.allow_bundle_selection is False
+    assert route.max_live_tool_calls == 3
+
+
 def test_bare_url_routes_quick_web_not_answer_now():
     plan = plan_biff_turn(
         "Can you see this thread https://www.reddit.com/r/hermesagent/comments/1tlyfob/best_localfirst_ai_memory_assistant_second_brain/"

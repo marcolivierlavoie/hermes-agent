@@ -17,6 +17,8 @@ from typing import Any, Iterable
 PASS = "pass"
 FAIL = "fail"
 
+BIFF_V3_SPECIALIST_TOOLSETS = ("file", "kanban", "memory", "search", "skills-read", "terminal", "todo", "web")
+
 
 @dataclass(frozen=True)
 class SyntheticScenario:
@@ -102,7 +104,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Keep K-1348 open until real live testing is complete.",
         expected_action="ranger_direct",
         expected_runtime="specialist_work",
-        expected_toolsets=("file", "kanban", "memory", "skills-read", "terminal", "todo"),
+        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
         max_tool_calls=24,
         expected_background=True,
         expected_specialist="ranger",
@@ -112,7 +114,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Create a Kanban story for proper Biff routing and move it to todo.",
         expected_action="ranger_direct",
         expected_runtime="specialist_work",
-        expected_toolsets=("file", "kanban", "memory", "skills-read", "terminal", "todo"),
+        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
         max_tool_calls=24,
         expected_background=True,
         expected_specialist="ranger",
@@ -122,7 +124,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Delete Cockpit from the Hermes dashboard sidebar and verify it is gone.",
         expected_action="forge_direct",
         expected_runtime="specialist_work",
-        expected_toolsets=("file", "kanban", "memory", "skills-read", "terminal", "todo"),
+        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
         max_tool_calls=24,
         expected_background=True,
         expected_specialist="forge",
@@ -132,7 +134,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Have Vex QA the dashboard change and verify the live UI actually works.",
         expected_action="vex_direct",
         expected_runtime="specialist_work",
-        expected_toolsets=("file", "kanban", "memory", "skills-read", "terminal", "todo"),
+        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
         max_tool_calls=24,
         expected_background=True,
         expected_specialist="vex",
@@ -142,7 +144,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Have Quill research and document the new Biff routing contract in Obsidian.",
         expected_action="quill_direct",
         expected_runtime="specialist_work",
-        expected_toolsets=("file", "kanban", "memory", "skills-read", "terminal", "todo"),
+        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
         max_tool_calls=24,
         expected_background=True,
         expected_specialist="quill",
@@ -152,7 +154,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Continue the current task, but do not resume stale emergency summary turns.",
         expected_action="route_bundle",
         expected_runtime="continuation",
-        expected_toolsets=("file", "kanban", "memory", "skills-read", "terminal", "todo"),
+        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
         max_tool_calls=16,
     ),
     SyntheticScenario(
@@ -168,7 +170,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Archive every old Linear story and scan the entire Obsidian workspace for references before updating the board.",
         expected_action="ranger_direct",
         expected_runtime="specialist_work",
-        expected_toolsets=("file", "kanban", "memory", "skills-read", "terminal", "todo"),
+        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
         max_tool_calls=24,
         expected_background=True,
         expected_specialist="ranger",

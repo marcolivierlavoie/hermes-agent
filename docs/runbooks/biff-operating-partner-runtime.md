@@ -2,6 +2,16 @@
 
 BIF-1353 adds a structural runtime overlay for Marco/Biff sessions. It is not a cosmetic tone pass: `agent/system_prompt.py` conditionally injects `agent/biff_operating_partner.py` when the loaded identity/SOUL content is clearly Marco+Biff, when the profile home is `profiles/biff`, or when `HERMES_BIFF_OPERATING_PARTNER=1` is set.
 
+Canonical operating contract: `docs/runbooks/biff-radar-spark-care-operating-contract.md`.
+Canonical Obsidian Dreaming runbook: `/Users/marco/Library/Mobile Documents/iCloud~md~obsidian/Documents/SecondBrain/02-Areas/Hermes/Biff Dreaming Artifact Pipeline and Idea Shelf Runbook - BIF-1353.md`.
+Canonical Obsidian template: `/Users/marco/Library/Mobile Documents/iCloud~md~obsidian/Documents/SecondBrain/07-Templates/Hermes/Biff Dreaming Artifact.md`.
+
+Source-of-truth split:
+- Obsidian is the durable archive for Dreaming artifacts, Idea Shelf entries, Proposal Queue context, operating contracts, and summaries.
+- Native Hermes Kanban board `biff-os` is the active task ledger: priority, status, ownership, blockers, acceptance criteria, execution evidence, and closure.
+- Mnemosyne / memory is stable context only; it is not a task list, archive, proof log, or idea database.
+- Live chat is for conversation and progress visibility, not durable truth.
+
 ## What changes
 
 The overlay makes these first-class operating responsibilities:
