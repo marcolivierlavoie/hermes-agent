@@ -87,8 +87,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    _soul_content = ""
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md()
+        _soul_content = _r.load_soul_md() or ""
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -96,6 +97,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Marco/Biff operating-partner overlay. This is conditional on the loaded
+    # identity/SOUL content (or explicit env/profile override), so generic Hermes
+    # sessions remain unchanged while Biff gains structural Radar/Spark/Care and
+    # Dreaming/Idea-Shelf behavior.
+    try:
+        from agent.biff_operating_partner import build_biff_operating_partner_guidance
+
+        _biff_guidance = build_biff_operating_partner_guidance(
+            _soul_content if _soul_loaded else DEFAULT_AGENT_IDENTITY
+        )
+        if _biff_guidance:
+            stable_parts.append(_biff_guidance)
+    except Exception:
+        pass
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
