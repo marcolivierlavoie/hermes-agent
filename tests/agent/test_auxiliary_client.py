@@ -1867,6 +1867,90 @@ class TestAuxiliaryAuthRefreshRetry:
         assert resp.choices[0].message.content == "fresh-async"
         mock_refresh.assert_called_once_with("openai-codex")
 
+
+class TestVisionRuntimeFallback:
+    def test_call_llm_falls_back_when_codex_vision_returns_malformed_response(self):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://chatgpt.com/backend-api/codex"
+        primary_client.chat.completions.create.side_effect = TypeError(
+            "'NoneType' object is not iterable"
+        )
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://openrouter.ai/api/v1"
+        fallback_client.chat.completions.create.return_value = _DummyResponse("vision fallback")
+
+        main_fallback = MagicMock()
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("openai-codex", primary_client, "gpt-5.4-mini"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback_client, "google/gemini-3-flash-preview", "openrouter"),
+            ) as configured_fallback,
+            patch("agent.auxiliary_client._try_main_agent_model_fallback", side_effect=main_fallback),
+        ):
+            resp = call_llm(
+                task="vision",
+                provider="openai-codex",
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": "describe this image"}],
+            )
+
+        assert resp.choices[0].message.content == "vision fallback"
+        configured_fallback.assert_called_once_with(
+            "vision", "openai-codex", reason="vision provider error"
+        )
+        main_fallback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_falls_back_when_codex_vision_returns_malformed_response(self):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://chatgpt.com/backend-api/codex"
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=TypeError("'NoneType' object is not iterable")
+        )
+
+        fallback_sync_client = MagicMock()
+        fallback_sync_client.base_url = "https://openrouter.ai/api/v1"
+
+        fallback_async_client = MagicMock()
+        fallback_async_client.base_url = "https://openrouter.ai/api/v1"
+        fallback_async_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async vision fallback")
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("openai-codex", primary_client, "gpt-5.4-mini"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback_sync_client, "google/gemini-3-flash-preview", "openrouter"),
+            ) as configured_fallback,
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback_async_client, "google/gemini-3-flash-preview"),
+            ),
+            patch("agent.auxiliary_client._try_main_agent_model_fallback") as main_fallback,
+        ):
+            resp = await async_call_llm(
+                task="vision",
+                provider="openai-codex",
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": "describe this image"}],
+            )
+
+        assert resp.choices[0].message.content == "async vision fallback"
+        configured_fallback.assert_called_once_with(
+            "vision", "openai-codex", reason="vision provider error"
+        )
+        main_fallback.assert_not_called()
+
     def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
         stale_client = MagicMock()
         cache_key = ("anthropic", False, None, None, None)

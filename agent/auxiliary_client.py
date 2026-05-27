@@ -2338,6 +2338,27 @@ def _is_connection_error(exc: Exception) -> bool:
     return False
 
 
+def _is_vision_runtime_fallback_error(exc: Exception) -> bool:
+    """Detect recoverable vision-provider response failures.
+
+    Vision calls can fail after provider resolution succeeds when the selected
+    adapter/provider returns no usable response.  Treat those as reroutable so
+    screenshot/OCR requests can fall back to a configured vision backend such
+    as OpenRouter instead of surfacing adapter internals to Biff.
+    """
+    err_lower = str(exc).lower()
+    err_type = type(exc).__name__.lower()
+    return any(marker in err_lower for marker in (
+        "nonetype object is not iterable",
+        "llm returned none response",
+        "llm returned invalid response",
+        "missing choices[0].message",
+    )) or (
+        "typeerror" in err_type
+        and ("none" in err_lower or "not iterable" in err_lower)
+    )
+
+
 def _is_auth_error(exc: Exception) -> bool:
     """Detect auth failures that should trigger provider-specific refresh."""
     status = getattr(exc, "status_code", None)
@@ -4857,6 +4878,7 @@ def call_llm(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or (task == "vision" and _is_vision_runtime_fallback_error(first_err))
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -4867,7 +4889,12 @@ def call_llm(
         is_auto = resolved_provider in {"auto", "", None}
         # Capacity errors bypass the explicit-provider gate: the provider
         # literally cannot serve this request regardless of user intent.
-        is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
+        is_vision_runtime_error = task == "vision" and _is_vision_runtime_fallback_error(first_err)
+        is_capacity_error = (
+            _is_payment_error(first_err)
+            or _is_connection_error(first_err)
+            or is_vision_runtime_error
+        )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_payment_error(first_err):
                 reason = "payment error"
@@ -4880,6 +4907,8 @@ def call_llm(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif is_vision_runtime_error:
+                reason = "vision provider error"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -5219,12 +5248,18 @@ async def async_call_llm(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or (task == "vision" and _is_vision_runtime_fallback_error(first_err))
         )
         # Capacity errors (payment/quota/connection) bypass the explicit-provider
         # gate — the provider cannot serve the request regardless of user intent.
         # See #26803: daily token quota must fall back like a 402 credit error.
         is_auto = resolved_provider in {"auto", "", None}
-        is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
+        is_vision_runtime_error = task == "vision" and _is_vision_runtime_fallback_error(first_err)
+        is_capacity_error = (
+            _is_payment_error(first_err)
+            or _is_connection_error(first_err)
+            or is_vision_runtime_error
+        )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_payment_error(first_err):
                 reason = "payment error"
@@ -5233,6 +5268,8 @@ async def async_call_llm(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif is_vision_runtime_error:
+                reason = "vision provider error"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
