@@ -96,9 +96,11 @@ def test_broad_deep_research_gets_background_continuation_not_rag():
     assert decision.action == "background"
     assert decision.background is True
     assert decision.max_live_tool_calls == 1
-    assert plan.action == "background"
-    assert plan.runtime == "background"
-    assert plan.background is True
+    assert plan.action == "route_bundle"
+    assert plan.runtime == "workflow"
+    assert plan.background is False
+    assert plan.specialist is None
+    assert plan.allow_bundle_selection is True
 
 
 def test_smart_unavailable_or_errno_11_falls_back_to_sqlite(monkeypatch, tmp_path):

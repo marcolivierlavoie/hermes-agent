@@ -1025,8 +1025,11 @@ def _build_seamless_rollover_handoff(
         "previous Discord session crossed the model-facing context quota. "
         "This is not a loss of memory: raw transcripts remain archived, "
         "Mnemosyne remains authoritative for durable memory, and this compact "
-        "handoff preserves the immediate thread. Continue naturally without "
-        "telling Marco a reset happened unless he asks.]\n\n"
+        "handoff preserves the immediate thread. Tool access is determined by "
+        "the fresh turn's live tool schema, not by the previous transcript or "
+        "handoff text; do not repeat stale claims that shell/file/Kanban/repo "
+        "tools are unavailable when the current tool schema exposes them. "
+        "Continue naturally without telling Marco a reset happened unless he asks.]\n\n"
         f"Previous session: {old_session_id}\n"
         f"Fresh session: {new_session_id}\n"
         f"Rollover threshold: {threshold} prompt tokens\n"
@@ -8601,13 +8604,20 @@ class GatewayRunner:
                     get_skill_bundles,
                 )
 
+                # Build the rich prompt with quoted/reply context for the work
+                # item itself, but never use quoted context as authorization to
+                # dispatch a named specialist. Discord replies often include
+                # prior Biff/Hermes text such as "send this to Forge"; treating
+                # that quoted text as the current user's approval violates the
+                # Biff consent boundary.
+                _current_user_text = event.text or ""
                 _original_text = _message_text_with_reply_context(
-                    event.text or "",
+                    _current_user_text,
                     reply_to_text=getattr(event, "reply_to_text", None),
                     reply_to_message_id=getattr(event, "reply_to_message_id", None),
                 )
                 _biff_original_text_for_deflection = _original_text
-                _biff_live_route = route_biff_live_intent(_original_text, command=False)
+                _biff_live_route = route_biff_live_intent(_current_user_text, command=False)
                 logger.info(
                     "biff_live_intent_route: platform=%s action=%s reason=%s max_live_tool_calls=%s allow_bundle=%s",
                     source.platform.value if source.platform else "gateway",
@@ -8636,6 +8646,22 @@ class GatewayRunner:
                 _selection = None
                 if _biff_live_route.action in {"forge_direct", "ranger_direct", "quill_direct", "vex_direct"}:
                     _specialist_role = _biff_live_route.action.removesuffix("_direct")
+                    from agent.biff_role_consent import require_role_handoff_consent
+
+                    _role_consent = require_role_handoff_consent(_current_user_text, expected_role=_specialist_role)
+                    if not _role_consent.approved:
+                        logger.warning(
+                            "biff_specialist_dispatch_blocked_by_consent_gate: platform=%s role=%s reason=%s source=%s",
+                            source.platform.value if source.platform else "gateway",
+                            _specialist_role,
+                            _role_consent.reason,
+                            _role_consent.source,
+                        )
+                        return (
+                            f"I did not send this to {_specialist_role.title()}; "
+                            "named-role handoff needs a clear current-message approval like "
+                            f"“send this to {_specialist_role.title()}” or “ask {_specialist_role.title()}.”"
+                        )
                     _specialist_builders = {
                         "forge": build_forge_direct_instruction,
                         "ranger": build_ranger_direct_instruction,
@@ -8682,6 +8708,8 @@ class GatewayRunner:
                                     original_text=_original_text,
                                     dispatch_key=_dispatch_key,
                                     source=source,
+                                    approval_phrase=_role_consent.approval_phrase,
+                                    approval_source=_role_consent.source,
                                 )
                             except Exception as _dispatch_exc:
                                 logger.warning(
@@ -8700,10 +8728,12 @@ class GatewayRunner:
                             _done._hermes_task_id = _kanban_ref  # type: ignore[attr-defined]
                             _active_specialist[_dispatch_key] = _done
                             logger.info(
-                                "biff_kanban_specialist_dispatch: platform=%s role=%s task=%s",
+                                "biff_kanban_specialist_dispatch: platform=%s role=%s task=%s approval_source=%s approval_phrase=%r",
                                 source.platform.value if source.platform else "gateway",
                                 _specialist_role,
                                 _kanban_ref,
+                                _role_consent.source,
+                                _role_consent.approval_phrase,
                             )
                             return (
                                 f"I’m sending this to {_specialist_role.title()} via Kanban now ({_kanban_ref}); "
@@ -13388,6 +13418,8 @@ class GatewayRunner:
         original_text: str,
         dispatch_key: str,
         source: "SessionSource",
+        approval_phrase: str = "",
+        approval_source: str = "current_message",
     ) -> str:
         """Create the native Kanban card backing a Biff specialist handoff."""
         from hermes_cli import kanban_db as _kanban_db
@@ -13403,6 +13435,8 @@ class GatewayRunner:
             f"Biff routed this user-facing request to {title_prefix} through native Hermes Kanban.\n\n"
             "User request:\n"
             f"{original_text}\n\n"
+            "Role handoff consent:\n"
+            f"source={approval_source or 'current_message'}; approval_phrase={approval_phrase or '[not recorded]'}\n\n"
             "Specialist execution contract:\n"
             f"{prompt}\n\n"
             "Control plane: keep Biff's current chat responsive. Plain follow-ups queue for the next turn; "
@@ -13503,6 +13537,7 @@ class GatewayRunner:
                 task_id,
                 "--timeout",
                 os.getenv("HERMES_BIFF_FORGE_BACKGROUND_TIMEOUT", "900"),
+                "--approved-by-biff",
             ]
             return subprocess.run(
                 command,

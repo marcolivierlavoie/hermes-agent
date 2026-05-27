@@ -127,6 +127,20 @@ def test_vex_decision_parser_requires_explicit_top_level_decision(text: str, exp
     assert module.parse_vex_decision(text) == expected
 
 
+def test_role_invocation_script_fails_closed_without_controller_consent(monkeypatch):
+    module = load_role_invoke()
+
+    monkeypatch.delenv('HERMES_BIFF_ROLE_CONSENT_APPROVED', raising=False)
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('should not launch role')))
+    monkeypatch.setattr(
+        module.sys,
+        'argv',
+        ['biff_role_invoke.py', 'forge', 'fix the gateway', '--dry-run'],
+    )
+
+    assert module.main() == 64
+
+
 @pytest.mark.parametrize(
     ('vex_stdout', 'expected_exit'),
     [
@@ -155,7 +169,7 @@ def test_vex_role_process_only_unlocks_on_explicit_pass(monkeypatch, vex_stdout:
     monkeypatch.setattr(
         module.sys,
         'argv',
-        ['biff_role_invoke.py', 'vex', 'verify the controller gate', '--dry-run'],
+        ['biff_role_invoke.py', 'vex', 'verify the controller gate', '--dry-run', '--approved-by-biff'],
     )
 
     assert module.main() == expected_exit

@@ -193,7 +193,7 @@ BIFF_CORE_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
 
 # Default Biff Discord schema profile v2: the smallest safe fixed allowlist
 # for Biff's common build/ops lane. It keeps the shell/file/code/skills/memory
-# surfaces needed to work Kanban-backed Biff OS tasks (including explicit Linear access via
+# surfaces needed to work Kanban-backed Biff OS tasks (including explicit legacy-tracker access via
 # terminal + credential helper), named-role delegation, and todo planning, while
 # omitting large or nice-to-have schemas. Operators can still select ``full``
 # via config or HERMES_BIFF_TOOL_SCHEMA_PROFILE for rollback/escalation.
@@ -633,8 +633,8 @@ def widen_biff_toolsets_for_bundle(
 
 
 SLOW_WORK_KANBAN_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(archive|migrate|import|export|backfill|sync)\b.*\b(stories|issues|linear|obsidian|docs?|history|references?)\b", re.IGNORECASE),
-    re.compile(r"\b(search|scan|check|inspect|audit)\b.*\b(all|every|entire|whole)\b.*\b(repo|repository|codebase|workspace|obsidian|mnemosyne|linear|stories|references?)\b", re.IGNORECASE),
+    re.compile(r"\b(archive|migrate|import|export|backfill|sync)\b.*\b(stories|issues|legacy_tracker|obsidian|docs?|history|references?)\b", re.IGNORECASE),
+    re.compile(r"\b(search|scan|check|inspect|audit)\b.*\b(all|every|entire|whole)\b.*\b(repo|repository|codebase|workspace|obsidian|mnemosyne|legacy_tracker|stories|references?)\b", re.IGNORECASE),
     re.compile(r"\b(run|fix|execute|work on|implement)\b.*\b(all|entire|whole|backlog|queue|board)\b", re.IGNORECASE),
     re.compile(r"\b(long|large|big|multi[-\s]?step|background)\b.*\b(task|work|migration|audit|cleanup|refactor)\b", re.IGNORECASE),
 )

@@ -11,7 +11,7 @@ from agent.biff_bundle_selector import is_direct_question_without_action
 
 _SLOW_WORK_RE = re.compile(
     r"\b(archive|migrate|import|export|backfill|sync|scan|audit|inspect|search|implement|fix|work on)\b"
-    r".*\b(all|every|entire|whole|backlog|board|repo|repository|workspace|linear|obsidian|stories|references?)\b",
+    r".*\b(all|every|entire|whole|backlog|board|repo|repository|workspace|legacy_tracker|obsidian|stories|references?)\b",
     re.IGNORECASE,
 )
 _BROAD_VERIFICATION_RE = re.compile(
@@ -30,6 +30,13 @@ _BOARD_ADMIN_RE = re.compile(
 )
 _ONE_TOOL_RE = re.compile(
     r"\b(check|status|state|verify|is .* running|gateway|service|launchd|logs?)\b",
+    re.IGNORECASE,
+)
+_TOOL_ACCESS_RECOVERY_RE = re.compile(
+    r"\b(?:why\s+(?:do|don'?t|does|doesn'?t)\s+(?:you|biff)\s+(?:not\s+)?have|you\s+(?:do\s+not|don'?t|cannot|can'?t)\s+have|missing|lost|restore|recover|give\s+(?:yourself|you)|enable|use)\b"
+    r".{0,120}\b(?:tools?|tool\s+access|terminal|shell|file\s+tools?|kanban|memory[-\s]?only|repo\s+tools?)\b"
+    r"|\b(?:tools?|tool\s+access|terminal|shell|file\s+tools?|kanban|memory[-\s]?only|repo\s+tools?)\b"
+    r".{0,120}\b(?:missing|lost|unavailable|blocked|restore|recover|enable|give\s+(?:yourself|you)|why\s+(?:do|don'?t|does|doesn'?t)\s+(?:you|biff))\b",
     re.IGNORECASE,
 )
 _VEX_QA_RE = re.compile(
@@ -52,15 +59,23 @@ _QUICK_WEB_RE = re.compile(
     r"\b("
     r"look\s*(?:it|this|that)?\s*up|search\s+(?:the\s+)?web|google|online|"
     r"(?:can\s+you\s+)?(?:see|open|read|inspect|check)\s+(?:this|that|the)?\s*(?:link|url|thread|post|page|site)|"
-    r"current|latest|today|recent|right\s+now|near\s+me|open\s+now|"
+    r"current|latest|today|recent|near\s+me|open\s+now|"
     r"deals?|sale|coupon|price|prices|availability|"
     r"score|scores|live\s+score|game|match|fixture|standings|schedule"
     r")\b",
     re.IGNORECASE,
 )
+_RIGHT_NOW_WEB_RE = re.compile(
+    r"\b(?:"
+    r"(?:what'?s|what\s+is|who'?s|who\s+is|where'?s|where\s+is)\b.{0,80}\bright\s+now\b|"
+    r"\b(?:happening|trending|available|open|on\s+sale|price|prices|score|weather|traffic)\b.{0,80}\bright\s+now\b|"
+    r"\bright\s+now\b.{0,80}\b(?:near\s+me|open|available|score|weather|traffic|price|prices)\b"
+    r")",
+    re.IGNORECASE,
+)
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _ACTION_RE = re.compile(
-    r"\b(implement|fix|change|patch|create|write|save|remember|forget|add|update|archive|migrate|sync|run|continue|finish|complete|close|debug|deploy|configure|install|delete|remove|make|build|execute|proceed|ship|work on|get it done|let me know|document|specify|triage)\b",
+    r"\b(implement|fix|change|patch|create|write|save|remember|forget|add|update|archive|migrate|sync|run|continue|finish|complete|close|debug|deploy|configure|install|delete|remove|make|build|execute|proceed|ship|work on|get it done|let me know|document|specify|triage|do)\b",
     re.IGNORECASE,
 )
 _FOLLOW_UP_ACTION_RE = re.compile(
@@ -108,10 +123,13 @@ _REPLY_FIX_FOLLOWUP_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _EXPLICIT_SPECIALIST_RE = re.compile(
-    r"\b(?:use|ask|have|send|dispatch|delegate|hand(?:\s+this)?\s+(?:to|off\s+to)|route\s+(?:to|through)|for)\s+"
-    r"(?P<role>forge|ranger|quill|vex)\b"
-    r"|\b(?:send|route|dispatch|delegate|hand\s+off)\b(?:\s+\w+){0,4}\s+(?:to|through)\s+(?P<role2>forge|ranger|quill|vex)\b"
-    r"|\b(?P<role3>forge|ranger|quill|vex)\b\s+(?:should|can|please|pls|needs?\s+to|must|go\s+do)\b",
+    # Named-role handoff must include an explicit dispatch/assignment verb.
+    # Bare role mentions, "for Ranger", "Vex should verify", and preference/
+    # correction language are conversation, not authorization to dispatch.
+    r"\b(?:use|ask|have)\s+(?P<role>forge|ranger|quill|vex)\b"
+    r"|\b(?:send|route|dispatch|delegate)\s+(?:this|it|that|work|task|story|issue|card|prompt|message)?(?:\s+\w+){0,4}\s+(?:to|through)\s+(?P<role2>forge|ranger|quill|vex)\b"
+    r"|\bhand(?:\s+this|\s+it|\s+that)?\s+off\s+to\s+(?P<role3>forge|ranger|quill|vex)\b"
+    r"|\brun\s+(?P<role4>forge|ranger|quill|vex)(?:\s*(?:->|→|then)\s*(?:forge|ranger|quill|vex))*\b",
     re.IGNORECASE,
 )
 _SPECIALIST_CONTROL_RE = re.compile(
@@ -152,10 +170,7 @@ _RANGER_TASK_CORRECTION_RE = re.compile(
     r"|\b(?:for\s+ranger|ranger\b.*\bnot\s+forge\b|not\s+forge\b.*\branger)\b.*\b(?:task|story|card|issue|ticket)\b",
     re.IGNORECASE,
 )
-_NOT_FORGE_RE = re.compile(
-    r"\bnot\s+forge\b|\bfor\s+(?:ranger|quill|vex)\b",
-    re.IGNORECASE,
-)
+_NOT_FORGE_RE = re.compile(r"\bnot\s+forge\b", re.IGNORECASE)
 _CONCEPTUAL_ENGINEERING_COMMENTARY_RE = re.compile(
     r"\b(?:gateway|runtime|repo|repository|code|bug|dashboard|api|workflow|flow|kanban|dispatcher)\b"
     r".*\b(?:seems?|feels?|looks?|sounds?|might|may|probably|risky|risk|important|stable|overkill|needed)\b"
@@ -273,7 +288,19 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
     if command:
         return BiffTurnPlan("command", "slash command already has explicit dispatch", "command", 0, True, "command")
     if not body:
-        return BiffTurnPlan("answer_now", "empty or whitespace-only prompt", "direct_answer", 0, False, "none")
+        # Discord can generate an empty live turn after a gateway restart,
+        # seamless rollover, image-only message, or interrupted-run recovery.
+        # Treat that as a continuation surface, not as a no-tool casual reply;
+        # otherwise the fresh session may falsely conclude it has only memory
+        # tools and stop instead of resuming the active work.
+        return BiffTurnPlan(
+            "route_bundle",
+            "empty/system continuation should preserve execution-capable tools",
+            "continuation",
+            2,
+            False,
+            "base",
+        )
     if re.fullmatch(r"(?i)\s*(?:hi|hello|hey|yo|sup|thanks|thank you|ok|okay|gm|gn)[.!?\s]*", body):
         return BiffTurnPlan("answer_now", "casual greeting or acknowledgement", "direct_answer", 0, False, "none")
     if _MENTAL_HEALTH_DECLINE_RE.search(body) and (
@@ -331,6 +358,33 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("answer_now", "review-before-send request must stay with Biff instead of dispatching to a specialist", "direct_answer", 0, False, "none")
     if _SPECIALIST_MISROUTE_FEEDBACK_RE.search(body):
         return BiffTurnPlan("answer_now", "specialist routing feedback must stay with Biff/controller instead of dispatching to that specialist", "direct_answer", 0, False, "none")
+    try:
+        from agent.biff_role_consent import detect_explicit_role_handoff
+
+        role_consent = detect_explicit_role_handoff(body)
+    except Exception:
+        role_consent = None
+    if role_consent is not None and role_consent.approved and role_consent.role in {"forge", "ranger", "quill", "vex"}:
+        role = role_consent.role
+        return BiffTurnPlan(
+            f"{role}_direct",
+            f"explicit {role.title()} specialist request",
+            "specialist_work",
+            2,
+            False,
+            "specialist",
+            background=True,
+            specialist=role,
+        )
+    if _TOOL_ACCESS_RECOVERY_RE.search(body):
+        return BiffTurnPlan(
+            "route_bundle",
+            "tool-access recovery request should restore the execution-capable base operator profile before answering",
+            "tool_access_recovery",
+            4,
+            True,
+            "base",
+        )
     if _REFRESH_RESUME_RE.search(body):
         return BiffTurnPlan(
             "resume_context",
@@ -349,25 +403,6 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
             True,
             "base",
         )
-    explicit_specialist = _EXPLICIT_SPECIALIST_RE.search(body)
-    if explicit_specialist:
-        role = (
-            explicit_specialist.group("role")
-            or explicit_specialist.group("role2")
-            or explicit_specialist.group("role3")
-            or ""
-        ).lower()
-        if role in {"forge", "ranger", "quill", "vex"}:
-            return BiffTurnPlan(
-                f"{role}_direct",
-                f"explicit {role.title()} specialist request",
-                "specialist_work",
-                2,
-                False,
-                "specialist",
-                background=True,
-                specialist=role,
-            )
     if _FOLLOW_UP_ACTION_RE.search(body):
         return BiffTurnPlan("route_bundle", "short follow-up should continue prior work context", "continuation", 2, True, "base")
     if _FOLLOW_UP_ACTION_LEAD_RE.search(body):
@@ -375,40 +410,22 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
             return BiffTurnPlan("route_bundle", "action follow-up should stay in the live Biff turn unless Forge is explicit", "continuation", 4, True, "base")
         return BiffTurnPlan("route_bundle", "action follow-up should continue prior work context", "continuation", 2, True, "base")
     if _REPLY_FIX_FOLLOWUP_RE.search(body) and _FORGE_DIRECT_RE.search(body):
-        return BiffTurnPlan("forge_direct", "engineering reply-fix follow-up should go through Forge's direct lane", "specialist_work", 2, False, "specialist", background=True, specialist="forge")
+        return BiffTurnPlan("route_bundle", "engineering reply-fix follow-up should stay with Biff unless a specialist handoff is explicit", "continuation", 4, True, "base")
     is_kanban_status_read = _KANBAN_STATUS_RE.search(body) and not _BOARD_ADMIN_RE.search(body)
     has_broad_quantifier = re.search(r"\b(?:all|every|entire|whole|full|broad|multi[-\s]?system)\b", body, re.IGNORECASE)
     if is_kanban_status_read and not has_broad_quantifier:
         return BiffTurnPlan("kanban_status", "read-only Kanban/status request", "kanban_read", 2, False, "kanban")
     if _BROAD_VERIFICATION_RE.search(body):
-        return BiffTurnPlan(
-            "background",
-            "broad verification should get a continuation handle/background specialist instead of spending the live Discord budget",
-            "background",
-            1,
-            False,
-            "none",
-            background=True,
-            specialist="vex",
-        )
+        return BiffTurnPlan("route_bundle", "broad verification should stay with Biff unless Vex handoff is explicit", "workflow", 2, True, "base")
     # Preserve board/archive hygiene routing before SecondBrain RAG broad-match.
-    # Prompts like "archive Linear stories and scan Obsidian" belong to Ranger's
+    # Prompts like "archive legacy tracker stories and scan Obsidian" belong to Ranger's
     # continuation lane, not Quill's SecondBrain retrieval lane.
     if _SLOW_WORK_RE.search(body) and re.search(
-        r"\b(?:backlog|board|kanban|linear|stories|story|cards|card|tickets|issues)\b",
+        r"\b(?:backlog|board|kanban|legacy_tracker|stories|story|cards|card|tickets|issues)\b",
         body,
         re.IGNORECASE,
     ):
-        return BiffTurnPlan(
-            "ranger_direct",
-            "broad board/backlog work should route to Ranger's nonblocking board lane",
-            "specialist_work",
-            2,
-            False,
-            "specialist",
-            background=True,
-            specialist="ranger",
-        )
+        return BiffTurnPlan("route_bundle", "broad board/backlog work should stay with Biff unless Ranger handoff is explicit", "workflow", 2, True, "base")
     try:
         from agent.biff_rag_router import classify_biff_rag_request
 
@@ -416,16 +433,7 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
     except Exception:
         rag_decision = None
     if rag_decision is not None and rag_decision.action == "background":
-        return BiffTurnPlan(
-            "background",
-            rag_decision.reason,
-            "background",
-            1,
-            False,
-            "none",
-            background=True,
-            specialist="quill",
-        )
+        return BiffTurnPlan("route_bundle", "broad retrieval/doc work should stay with Biff unless Quill handoff is explicit", "workflow", 2, True, "base")
     if rag_decision is not None and rag_decision.action == "sqlite_fts":
         return BiffTurnPlan(
             "secondbrain_lookup",
@@ -437,10 +445,10 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
             requires_current_info=False,
         )
     if _RANGER_TASK_CORRECTION_RE.search(body):
-        return BiffTurnPlan("ranger_direct", "explicit Ranger board/task request", "specialist_work", 2, False, "specialist", background=True, specialist="ranger")
+        return BiffTurnPlan("route_bundle", "Ranger/task correction mention is not a dispatch request without explicit handoff wording", "workflow", 2, True, "base")
     if _BOARD_ADMIN_RE.search(body):
-        return BiffTurnPlan("ranger_direct", "Kanban/backlog administration should route to Ranger's nonblocking board lane", "specialist_work", 2, False, "specialist", background=True, specialist="ranger")
-    if _URL_RE.search(body) or _QUICK_WEB_RE.search(body):
+        return BiffTurnPlan("route_bundle", "Kanban/backlog administration should stay with Biff unless Ranger handoff is explicit", "workflow", 2, True, "base")
+    if _URL_RE.search(body) or _QUICK_WEB_RE.search(body) or _RIGHT_NOW_WEB_RE.search(body):
         return BiffTurnPlan("quick_web", "casual web lookup can use a bounded side-lane search", "web_lookup", 3, False, "web", requires_current_info=True)
     if _QUILL_DOC_RE.search(body) and not _IMPLEMENTATION_ACTION_RE.search(body):
         return BiffTurnPlan("route_bundle", "documentation/research/memory work should stay in the live Biff turn unless Quill is explicit", "workflow", 4, True, "base")
@@ -451,18 +459,14 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
     if _CONCEPTUAL_ENGINEERING_COMMENTARY_RE.search(body):
         return BiffTurnPlan("route_bundle", "engineering/runtime concept mention without explicit assignment should stay with Biff", "workflow", 2, True, "base")
     if _FORGE_DIRECT_RE.search(body) and _ACTION_RE.search(body):
-        return BiffTurnPlan("forge_direct", "engineering action should route to Forge's nonblocking implementation lane", "specialist_work", 2, False, "specialist", background=True, specialist="forge")
+        return BiffTurnPlan("route_bundle", "engineering action should stay with Biff unless Forge handoff is explicit", "workflow", 4, True, "base")
     if _SLOW_WORK_RE.search(body):
-        if re.search(r"\b(?:backlog|board|kanban|linear|stories|story|cards|card|tickets|issues)\b", body, re.IGNORECASE):
-            return BiffTurnPlan("ranger_direct", "broad board/backlog work should route to Ranger's nonblocking board lane", "specialist_work", 2, False, "specialist", background=True, specialist="ranger")
-        return BiffTurnPlan("background", "broad slow work should move to Kanban/background", "background", 0, False, "none", background=True)
+        if re.search(r"\b(?:backlog|board|kanban|legacy_tracker|stories|story|cards|card|tickets|issues)\b", body, re.IGNORECASE):
+            return BiffTurnPlan("route_bundle", "broad board/backlog work should stay with Biff unless Ranger handoff is explicit", "workflow", 2, True, "base")
+        return BiffTurnPlan("route_bundle", "broad slow work should stay with Biff unless a background handoff is explicit", "workflow", 2, True, "base")
     if _ONE_TOOL_RE.search(body) and not _ACTION_RE.search(body):
         return BiffTurnPlan("one_tool", "quick status/check request", "status_read", 1, False, "status")
     if _NOT_FORGE_RE.search(body):
-        match = re.search(r"\bfor\s+(ranger|quill|vex)\b", body, re.IGNORECASE)
-        if match:
-            role = match.group(1).lower()
-            return BiffTurnPlan(f"{role}_direct", f"explicit {role.title()} specialist request", "specialist_work", 2, False, "specialist", background=True, specialist=role)
         return BiffTurnPlan("route_bundle", "explicit specialist correction should not force Forge", "workflow", 2, True, "base")
     if is_direct_question_without_action(body):
         return BiffTurnPlan("answer_now", "direct question without action request", "direct_answer", 0, False, "none")

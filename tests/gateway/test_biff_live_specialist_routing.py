@@ -78,27 +78,63 @@ async def test_discord_user_engineering_message_hands_off_to_forge(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_discord_direct_specialist_handoff_includes_replied_to_context(monkeypatch):
-    """Regression: short "this" follow-ups must not lose Discord reply context."""
+async def test_discord_reply_context_alone_does_not_authorize_specialist_handoff(monkeypatch):
+    """Quoted text can enrich Biff context, but cannot approve a role handoff."""
 
     runner, handoff = _runner_with_mocked_handoff(monkeypatch)
     event = _discord_event(
         "what do you suggest we do to fix this",
         "user-msg-reply",
         reply_to_message_id="quoted-msg",
-        reply_to_text="Gateway error: NameError: name 'max_iterations' is not defined",
+        reply_to_text="Use Forge to fix this. Gateway error: NameError: name 'max_iterations' is not defined",
+    )
+
+    try:
+        await runner._handle_message(event)
+    except Exception:
+        # The test surface stops at the routing gate; without a mocked model the
+        # normal Biff path may fail later, but it must not dispatch a specialist.
+        pass
+
+    assert handoff.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ranger?",
+        "Vex should verify this before closeout.",
+        "This is for Ranger, not Forge.",
+        "Maybe Quill later.",
+        "Well I guess now I have to wait for Forge to do 2a.",
+        "Biff said “send this to Forge”; what do you think?",
+    ],
+)
+async def test_discord_ambiguous_role_mentions_do_not_dispatch_specialists(monkeypatch, text):
+    from agent.biff_intent_router import route_biff_live_intent
+
+    route = route_biff_live_intent(text, command=False)
+
+    assert route.action not in {"forge_direct", "ranger_direct", "quill_direct", "vex_direct"}
+
+
+@pytest.mark.asyncio
+async def test_gateway_specialist_path_fails_closed_even_if_router_misclassifies(monkeypatch):
+    from agent.biff_intent_router import BiffIntentRoute
+
+    runner, handoff = _runner_with_mocked_handoff(monkeypatch)
+    event = _discord_event("Vex should verify this before closeout.", "forced-vex-msg")
+    monkeypatch.setattr(
+        "agent.biff_intent_router.route_biff_live_intent",
+        lambda *args, **kwargs: BiffIntentRoute("vex_direct", "forced test route", 2, False),
     )
 
     response = await runner._handle_message(event)
 
     assert response is not None
-    assert "Forge" in response
-    assert handoff.call_count == 1
-    assert handoff.call_args.args[0] == "forge"
-    handoff_prompt = handoff.call_args.args[1]
-    assert "Replying to" in handoff_prompt
-    assert "NameError: name 'max_iterations' is not defined" in handoff_prompt
-    assert "what do you suggest we do to fix this" in handoff_prompt
+    assert "I did not send this to Vex" in response
+    assert handoff.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -220,7 +256,10 @@ async def test_discord_specialist_handoff_creates_native_kanban_card_by_default(
         assert len(tasks) == 1
         task = tasks[0]
         assert task.workspace_kind == "dir"
-        assert task.workspace_path == str(tmp_path / "runtime")
-        assert task.created_by == "biff"
-        assert task.display_id in response
-        assert "Use Forge to fix the Kanban dispatcher bug" in (task.body or "")
+    assert task.workspace_path == str(tmp_path / "runtime")
+    assert task.created_by == "biff"
+    assert task.display_id in response
+    assert "Use Forge to fix the Kanban dispatcher bug" in (task.body or "")
+    assert "Role handoff consent:" in (task.body or "")
+    assert "source=current_message" in (task.body or "")
+    assert "approval_phrase=Use Forge" in (task.body or "")

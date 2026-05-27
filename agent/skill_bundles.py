@@ -190,7 +190,7 @@ def _max_mtime(files: List[Path]) -> float:
 def _normalize_skill_entry(entry: Any) -> Optional[Dict[str, Any]]:
     """Normalize a bundle skill entry while preserving string defaults.
 
-    Historical bundle YAML used ``skills: [linear, ...]``. BIF-630 adds an
+    Historical bundle YAML used plain string entries such as ``skills: [test-driven-development, ...]``. BIF-630 adds an
     opt-in mapping form for bounded prompt loading without changing the old
     behavior for plain strings.
     """

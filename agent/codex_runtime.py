@@ -329,6 +329,54 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
             raise
+        except TypeError as exc:
+            err_text = str(exc)
+            # The ChatGPT Codex backend can emit a final
+            # ``response.completed`` frame whose response object has
+            # ``output=None`` even though the actual answer was already
+            # delivered via ``response.output_item.done``.  The OpenAI SDK
+            # tries to iterate ``response.output`` while accumulating that
+            # terminal event and raises ``TypeError("'NoneType' object is not
+            # iterable")`` before callers can reach ``get_final_response()``.
+            # Treat that as the same recoverable empty-final-response shape
+            # handled above: preserve the streamed output items when we have
+            # them, or synthesize text-only output from deltas.
+            if "NoneType" in err_text and "not iterable" in err_text:
+                if collected_output_items:
+                    logger.warning(
+                        "Codex Responses stream terminal frame had output=None; "
+                        "recovering from %d collected output item(s). %s",
+                        len(collected_output_items),
+                        agent._client_log_context(),
+                    )
+                    return SimpleNamespace(
+                        output=list(collected_output_items),
+                        status="completed",
+                        usage=None,
+                        model=api_kwargs.get("model"),
+                    )
+                if agent._codex_streamed_text_parts and not has_tool_calls:
+                    assembled = "".join(agent._codex_streamed_text_parts)
+                    logger.warning(
+                        "Codex Responses stream terminal frame had output=None; "
+                        "synthesizing output from %d text delta(s). %s",
+                        len(agent._codex_streamed_text_parts),
+                        agent._client_log_context(),
+                    )
+                    return SimpleNamespace(
+                        output=[
+                            SimpleNamespace(
+                                type="message",
+                                role="assistant",
+                                status="completed",
+                                content=[SimpleNamespace(type="output_text", text=assembled)],
+                            )
+                        ],
+                        status="completed",
+                        usage=None,
+                        model=api_kwargs.get("model"),
+                    )
+            raise
 
 
 

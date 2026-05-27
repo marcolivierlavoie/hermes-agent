@@ -22,13 +22,14 @@ def _load_script(path: str):
     return mod
 
 
-def test_discord_quick_check_budget_contract_routes_broad_verification_to_background():
+def test_discord_quick_check_budget_contract_keeps_broad_verification_with_biff_without_explicit_handoff():
     plan = plan_biff_turn("Please verify every K card and all related runtime systems are really done")
 
-    assert plan.action == "background"
-    assert plan.background is True
-    assert plan.specialist == "vex"
-    assert plan.max_live_tool_calls == 1
+    assert plan.action == "route_bundle"
+    assert plan.runtime == "workflow"
+    assert plan.background is False
+    assert plan.specialist is None
+    assert plan.allow_bundle_selection is True
 
 
 def test_discord_ordinary_workflow_guardrail_defaults_to_two_tools_and_prompt_contract():

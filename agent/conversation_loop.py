@@ -33,7 +33,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, sanitize_context
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
@@ -742,20 +742,20 @@ def run_conversation(
             )
 
         api_messages = []
+        _memory_system_context = ""
+        if _ext_prefetch_cache:
+            _memory_system_context = build_memory_context_block(_ext_prefetch_cache)
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated, so nothing leaks into session persistence.
+            # Inject plugin-provided ephemeral user context into the current
+            # turn's user message. External memory prefetch is intentionally
+            # NOT injected here: recalled memory is model context, not new user
+            # input. Keep it in the ephemeral system suffix below so UI/session
+            # renderers and downstream providers cannot mistake it for text the
+            # user just said.
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 _injections = []
-                if _ext_prefetch_cache:
-                    _fenced = build_memory_context_block(_ext_prefetch_cache)
-                    if _fenced:
-                        _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
                 if _injections:
@@ -788,8 +788,10 @@ def run_conversation(
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
-        # External recall context is injected into the user message, not the system
-        # prompt, so the stable cache prefix remains unchanged.
+        # External recall context is appended as an ephemeral system suffix,
+        # not into the user message. That keeps recalled memory internal/model
+        # context rather than making it look like fresh user input. The stable
+        # cached system prefix remains byte-identical; only the suffix changes.
         #
         # NOTE: Plugin context from pre_llm_call hooks is injected into the
         # user message (see injection block above), NOT the system prompt.
@@ -804,6 +806,8 @@ def run_conversation(
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        if _memory_system_context:
+            effective_system = (effective_system + "\n\n" + _memory_system_context).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -3291,7 +3295,7 @@ def run_conversation(
                     if _all_housekeeping and agent._has_stream_consumers():
                         agent._mute_post_response = True
                     elif agent._should_emit_quiet_tool_messages():
-                        clean = agent._strip_think_blocks(turn_content).strip()
+                        clean = sanitize_context(agent._strip_think_blocks(turn_content)).strip()
                         if clean:
                             agent._vprint(f"  ┊ 💬 {clean}")
 
@@ -3480,7 +3484,7 @@ def run_conversation(
                         # old code injected "Calling the X tools..." which
                         # poisoned the conversation history.  Just use the
                         # fallback text as the final response and break.
-                        final_response = agent._strip_think_blocks(fallback).strip()
+                        final_response = sanitize_context(agent._strip_think_blocks(fallback)).strip()
                         agent._response_was_previewed = True
                         break
 
@@ -3727,7 +3731,7 @@ def run_conversation(
                     truncated_response_parts = []
                     length_continue_retries = 0
 
-                final_response = agent._strip_think_blocks(final_response).strip()
+                final_response = sanitize_context(agent._strip_think_blocks(final_response)).strip()
 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 

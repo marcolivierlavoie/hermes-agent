@@ -9,11 +9,20 @@ def test_direct_question_routes_answer_now_before_bundle_load():
     assert route.max_live_tool_calls == 0
 
 
-def test_broad_board_work_routes_ranger_before_bundle_load():
-    route = route_biff_live_intent("Archive every old Linear story and scan the whole Obsidian workspace.")
+def test_broad_board_work_stays_with_biff_without_explicit_handoff():
+    route = route_biff_live_intent("Archive every old Kanban card and scan the whole Obsidian workspace.")
 
-    assert route.action == "ranger_direct"
-    assert route.allow_bundle_selection is False
+    assert route.action == "route_bundle"
+    assert route.allow_bundle_selection is True
+
+
+def test_empty_discord_turn_preserves_execution_tools_for_rollover_recovery():
+    plan = plan_biff_turn("")
+
+    assert plan.action == "route_bundle"
+    assert plan.runtime == "continuation"
+    assert plan.toolset_profile == "base"
+    assert plan.allow_bundle_selection is False
 
 
 def test_quick_status_routes_one_tool_without_bundle_load():
@@ -43,23 +52,23 @@ def test_kanban_status_check_routes_to_read_only_board_lane():
     assert plan.requires_current_info is False
 
 
-def test_keep_story_open_routes_to_ranger_board_admin_lane():
+def test_keep_story_open_stays_with_biff_without_explicit_handoff():
     plan = plan_biff_turn("Keep K-1348 open until we finish live testing.")
 
-    assert plan.action == "ranger_direct"
-    assert plan.runtime == "specialist_work"
-    assert plan.toolset_profile == "specialist"
-    assert plan.allow_bundle_selection is False
-    assert plan.background is True
-    assert plan.specialist == "ranger"
+    assert plan.action == "route_bundle"
+    assert plan.runtime == "workflow"
+    assert plan.toolset_profile == "base"
+    assert plan.allow_bundle_selection is True
+    assert plan.background is False
+    assert plan.specialist is None
 
 
-def test_create_story_routes_to_ranger_not_forge():
+def test_create_story_stays_with_biff_not_ranger_or_forge_without_explicit_handoff():
     plan = plan_biff_turn("Create a Kanban story for proper routing and move it to todo.")
 
-    assert plan.action == "ranger_direct"
-    assert plan.runtime == "specialist_work"
-    assert plan.specialist == "ranger"
+    assert plan.action == "route_bundle"
+    assert plan.runtime == "workflow"
+    assert plan.specialist is None
 
 
 def test_explicit_fresh_or_online_lookup_routes_quick_web():
@@ -76,6 +85,33 @@ def test_live_sports_score_routes_quick_web():
     assert route.action == "quick_web"
     assert route.allow_bundle_selection is False
     assert route.max_live_tool_calls == 3
+
+
+def test_casual_right_now_without_current_lookup_does_not_route_quick_web():
+    for prompt in (
+        "Let's fix the router right now.",
+        "Stay tactical right now.",
+        "Can you help me decide what to do right now?",
+        "The runtime and gateway should stay stable right now.",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action != "quick_web"
+        assert plan.runtime != "web_lookup"
+        assert plan.toolset_profile != "web"
+
+
+def test_current_right_now_lookup_still_routes_quick_web():
+    for prompt in (
+        "What's happening in Montreal right now?",
+        "Is Costco open right now near me?",
+        "What's the weather right now?",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action == "quick_web"
+        assert plan.runtime == "web_lookup"
+        assert plan.requires_current_info is True
 
 
 def test_bare_url_routes_quick_web_not_answer_now():
@@ -103,28 +139,44 @@ def test_recipe_ideas_without_fresh_lookup_stays_answer_now():
     assert route.allow_bundle_selection is False
 
 
-def test_engineering_workflow_routes_to_forge_direct_lane():
+def test_engineering_workflow_stays_with_biff_without_explicit_handoff():
     plan = plan_biff_turn("Implement the speed story and add tests.")
 
-    assert plan.action == "forge_direct"
-    assert plan.allow_bundle_selection is False
-    assert plan.max_live_tool_calls == 2
-    assert plan.background is True
-    assert plan.specialist == "forge"
+    assert plan.action == "route_bundle"
+    assert plan.allow_bundle_selection is True
+    assert plan.background is False
+    assert plan.specialist is None
 
 
-def test_engineering_question_with_action_routes_to_forge_direct_lane():
+def test_do_phase_work_stays_with_biff_and_is_not_misread_as_direct_question():
+    plan = plan_biff_turn("Ok so do phase 2a yourself biff")
+
+    assert plan.action == "route_bundle"
+    assert plan.allow_bundle_selection is True
+    assert plan.background is False
+    assert plan.specialist is None
+
+
+def test_waiting_for_forge_complaint_is_not_specialist_approval():
+    plan = plan_biff_turn("Well I guess now I have to wait for forge to do 2a")
+
+    assert plan.runtime != "specialist_work"
+    assert plan.background is False
+    assert plan.specialist is None
+
+
+def test_engineering_question_with_action_stays_with_biff_without_explicit_handoff():
     route = route_biff_live_intent("Can you make the Hermes dashboard into an iOS app?")
 
-    assert route.action == "forge_direct"
-    assert route.allow_bundle_selection is False
+    assert route.action == "route_bundle"
+    assert route.allow_bundle_selection is True
 
 
-def test_dashboard_delete_routes_to_forge_direct_lane():
+def test_dashboard_delete_stays_with_biff_without_explicit_handoff():
     route = route_biff_live_intent("Delete Cockpit from the Hermes dashboard sidebar.")
 
-    assert route.action == "forge_direct"
-    assert route.allow_bundle_selection is False
+    assert route.action == "route_bundle"
+    assert route.allow_bundle_selection is True
 
 
 def test_short_follow_up_actions_continue_prior_work_context():
@@ -198,16 +250,16 @@ def test_qa_validation_routes_to_vex_not_forge():
 
 
 
-def test_engineering_reply_fix_followup_routes_to_forge_direct_lane():
+def test_engineering_reply_fix_followup_stays_with_biff_without_explicit_handoff():
     plan = plan_biff_turn(
         '[Replying to: "Gateway error: NameError: name max_iterations is not defined"]\n\n'
         "what do you suggest we do to fix this"
     )
 
-    assert plan.action == "forge_direct"
-    assert plan.allow_bundle_selection is False
-    assert plan.background is True
-    assert plan.specialist == "forge"
+    assert plan.action == "route_bundle"
+    assert plan.allow_bundle_selection is True
+    assert plan.background is False
+    assert plan.specialist is None
 
 
 def test_explicit_forge_request_routes_to_named_specialist():
@@ -262,6 +314,9 @@ def test_specialist_keyword_mentions_without_assignment_do_not_dispatch():
         "Ranger will still be needed if we use the native dispatcher, right?",
         "Quill is probably just documentation, not execution.",
         "Vex verification seems important before done.",
+        "Vex should verify this before done.",
+        "Ranger should create those cards.",
+        "This is for Ranger, not Forge.",
         "The native Kanban dispatcher may have too much access.",
         "The runtime and gateway should stay stable during this change.",
         "The gateway change seems risky.",
@@ -309,17 +364,17 @@ def test_restart_done_followup_stays_with_biff_controller_continuation():
         assert plan.specialist is None
 
 
-def test_explicit_ranger_correction_does_not_route_to_forge_direct_lane():
+def test_ranger_correction_does_not_dispatch_without_explicit_handoff_verb():
     plan = plan_biff_turn("this is a task for ranger, not forge")
 
-    assert plan.action == "ranger_direct"
-    assert plan.allow_bundle_selection is False
-    assert plan.specialist == "ranger"
+    assert plan.action == "route_bundle"
+    assert plan.allow_bundle_selection is True
+    assert plan.specialist is None
 
 
-def test_explicit_quill_and_vex_corrections_route_to_named_specialist():
-    assert plan_biff_turn("this is for quill, not forge").specialist == "quill"
-    assert plan_biff_turn("this is for vex, not forge").specialist == "vex"
+def test_quill_and_vex_corrections_do_not_dispatch_without_explicit_handoff_verb():
+    assert plan_biff_turn("this is for quill, not forge").specialist is None
+    assert plan_biff_turn("this is for vex, not forge").specialist is None
 
 
 def test_explicit_moment_coach_triggers_route_to_mental_health_runtime():

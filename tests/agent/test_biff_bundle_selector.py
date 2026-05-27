@@ -26,7 +26,7 @@ def bundles():
             "/biff-hermes-runtime-change",
         ),
         (
-            "Continue BIF-512 and close the Linear issue after Vex verifies acceptance.",
+            "Continue BIF-512 and close the legacy tracker issue after Vex verifies acceptance.",
             "/biff-issue-execution",
         ),
         (
@@ -71,7 +71,7 @@ def test_direct_questions_stay_on_lean_chat_path(bundles):
     assert is_direct_question_without_action("Should this correction go to Mnemosyne memory or Obsidian?")
 
     selection = select_biff_bundle_for_prompt(
-        "Should this correction go to Mnemosyne memory, Obsidian, Linear, or nowhere?",
+        "Should this correction go to Mnemosyne memory, Obsidian, legacy tracker, or nowhere?",
         bundles,
     )
 

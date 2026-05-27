@@ -124,8 +124,10 @@ def test_loop_bounding_synthetic_scenarios_cover_empty_or_broad_searches():
     scenarios = {scenario.name: scenario for scenario in DEFAULT_SCENARIOS}
     assert scenarios["explicit_secondbrain_lookup"].max_tool_calls == 1
     assert scenarios["smart_connections_fallback_to_bounded_lookup"].max_tool_calls == 1
-    assert scenarios["broad_secondbrain_deep_research_background"].expected_background is True
-    assert scenarios["broad_multi_system_verification_background"].expected_background is True
+    assert scenarios["broad_secondbrain_deep_research_background"].expected_action == "route_bundle"
+    assert scenarios["broad_secondbrain_deep_research_background"].expected_background is False
+    assert scenarios["broad_multi_system_verification_background"].expected_action == "route_bundle"
+    assert scenarios["broad_multi_system_verification_background"].expected_background is False
     assert scenarios["refresh_resume_context_recovery"].max_tool_calls == 3
 
 

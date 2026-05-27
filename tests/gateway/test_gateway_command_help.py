@@ -32,7 +32,7 @@ async def test_help_sanitizes_slash_command_mentions_for_telegram(monkeypatch):
     monkeypatch.setattr(
         "agent.skill_commands.get_skill_commands",
         lambda: {
-            "/Linear": {"description": "Open Linear"},
+            "/Sample": {"description": "Open sample"},
             "/Custom-Thing": {"description": "Run a custom thing"},
         },
     )
@@ -41,9 +41,9 @@ async def test_help_sanitizes_slash_command_mentions_for_telegram(monkeypatch):
         _make_event("/help", Platform.TELEGRAM)
     )
 
-    assert "`/linear`" in result
+    assert "`/sample`" in result
     assert "`/custom_thing`" in result
-    assert "`/Linear`" not in result
+    assert "`/Sample`" not in result
     assert "`/Custom-Thing`" not in result
 
 
@@ -52,15 +52,15 @@ async def test_commands_sanitizes_slash_command_mentions_for_telegram(monkeypatc
     """Paginated Telegram /commands output uses Telegram-valid slash mentions."""
     monkeypatch.setattr(
         "agent.skill_commands.get_skill_commands",
-        lambda: {"/Linear": {"description": "Open Linear"}},
+        lambda: {"/Sample": {"description": "Open sample"}},
     )
 
     result = await _make_runner()._handle_commands_command(
         _make_event("/commands 999", Platform.TELEGRAM)
     )
 
-    assert "`/linear`" in result
-    assert "`/Linear`" not in result
+    assert "`/sample`" in result
+    assert "`/Sample`" not in result
 
 
 @pytest.mark.asyncio
@@ -68,11 +68,11 @@ async def test_help_keeps_non_telegram_slash_command_mentions_unchanged(monkeypa
     """Only Telegram needs slash mentions rewritten to Telegram command names."""
     monkeypatch.setattr(
         "agent.skill_commands.get_skill_commands",
-        lambda: {"/Linear": {"description": "Open Linear"}},
+        lambda: {"/Sample": {"description": "Open sample"}},
     )
 
     result = await _make_runner()._handle_help_command(
         _make_event("/help", Platform.DISCORD)
     )
 
-    assert "`/Linear`" in result
+    assert "`/Sample`" in result

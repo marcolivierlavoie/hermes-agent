@@ -72,7 +72,7 @@ def _safe_recall_lines(provider: Any, query: str, *, limit: int = 3) -> list[str
 def build_biff_fast_memory_snapshot(
     config: Mapping[str, Any] | None,
     *,
-    query: str = "Biff Discord Kanban Mnemosyne Obsidian Linear source of truth roles",
+    query: str = "Biff Discord Kanban Mnemosyne Obsidian source of truth roles",
     max_chars: int = 1400,
 ) -> str:
     """Return a compact Mnemosyne snapshot without model calls or mutation."""

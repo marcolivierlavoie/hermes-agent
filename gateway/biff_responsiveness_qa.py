@@ -82,7 +82,7 @@ def _check_fast_router_deflects_slow_work() -> tuple[str, str]:
     from gateway.session_hygiene import maybe_build_slow_work_deflection
 
     prompt = (
-        "Please archive every old Linear story and scan the entire Obsidian "
+        "Please archive every old legacy tracker story and scan the entire Obsidian "
         "workspace for references before updating the board."
     )
     deflection = maybe_build_slow_work_deflection(prompt, platform_key="discord")
@@ -322,18 +322,21 @@ def _check_fast_router_model_pending() -> tuple[str, str]:
     from agent.biff_intent_router import route_biff_live_intent
 
     direct = route_biff_live_intent("What folder do I use for Time Machine?")
-    slow = route_biff_live_intent("Archive every Linear story and scan the whole Obsidian workspace.")
+    slow = route_biff_live_intent("Archive every legacy tracker story and scan the whole Obsidian workspace.")
     status = route_biff_live_intent("Can you check gateway status?")
     workflow = route_biff_live_intent("Implement the speed story and add tests.")
+    explicit = route_biff_live_intent("Ask Forge to implement the speed story and add tests.")
     if direct.action != "answer_now" or direct.allow_bundle_selection:
         return _fail("Direct question does not stay on the answer-now path before bundle load.")
-    if slow.action != "ranger_direct" or slow.allow_bundle_selection:
-        return _fail("Broad board/archive work does not route to Ranger before bundle load.")
+    if slow.action != "route_bundle" or not slow.allow_bundle_selection:
+        return _fail("Broad board/archive work did not stay with Biff without explicit handoff.")
     if status.action != "one_tool" or status.max_live_tool_calls != 1:
         return _fail("Quick status check does not route to the one-tool live path.")
-    if workflow.action != "forge_direct" or workflow.allow_bundle_selection:
-        return _fail("Implementation workflow does not route to Forge direct before generic bundle selection.")
-    return _pass("Cheap deterministic router classifies answer-now, one-tool, background, Forge-direct, and web paths before heavy bundle load.")
+    if workflow.action != "route_bundle" or not workflow.allow_bundle_selection:
+        return _fail("Implementation workflow did not stay with Biff without explicit handoff.")
+    if explicit.action != "forge_direct" or explicit.allow_bundle_selection:
+        return _fail("Explicit Forge handoff no longer routes to the specialist direct lane.")
+    return _pass("Cheap deterministic router classifies answer-now, one-tool, Biff-default workflow, explicit specialist handoff, and web paths before heavy bundle load.")
 
 
 def _check_normal_prompt_budget_under_10k() -> tuple[str, str]:

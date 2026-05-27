@@ -11,7 +11,7 @@ from hermes_constants import get_hermes_home
 
 
 _CACHE: dict[str, tuple[float, str]] = {}
-_ROLE_RE = re.compile(r"\b(?:Biff|Ranger|Forge|Vex|Quill|Kanban|Linear|Mnemosyne|Obsidian|Discord)\b", re.IGNORECASE)
+_ROLE_RE = re.compile(r"\b(?:Biff|Ranger|Forge|Vex|Quill|Kanban|Mnemosyne|Obsidian|Discord)\b", re.IGNORECASE)
 
 
 def _truthy(value: Any, default: bool = True) -> bool:

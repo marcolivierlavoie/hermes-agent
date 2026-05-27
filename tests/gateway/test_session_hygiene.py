@@ -123,6 +123,20 @@ def test_turn_toolset_plan_removes_tools_for_casual_answer():
     assert enabled == []
 
 
+def test_turn_toolset_plan_recovers_operator_tools_when_user_flags_missing_tool_access():
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search"]
+
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        [],
+        configured_toolsets=configured,
+        message="why do you not have tools?",
+    )
+
+    assert {"terminal", "file", "memory", "todo", "kanban", "web"}.issubset(enabled)
+
+
 def test_turn_toolset_plan_keeps_only_board_tools_for_kanban_status():
     configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
     enabled = apply_biff_turn_toolset_plan(
@@ -290,16 +304,16 @@ def test_discord_live_guardrails_allow_explicit_unlimited_bundle_tools():
     assert settings["max_tool_calls"] is None
 
 
-def test_discord_live_guardrails_adapt_for_plain_engineering_action():
+def test_discord_live_guardrails_keep_plain_engineering_action_with_biff():
     message = "Delete Cockpit from the Hermes dashboard sidebar and verify it is gone."
 
     settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message=message)
 
     assert settings["bundle_key"] is None
-    assert settings["route_action"] == "forge_direct"
+    assert settings["route_action"] == "route_bundle"
     assert settings["terminal_timeout"] == 45
-    assert settings["max_tool_calls"] == 24
-    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 24
+    assert settings["max_tool_calls"] == 36
+    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 48
 
 
 def test_discord_live_guardrails_keep_quick_status_small():
@@ -324,15 +338,15 @@ def test_discord_live_guardrails_keep_kanban_status_bounded():
     assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 5
 
 
-def test_discord_live_guardrails_give_ranger_board_admin_room():
+def test_discord_live_guardrails_keep_board_admin_action_with_biff():
     message = "Create a Kanban story for proper routing and move it to todo."
 
     settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message=message)
 
-    assert settings["route_action"] == "ranger_direct"
+    assert settings["route_action"] == "route_bundle"
     assert settings["terminal_timeout"] == 45
-    assert settings["max_tool_calls"] == 24
-    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 24
+    assert settings["max_tool_calls"] == 36
+    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 48
 
 
 def test_plain_route_budgets_ignore_generic_chat_cap():
@@ -997,6 +1011,7 @@ class TestSessionHygieneCaps:
             "skills-read",
             "terminal",
             "todo",
+            "web",
         ]
 
     def test_biff_discord_tool_schema_profile_v2_keeps_previous_build_ops_allowlist(self, monkeypatch):
@@ -1159,6 +1174,25 @@ class TestSessionHygieneCaps:
             "vision_analyze",
         }.isdisjoint(default_names)
 
+    def test_empty_discord_rollover_turn_keeps_repo_shell_kanban_toolsets(self, monkeypatch):
+        monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import get_tool_definitions
+
+        cfg = {"platform_toolsets": {"discord": ["hermes-discord"]}}
+        configured = sorted(_get_platform_tools(cfg, "discord"))
+        profiled = apply_biff_tool_schema_profile(cfg, "discord", configured)
+        planned = apply_biff_turn_toolset_plan(
+            cfg,
+            "discord",
+            profiled,
+            message="",
+            configured_toolsets=configured,
+        )
+        names = {tool["function"]["name"] for tool in get_tool_definitions(planned, [], quiet_mode=True)}
+
+        assert {"terminal", "process", "read_file", "search_files", "patch"}.issubset(names)
+
     def test_biff_bundle_tool_widening_adds_only_selected_specialist_toolsets(self, monkeypatch):
         monkeypatch.delenv("HERMES_BIFF_BUNDLE_TOOL_WIDENING", raising=False)
         configured = [
@@ -1207,7 +1241,7 @@ class TestSessionHygieneCaps:
 
     def test_slow_work_deflection_catches_broad_background_requests(self):
         decision = maybe_build_slow_work_deflection(
-            "Please migrate all Linear stories and scan the whole Obsidian workspace for references before updating the board.",
+            "Please migrate all legacy tracker stories and scan the whole Obsidian workspace for references before updating the board.",
             platform_key="discord",
         )
 
