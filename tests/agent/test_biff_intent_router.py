@@ -52,13 +52,29 @@ def test_kanban_status_check_routes_to_read_only_board_lane():
     assert plan.requires_current_info is False
 
 
+def test_bare_kanban_story_number_routes_to_read_only_board_lane():
+    for prompt in ("Check 1503", "show BIF-1503", "what's up with 1503?"):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action == "kanban_status"
+        assert plan.runtime == "kanban_read"
+        assert plan.toolset_profile == "kanban"
+
+
+def test_non_kanban_number_question_does_not_route_to_board_lane():
+    plan = plan_biff_turn("what is 1503 divided by 3?")
+
+    assert plan.action != "kanban_status"
+    assert plan.toolset_profile != "kanban"
+
+
 def test_keep_story_open_stays_with_biff_without_explicit_handoff():
     plan = plan_biff_turn("Keep K-1348 open until we finish live testing.")
 
-    assert plan.action == "route_bundle"
-    assert plan.runtime == "workflow"
-    assert plan.toolset_profile == "base"
-    assert plan.allow_bundle_selection is True
+    assert plan.action == "kanban_admin"
+    assert plan.runtime == "kanban_admin"
+    assert plan.toolset_profile == "kanban"
+    assert plan.allow_bundle_selection is False
     assert plan.background is False
     assert plan.specialist is None
 
@@ -66,9 +82,26 @@ def test_keep_story_open_stays_with_biff_without_explicit_handoff():
 def test_create_story_stays_with_biff_not_ranger_or_forge_without_explicit_handoff():
     plan = plan_biff_turn("Create a Kanban story for proper routing and move it to todo.")
 
-    assert plan.action == "route_bundle"
-    assert plan.runtime == "workflow"
+    assert plan.action == "kanban_admin"
+    assert plan.runtime == "kanban_admin"
+    assert plan.toolset_profile == "kanban"
     assert plan.specialist is None
+
+
+def test_kanban_admin_turns_get_native_board_tool_profile():
+    for prompt in (
+        "move story K-1503 to todo",
+        "move 1503 to todo",
+        "close BIF-1503 after verification",
+        "Biff needs native kanban admin access",
+        "add a story to the board for the runtime fix",
+    ):
+        plan = plan_biff_turn(prompt)
+
+        assert plan.action == "kanban_admin"
+        assert plan.runtime == "kanban_admin"
+        assert plan.toolset_profile == "kanban"
+        assert plan.allow_bundle_selection is False
 
 
 def test_explicit_fresh_or_online_lookup_routes_quick_web():
@@ -130,6 +163,20 @@ def test_link_inspection_words_route_quick_web():
 
     assert route.action == "quick_web"
     assert route.allow_bundle_selection is False
+
+
+def test_vision_requests_route_to_narrow_vision_lane():
+    for prompt in (
+        "Grant yourself vision analyze",
+        "analyze this screenshot",
+        "what's in this attachment?",
+    ):
+        route = plan_biff_turn(prompt)
+
+        assert route.action == "vision_analyze"
+        assert route.runtime == "vision_lookup"
+        assert route.toolset_profile == "vision"
+        assert route.allow_bundle_selection is False
 
 
 def test_recipe_ideas_without_fresh_lookup_stays_answer_now():

@@ -143,13 +143,70 @@ def inspect_biff_runtime_instability_logs(
     return detect_biff_runtime_instability("\n".join(chunks))
 
 
+_FALSE_CONFIG_VALUES = {"0", "false", "no", "off", "disabled"}
+_TRUE_CONFIG_VALUES = {"1", "true", "yes", "on", "enabled"}
+
+
+def _coerce_config_bool(value: Any, *, default: bool | None = None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    raw = str(value).strip().lower()
+    if raw in _TRUE_CONFIG_VALUES:
+        return True
+    if raw in _FALSE_CONFIG_VALUES:
+        return False
+    return default
+
+
+def biff_runtime_instability_guard_disabled(
+    config: Mapping[str, Any] | None = None,
+    platform_key: str | None = None,
+) -> bool:
+    """Return whether the Biff runtime instability guard is explicitly disabled.
+
+    This is a controlled kill switch for live recovery. ``BIFF_DISABLE_INSTABILITY_GUARD=1``
+    is the preferred emergency override; the older
+    ``HERMES_BIFF_RUNTIME_INSTABILITY_GUARD=0`` remains supported for rollback
+    compatibility. Config mirrors are intentionally narrow and profile-scoped.
+    """
+
+    if _coerce_config_bool(os.getenv("BIFF_DISABLE_INSTABILITY_GUARD"), default=False):
+        return True
+    legacy_enabled = _coerce_config_bool(os.getenv("HERMES_BIFF_RUNTIME_INSTABILITY_GUARD"), default=None)
+    if legacy_enabled is False:
+        return True
+
+    cfg: Mapping[str, Any] = config if isinstance(config, Mapping) else {}
+    maybe_biff_cfg = cfg.get("biff")
+    biff_cfg: Mapping[str, Any] = maybe_biff_cfg if isinstance(maybe_biff_cfg, Mapping) else {}
+    platform_cfg: Mapping[str, Any] = {}
+    maybe_platforms = biff_cfg.get("platforms")
+    platforms: Mapping[str, Any] = maybe_platforms if isinstance(maybe_platforms, Mapping) else {}
+    maybe_platform = platforms.get(platform_key) if platform_key else None
+    if isinstance(maybe_platform, Mapping):
+        platform_cfg = maybe_platform
+
+    for scoped_cfg in (platform_cfg, biff_cfg):
+        disabled = _coerce_config_bool(scoped_cfg.get("disable_instability_guard"), default=None)
+        if disabled is True:
+            return True
+        enabled = _coerce_config_bool(scoped_cfg.get("runtime_instability_guard_enabled"), default=None)
+        if enabled is False:
+            return True
+    return False
+
+
 def apply_biff_runtime_instability_guard(
     mode: BiffOperatingMode,
     signal: BiffRuntimeInstabilitySignal | None,
+    *,
+    disabled: bool = False,
 ) -> BiffOperatingMode:
     """Downgrade live Biff Discord turns while recent runtime instability exists."""
 
-    if not signal or not signal.active:
+    if disabled or not signal or not signal.active:
         return mode
     if mode.name in {"emergency", "evidence-only"}:
         return mode
@@ -178,7 +235,14 @@ def relax_biff_runtime_instability_guard_for_turn(
         return mode
     runtime = str(route_runtime or "").strip().lower()
     action = str(route_action or "").strip().lower()
-    if runtime in {"tool_access_recovery", "continuation"} or action in {"resume_context"}:
+    if runtime in {
+        "tool_access_recovery",
+        "continuation",
+        "kanban_read",
+        "kanban_admin",
+        "biff-hermes-runtime-change",
+        "runtime_change",
+    } or action in {"resume_context", "kanban_status", "kanban_admin"}:
         return _BIFF_MODE_SPECS["emergency"]
     return mode
 
@@ -186,10 +250,15 @@ def relax_biff_runtime_instability_guard_for_turn(
 def apply_biff_runtime_instability_tool_guardrails(
     settings: Mapping[str, Any] | None,
     signal: BiffRuntimeInstabilitySignal | None,
+    *,
+    disabled: bool = False,
 ) -> dict[str, Any]:
     """Narrow tool-loop budget during unstable gateway windows."""
 
     adjusted = dict(settings or {})
+    if disabled:
+        adjusted["runtime_instability_guard"] = {"disabled": True, "reason": "disabled_by_config"}
+        return adjusted
     if not signal or not signal.active:
         return adjusted
     current_max = adjusted.get("max_tool_calls")
@@ -370,6 +439,7 @@ BIFF_TURN_TOOLSET_PROFILES: dict[str, frozenset[str]] = {
     "resume": frozenset({"session_search", "terminal", "file", "kanban"}),
     "secondbrain": frozenset({"terminal", "file"}),
     "web": frozenset({"web", "search", "browser", "terminal", "file"}),
+    "vision": frozenset({"vision", "file", "terminal"}),
     # Mental-health moment and dashboard ritual routing is intentionally
     # zero-tool at the planner layer: the live turn should present a focused
     # opt-in/handoff surface, not broaden into general agent tools or private
@@ -454,13 +524,13 @@ def resolve_biff_live_tool_guardrail_settings(
         timeout_default = 45
     elif route_action in {"forge_direct", "ranger_direct", "quill_direct", "vex_direct"}:
         timeout_default = 45
-    elif route_action == "kanban_status":
+    elif route_action in {"kanban_status", "kanban_admin"}:
         timeout_default = 20
     elif route_action == "secondbrain_lookup":
         timeout_default = 10
     elif route_action == "route_bundle":
         timeout_default = 45
-    elif route_action in {"quick_web", "one_tool"}:
+    elif route_action in {"quick_web", "vision_analyze", "one_tool"}:
         timeout_default = 20
     else:
         timeout_default = 15
@@ -476,13 +546,13 @@ def resolve_biff_live_tool_guardrail_settings(
         timeout_keys = ("quill_direct_chat_terminal_timeout", "route_bundle_chat_terminal_timeout", "chat_terminal_timeout")
     elif route_action == "vex_direct":
         timeout_keys = ("vex_direct_chat_terminal_timeout", "route_bundle_chat_terminal_timeout", "chat_terminal_timeout")
-    elif route_action == "kanban_status":
+    elif route_action in {"kanban_status", "kanban_admin"}:
         timeout_keys = ("kanban_chat_terminal_timeout", "one_tool_chat_terminal_timeout")
     elif route_action == "secondbrain_lookup":
         timeout_keys = ("secondbrain_chat_terminal_timeout", "one_tool_chat_terminal_timeout")
     elif route_action == "route_bundle":
         timeout_keys = ("route_bundle_chat_terminal_timeout", "chat_terminal_timeout")
-    elif route_action == "quick_web":
+    elif route_action in {"quick_web", "vision_analyze"}:
         timeout_keys = ("quick_web_chat_terminal_timeout",)
     elif route_action == "one_tool":
         timeout_keys = ("one_tool_chat_terminal_timeout",)
@@ -508,13 +578,13 @@ def resolve_biff_live_tool_guardrail_settings(
         tool_keys = ("quill_direct_chat_max_tool_calls", "route_bundle_chat_max_tool_calls")
     elif route_action == "vex_direct":
         tool_keys = ("vex_direct_chat_max_tool_calls", "route_bundle_chat_max_tool_calls")
-    elif route_action == "kanban_status":
+    elif route_action in {"kanban_status", "kanban_admin"}:
         tool_keys = ("kanban_chat_max_tool_calls", "one_tool_chat_max_tool_calls")
     elif route_action == "secondbrain_lookup":
         tool_keys = ("secondbrain_chat_max_tool_calls", "one_tool_chat_max_tool_calls")
     elif route_action == "route_bundle":
         tool_keys = ("route_bundle_chat_max_tool_calls", "bundle_chat_max_tool_calls")
-    elif route_action == "quick_web":
+    elif route_action in {"quick_web", "vision_analyze"}:
         tool_keys = ("quick_web_chat_max_tool_calls",)
     elif route_action == "one_tool":
         tool_keys = ("one_tool_chat_max_tool_calls",)
@@ -540,12 +610,16 @@ def resolve_biff_live_tool_guardrail_settings(
         tool_default = 24
     elif route_action == "kanban_status":
         tool_default = 3
+    elif route_action == "kanban_admin":
+        tool_default = 6
     elif route_action == "secondbrain_lookup":
         tool_default = 1
     elif route_action == "route_bundle":
         tool_default = 36
     elif route_action == "quick_web":
         tool_default = 4
+    elif route_action == "vision_analyze":
+        tool_default = 3
     elif route_action == "one_tool":
         tool_default = 2
     elif route_action == "resume_context":
@@ -609,13 +683,13 @@ def resolve_biff_live_max_iterations(
         iterations_key = "quill_direct_chat_max_iterations"
     elif route_action == "vex_direct":
         iterations_key = "vex_direct_chat_max_iterations"
-    elif route_action == "kanban_status":
+    elif route_action in {"kanban_status", "kanban_admin"}:
         iterations_key = "kanban_chat_max_iterations"
     elif route_action == "secondbrain_lookup":
         iterations_key = "secondbrain_chat_max_iterations"
     elif route_action == "route_bundle":
         iterations_key = "route_bundle_chat_max_iterations"
-    elif route_action == "quick_web":
+    elif route_action in {"quick_web", "vision_analyze"}:
         iterations_key = "quick_web_chat_max_iterations"
     elif route_action == "one_tool":
         iterations_key = "one_tool_chat_max_iterations"
@@ -639,12 +713,16 @@ def resolve_biff_live_max_iterations(
         iterations_default = 24
     elif route_action == "kanban_status":
         iterations_default = 5
+    elif route_action == "kanban_admin":
+        iterations_default = 8
     elif route_action == "secondbrain_lookup":
         iterations_default = 2
     elif route_action == "route_bundle":
         iterations_default = 48
     elif route_action == "quick_web":
         iterations_default = 6
+    elif route_action == "vision_analyze":
+        iterations_default = 4
     elif route_action == "one_tool":
         iterations_default = 3
     elif route_action == "answer_now":

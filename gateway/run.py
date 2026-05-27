@@ -17907,6 +17907,7 @@ class GatewayRunner:
             apply_biff_turn_toolset_plan,
             biff_discord_quick_check_budget_prompt,
             biff_operating_mode_prompt,
+            biff_runtime_instability_guard_disabled,
             extract_biff_bundle_key,
             filter_biff_mode_enabled_toolsets,
             inspect_biff_runtime_instability_logs,
@@ -17919,10 +17920,17 @@ class GatewayRunner:
         )
         _biff_mode = resolve_biff_operating_mode(user_config, platform_key)
         _biff_runtime_instability_signal = None
-        if str(platform_key or "").strip().lower() == "discord" and os.getenv("HERMES_BIFF_RUNTIME_INSTABILITY_GUARD", "1").lower() not in {"0", "false", "no", "off"}:
+        _biff_instability_guard_disabled = biff_runtime_instability_guard_disabled(user_config, platform_key)
+        if str(platform_key or "").strip().lower() == "discord" and _biff_instability_guard_disabled:
+            logger.warning("instability_guard=disabled_by_config platform=%s", platform_key)
+        if str(platform_key or "").strip().lower() == "discord" and not _biff_instability_guard_disabled:
             try:
                 _biff_runtime_instability_signal = inspect_biff_runtime_instability_logs()
-                _guarded_mode = apply_biff_runtime_instability_guard(_biff_mode, _biff_runtime_instability_signal)
+                _guarded_mode = apply_biff_runtime_instability_guard(
+                    _biff_mode,
+                    _biff_runtime_instability_signal,
+                    disabled=_biff_instability_guard_disabled,
+                )
                 if _guarded_mode.name != _biff_mode.name:
                     logger.warning(
                         "biff_runtime_instability_degraded_mode: platform=%s from=%s to=%s reasons=%s",
@@ -17998,11 +18006,14 @@ class GatewayRunner:
                 from agent.biff_intent_router import plan_biff_turn
 
                 _turn_plan = plan_biff_turn(message, command=False)
+                _bundle_key = extract_biff_bundle_key(message)
+                _route_runtime = _bundle_key or getattr(_turn_plan, "runtime", None)
+                _route_action = getattr(_turn_plan, "action", None)
                 _relaxed_mode = relax_biff_runtime_instability_guard_for_turn(
                     _biff_mode,
                     _biff_runtime_instability_signal,
-                    route_runtime=getattr(_turn_plan, "runtime", None),
-                    route_action=getattr(_turn_plan, "action", None),
+                    route_runtime=_route_runtime,
+                    route_action=_route_action,
                 )
                 if _relaxed_mode.name != _biff_mode.name:
                     logger.warning(
@@ -18010,8 +18021,8 @@ class GatewayRunner:
                         platform_key,
                         _biff_mode.name,
                         _relaxed_mode.name,
-                        getattr(_turn_plan, "runtime", None),
-                        getattr(_turn_plan, "action", None),
+                        _route_runtime,
+                        _route_action,
                         ",".join(getattr(_biff_runtime_instability_signal, "reasons", ()) or ()),
                     )
                     _biff_mode = _relaxed_mode
@@ -18044,6 +18055,7 @@ class GatewayRunner:
                 _guardrail_settings = apply_biff_runtime_instability_tool_guardrails(
                     _guardrail_settings,
                     _biff_runtime_instability_signal,
+                    disabled=_biff_instability_guard_disabled,
                 )
                 set_chat_tool_policy(
                     session_id,

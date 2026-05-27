@@ -30,6 +30,7 @@ from gateway.session_hygiene import (
     apply_biff_prompt_budget,
     biff_operating_mode_prompt,
     biff_prompt_budget_enabled,
+    biff_runtime_instability_guard_disabled,
     cap_hygiene_history,
     cap_model_facing_tool_outputs,
     collect_token_source_metrics,
@@ -154,6 +155,40 @@ def test_turn_toolset_plan_keeps_only_board_tools_for_kanban_status():
     assert enabled == ["kanban", "terminal"]
 
 
+def test_turn_toolset_plan_exposes_native_kanban_tools_for_bare_story_check(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  discord:\n"
+        "    - terminal\n"
+        "    - kanban\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        configured,
+        configured_toolsets=configured,
+        message="Check 1503",
+    )
+
+    from model_tools import get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    names = {
+        tool["function"]["name"]
+        for tool in get_tool_definitions(enabled, [], quiet_mode=True)
+        if isinstance(tool, dict) and "function" in tool
+    }
+    assert enabled == ["kanban", "terminal"]
+    assert {"kanban_show", "kanban_list", "kanban_admin"}.issubset(names)
+
+
 def test_turn_toolset_plan_grants_web_and_browser_for_links():
     configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search", "browser"]
     enabled = apply_biff_turn_toolset_plan(
@@ -165,6 +200,19 @@ def test_turn_toolset_plan_grants_web_and_browser_for_links():
     )
 
     assert enabled == ["browser", "file", "search", "terminal", "web"]
+
+
+def test_turn_toolset_plan_exposes_vision_for_attachment_analysis(monkeypatch):
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "vision"]
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        ["terminal", "file", "memory", "skills-read", "todo", "kanban"],
+        configured_toolsets=configured,
+        message="Grant yourself vision analyze",
+    )
+
+    assert enabled == ["file", "terminal", "vision"]
 
 
 def test_turn_toolset_plan_zero_tools_for_mental_health_moment_and_dashboard_handoff():
@@ -332,6 +380,17 @@ def test_discord_live_guardrails_keep_quick_status_small():
     assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 3
 
 
+def test_discord_live_guardrails_keep_vision_analysis_bounded():
+    message = "Grant yourself vision analyze"
+
+    settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message=message)
+
+    assert settings["route_action"] == "vision_analyze"
+    assert settings["terminal_timeout"] == 20
+    assert settings["max_tool_calls"] == 3
+    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 4
+
+
 def test_discord_live_guardrails_keep_kanban_status_bounded():
     message = "Status check only: tell me what K-1346 and K-1347 currently say on the Kanban board."
 
@@ -348,10 +407,10 @@ def test_discord_live_guardrails_keep_board_admin_action_with_biff():
 
     settings = resolve_biff_live_tool_guardrail_settings({}, "discord", message=message)
 
-    assert settings["route_action"] == "route_bundle"
-    assert settings["terminal_timeout"] == 45
-    assert settings["max_tool_calls"] == 36
-    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 48
+    assert settings["route_action"] == "kanban_admin"
+    assert settings["terminal_timeout"] == 20
+    assert settings["max_tool_calls"] == 6
+    assert resolve_biff_live_max_iterations({}, "discord", message=message, base_max_iterations=90) == 8
 
 
 def test_plain_route_budgets_ignore_generic_chat_cap():
@@ -2089,6 +2148,81 @@ def test_biff_runtime_instability_guard_downgrades_mode_and_narrows_tool_budget(
     assert adjusted["runtime_instability_guard"]["active"] is True
 
 
+def test_biff_runtime_instability_guard_kill_switch_preserves_runtime_change_tools(monkeypatch):
+    mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
+    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+    message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
+
+    monkeypatch.setenv("BIFF_DISABLE_INSTABILITY_GUARD", "1")
+
+    assert biff_runtime_instability_guard_disabled({}, "discord") is True
+    guarded = apply_biff_runtime_instability_guard(
+        mode,
+        signal,
+        disabled=biff_runtime_instability_guard_disabled({}, "discord"),
+    )
+    enabled = filter_biff_mode_enabled_toolsets(
+        guarded,
+        apply_biff_turn_toolset_plan({}, "discord", configured, message=message),
+    )
+    adjusted = apply_biff_runtime_instability_tool_guardrails(
+        {"max_tool_calls": 60, "terminal_timeout": 45},
+        signal,
+        disabled=biff_runtime_instability_guard_disabled({}, "discord"),
+    )
+
+    assert guarded.name == "normal"
+    assert {"terminal", "file", "kanban", "web"}.issubset(enabled)
+    assert adjusted["max_tool_calls"] == 60
+    assert adjusted["terminal_timeout"] == 45
+    assert adjusted["runtime_instability_guard"] == {"disabled": True, "reason": "disabled_by_config"}
+
+
+def test_biff_runtime_instability_guard_relaxes_for_approved_runtime_change_bundle():
+    mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
+    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+    message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.] User instruction: fix the guard'
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
+
+    degraded = apply_biff_runtime_instability_guard(mode, signal)
+    relaxed = relax_biff_runtime_instability_guard_for_turn(
+        degraded,
+        signal,
+        route_runtime="biff-hermes-runtime-change",
+        route_action="route_bundle",
+    )
+    enabled = filter_biff_mode_enabled_toolsets(
+        relaxed,
+        widen_biff_toolsets_for_bundle(
+            {},
+            "discord",
+            apply_biff_turn_toolset_plan({}, "discord", configured, message=message),
+            configured,
+            message=message,
+        ),
+    )
+
+    assert degraded.name == "evidence-only"
+    assert relaxed.name == "emergency"
+    assert {"terminal", "file", "kanban", "web"}.issubset(enabled)
+
+
+def test_biff_runtime_instability_guard_config_kill_switch_preserves_budget():
+    mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
+    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+    config = {"biff": {"platforms": {"discord": {"disable_instability_guard": True}}}}
+
+    guarded = apply_biff_runtime_instability_guard(
+        mode,
+        signal,
+        disabled=biff_runtime_instability_guard_disabled(config, "discord"),
+    )
+
+    assert biff_runtime_instability_guard_disabled(config, "discord") is True
+    assert guarded.name == "normal"
+
+
 def test_biff_runtime_instability_recovery_turn_restores_execution_capable_mode():
     mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
     signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
@@ -2106,6 +2240,18 @@ def test_biff_runtime_instability_recovery_turn_restores_execution_capable_mode(
         route_runtime="continuation",
         route_action="route_bundle",
     )
+    kanban_admin = relax_biff_runtime_instability_guard_for_turn(
+        degraded,
+        signal,
+        route_runtime="kanban_admin",
+        route_action="kanban_admin",
+    )
+    kanban_read = relax_biff_runtime_instability_guard_for_turn(
+        degraded,
+        signal,
+        route_runtime="kanban_read",
+        route_action="kanban_status",
+    )
     unrelated = relax_biff_runtime_instability_guard_for_turn(
         degraded,
         signal,
@@ -2115,6 +2261,8 @@ def test_biff_runtime_instability_recovery_turn_restores_execution_capable_mode(
 
     assert recovered.name == "emergency"
     assert continuation.name == "emergency"
+    assert kanban_admin.name == "emergency"
+    assert kanban_read.name == "emergency"
     assert unrelated.name == "evidence-only"
 
 

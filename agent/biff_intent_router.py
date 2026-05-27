@@ -74,6 +74,15 @@ _RIGHT_NOW_WEB_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_VISION_REQUEST_RE = re.compile(
+    r"\b(?:vision[_\s-]?analy[sz]e|analy[sz]e\s+(?:this\s+)?(?:image|photo|picture|screenshot|attachment)|"
+    r"look\s+at\s+(?:this\s+)?(?:image|photo|picture|screenshot|attachment)|"
+    r"read\s+(?:this\s+)?(?:image|photo|picture|screenshot|attachment)|"
+    r"what(?:'s|\s+is)\s+(?:in|on)\s+(?:this\s+)?(?:image|photo|picture|screenshot|attachment)|"
+    r"grant\s+(?:yourself|you)\s+vision|give\s+(?:yourself|you)\s+vision|"
+    r"(?:missing|lost|restore|recover|enable|use)\s+vision)\b",
+    re.IGNORECASE,
+)
 _ACTION_RE = re.compile(
     r"\b(implement|fix|change|patch|create|write|save|remember|forget|add|update|archive|migrate|sync|run|continue|finish|complete|close|debug|deploy|configure|install|delete|remove|make|build|execute|proceed|ship|work on|get it done|let me know|document|specify|triage|do)\b",
     re.IGNORECASE,
@@ -276,8 +285,25 @@ class BiffTurnPlan:
 
 
 _KANBAN_STATUS_RE = re.compile(
-    r"\b(?:status|state|say|show|read|check|current(?:ly)?|open|closed|done)\b.*\b(?:K-\d+|story|card|kanban|board|ticket|issue)\b"
-    r"|\b(?:K-\d+|story|card|kanban|board|ticket|issue)\b.*\b(?:status|state|say|show|read|check|current(?:ly)?|open|closed|done)\b",
+    r"\b(?:status|state|say|show|read|check|current(?:ly)?|open|closed|done)\b.*\b(?:K-\d+|BIF-\d+|story|card|kanban|board|ticket|issue)\b"
+    r"|\b(?:K-\d+|BIF-\d+|story|card|kanban|board|ticket|issue)\b.*\b(?:status|state|say|show|read|check|current(?:ly)?|open|closed|done)\b",
+    re.IGNORECASE,
+)
+_KANBAN_ADMIN_RE = re.compile(
+    r"\b(?:create|add|move|update|edit|admin|assign|reassign|open|close|reopen|block|unblock|link|unlink|comment|archive|delete)\b.*\b(?:K-\d+|BIF-\d+|card|cards|kanban|board|ticket|issue|backlog)\b"
+    r"|\b(?:K-\d+|BIF-\d+|card|cards|kanban|board|ticket|issue|backlog)\b.*\b(?:create|add|move|update|edit|admin|assign|reassign|open|close|reopen|block|unblock|link|unlink|comment|archive|delete)\b"
+    r"|\b(?:create|move|update|assign|reassign|open|close|reopen|block|unblock|link|unlink|comment|archive|delete)\b.*\bstor(?:y|ies)\b"
+    r"|\bstor(?:y|ies)\b.*\b(?:move|update|assign|reassign|open|close|reopen|block|unblock|link|unlink|comment|archive|delete|to\s+(?:todo|ready|doing|done|blocked))\b",
+    re.IGNORECASE,
+)
+_KANBAN_BARE_STATUS_RE = re.compile(
+    r"^\s*(?:check|show|read|status|state|open|closed|done|where(?:'s|\s+is)|what(?:'s|\s+is)(?:\s+up\s+with)?|tell\s+me\s+about)\s+"
+    r"(?:the\s+)?(?:story|card|ticket|issue)?\s*(?:#\s*)?(?:K-|BIF-)?\d{3,5}\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+_KANBAN_BARE_ADMIN_RE = re.compile(
+    r"^\s*(?:move|update|edit|assign|reassign|open|close|reopen|block|unblock|link|unlink|comment|archive|delete|keep)\s+"
+    r"(?:the\s+)?(?:story|card|ticket|issue)?\s*(?:#\s*)?(?:K-|BIF-)?\d{3,5}\b",
     re.IGNORECASE,
 )
 
@@ -394,6 +420,15 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
             False,
             "resume",
         )
+    if _VISION_REQUEST_RE.search(body):
+        return BiffTurnPlan(
+            "vision_analyze",
+            "image/attachment vision request needs the narrow vision tool lane",
+            "vision_lookup",
+            3,
+            False,
+            "vision",
+        )
     if _RESTART_DONE_FOLLOWUP_RE.search(body):
         return BiffTurnPlan(
             "route_bundle",
@@ -403,6 +438,18 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
             True,
             "base",
         )
+    is_early_kanban_status_read = (
+        _KANBAN_STATUS_RE.search(body) or _KANBAN_BARE_STATUS_RE.search(body)
+    ) and not _BOARD_ADMIN_RE.search(body)
+    is_early_kanban_admin = _KANBAN_ADMIN_RE.search(body) or (
+        _BOARD_ADMIN_RE.search(body)
+        and re.search(r"\b(?:K-\d+|BIF-\d+|story|stories|card|cards|kanban|board|ticket|issue|backlog)\b", body, re.IGNORECASE)
+    ) or _KANBAN_BARE_ADMIN_RE.search(body)
+    has_early_broad_quantifier = re.search(r"\b(?:all|every|entire|whole|full|broad|multi[-\s]?system)\b", body, re.IGNORECASE)
+    if is_early_kanban_status_read and not has_early_broad_quantifier:
+        return BiffTurnPlan("kanban_status", "read-only Kanban/status request", "kanban_read", 2, False, "kanban")
+    if is_early_kanban_admin and not has_early_broad_quantifier:
+        return BiffTurnPlan("kanban_admin", "bounded Kanban administration request", "kanban_admin", 4, False, "kanban")
     if _FOLLOW_UP_ACTION_RE.search(body):
         return BiffTurnPlan("route_bundle", "short follow-up should continue prior work context", "continuation", 2, True, "base")
     if _FOLLOW_UP_ACTION_LEAD_RE.search(body):
@@ -411,10 +458,18 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("route_bundle", "action follow-up should continue prior work context", "continuation", 2, True, "base")
     if _REPLY_FIX_FOLLOWUP_RE.search(body) and _FORGE_DIRECT_RE.search(body):
         return BiffTurnPlan("route_bundle", "engineering reply-fix follow-up should stay with Biff unless a specialist handoff is explicit", "continuation", 4, True, "base")
-    is_kanban_status_read = _KANBAN_STATUS_RE.search(body) and not _BOARD_ADMIN_RE.search(body)
+    is_kanban_status_read = (
+        _KANBAN_STATUS_RE.search(body) or _KANBAN_BARE_STATUS_RE.search(body)
+    ) and not _BOARD_ADMIN_RE.search(body)
+    is_kanban_admin = _KANBAN_ADMIN_RE.search(body) or (
+        _BOARD_ADMIN_RE.search(body)
+        and re.search(r"\b(?:K-\d+|BIF-\d+|story|stories|card|cards|kanban|board|ticket|issue|backlog)\b", body, re.IGNORECASE)
+    ) or _KANBAN_BARE_ADMIN_RE.search(body)
     has_broad_quantifier = re.search(r"\b(?:all|every|entire|whole|full|broad|multi[-\s]?system)\b", body, re.IGNORECASE)
     if is_kanban_status_read and not has_broad_quantifier:
         return BiffTurnPlan("kanban_status", "read-only Kanban/status request", "kanban_read", 2, False, "kanban")
+    if is_kanban_admin and not has_broad_quantifier:
+        return BiffTurnPlan("kanban_admin", "bounded Kanban administration request", "kanban_admin", 4, False, "kanban")
     if _BROAD_VERIFICATION_RE.search(body):
         return BiffTurnPlan("route_bundle", "broad verification should stay with Biff unless Vex handoff is explicit", "workflow", 2, True, "base")
     # Preserve board/archive hygiene routing before SecondBrain RAG broad-match.
