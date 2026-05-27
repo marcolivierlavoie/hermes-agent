@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -72,6 +73,7 @@ class BiffRuntimeInstabilitySignal:
     sigterm_count: int = 0
     codex_empty_output_count: int = 0
     repeated_failure_count: int = 0
+    severity: str = "none"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -80,6 +82,7 @@ class BiffRuntimeInstabilitySignal:
             "sigterm_count": self.sigterm_count,
             "codex_empty_output_count": self.codex_empty_output_count,
             "repeated_failure_count": self.repeated_failure_count,
+            "severity": self.severity,
         }
 
 
@@ -97,7 +100,16 @@ def detect_biff_runtime_instability(log_text: Any) -> BiffRuntimeInstabilitySign
     text = str(log_text or "")[-200_000:]
     lowered = text.lower()
     sigterm_count = len(re.findall(r"\bsigterm\b|received signal 15|signal\.sigterm", lowered))
-    codex_empty_output_count = len(re.findall(r"output\s*=\s*none|output none|empty terminal frame", lowered))
+    codex_empty_output_raw_count = len(re.findall(r"output\s*=\s*none|output none|empty terminal frame", lowered))
+    recovered_codex_empty_count = len(
+        re.findall(
+            r"codex responses stream terminal frame had output\s*=\s*none;\s*recovering",
+            lowered,
+        )
+    )
+    # Recovered Codex stream terminal frames are warning-only. They explain why
+    # a stream looked odd, but the runtime already recovered usable output.
+    codex_empty_output_count = max(0, codex_empty_output_raw_count - recovered_codex_empty_count)
     repeated_failure_count = len(
         re.findall(
             r"long_turn_repeated_failure_fallback|repeated_exact_failure|same_tool_failure|tool-loop|tool loop",
@@ -105,28 +117,90 @@ def detect_biff_runtime_instability(log_text: Any) -> BiffRuntimeInstabilitySign
         )
     )
     pending_message_bug = "get_pending_message" in lowered and "attribute" in lowered
+    security_lockdown = bool(
+        re.search(
+            r"security[_\s-]?(?:lockdown|incident|breach)|credential\s+(?:leak|exposure)|secret\s+(?:leak|exposure)",
+            lowered,
+        )
+    )
     reasons: list[str] = []
-    if sigterm_count >= 2:
+    if sigterm_count >= 4:
         reasons.append("recent_gateway_restarts")
-    if codex_empty_output_count >= 2:
+    if codex_empty_output_count >= 3:
         reasons.append("codex_empty_terminal_frames")
     if repeated_failure_count >= 2:
         reasons.append("repeated_tool_or_long_turn_loop")
     if pending_message_bug:
         reasons.append("discord_pending_message_adapter_error")
+    if security_lockdown:
+        reasons.append("security_lockdown")
+
+    extreme = (
+        security_lockdown
+        or sigterm_count >= 8
+        or repeated_failure_count >= 6
+        or (sigterm_count >= 5 and repeated_failure_count >= 3)
+        or (pending_message_bug and repeated_failure_count >= 3)
+    )
+    severity = "extreme" if extreme else ("soft" if reasons else "none")
     return BiffRuntimeInstabilitySignal(
         active=bool(reasons),
         reasons=tuple(reasons),
         sigterm_count=sigterm_count,
         codex_empty_output_count=codex_empty_output_count,
         repeated_failure_count=repeated_failure_count,
+        severity=severity,
     )
+
+
+_LOG_TIMESTAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d{3})?\b")
+
+
+def _filter_recent_instability_log_text(
+    text: str,
+    *,
+    window_seconds: int,
+    now: datetime | None = None,
+) -> str:
+    """Keep only timestamped log lines in the current short instability window."""
+
+    if window_seconds <= 0:
+        return text
+    parsed: list[tuple[datetime | None, str]] = []
+    timestamps: list[datetime] = []
+    for line in str(text or "").splitlines():
+        match = _LOG_TIMESTAMP_RE.match(line)
+        ts = None
+        if match:
+            try:
+                ts = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+                timestamps.append(ts)
+            except ValueError:
+                ts = None
+        parsed.append((ts, line))
+    if not timestamps:
+        return ""
+
+    current = now or datetime.now()
+    latest = max(timestamps)
+    if latest < current - timedelta(seconds=window_seconds * 2):
+        return ""
+    cutoff = current - timedelta(seconds=window_seconds)
+    chunks: list[str] = []
+    keep_continuation = False
+    for ts, line in parsed:
+        if ts is not None:
+            keep_continuation = ts >= cutoff
+        if keep_continuation:
+            chunks.append(line)
+    return "\n".join(chunks)
 
 
 def inspect_biff_runtime_instability_logs(
     log_dir: str | os.PathLike[str] | None = None,
     *,
     max_chars_per_file: int = 80_000,
+    window_seconds: int = 600,
 ) -> BiffRuntimeInstabilitySignal:
     """Inspect recent local gateway/error logs for live-turn instability."""
 
@@ -137,7 +211,12 @@ def inspect_biff_runtime_instability_logs(
         try:
             if path.is_file():
                 text = path.read_text(errors="replace")
-                chunks.append(text[-max_chars_per_file:])
+                chunks.append(
+                    _filter_recent_instability_log_text(
+                        text[-max_chars_per_file:],
+                        window_seconds=window_seconds,
+                    )
+                )
         except OSError:
             continue
     return detect_biff_runtime_instability("\n".join(chunks))
@@ -204,13 +283,18 @@ def apply_biff_runtime_instability_guard(
     *,
     disabled: bool = False,
 ) -> BiffOperatingMode:
-    """Downgrade live Biff Discord turns while recent runtime instability exists."""
+    """Fail soft for recoverable runtime weirdness; evidence-only is extreme-only."""
 
     if disabled or not signal or not signal.active:
         return mode
     if mode.name in {"emergency", "evidence-only"}:
         return mode
-    return _BIFF_MODE_SPECS["evidence-only"]
+    severity = str(getattr(signal, "severity", "") or "").strip().lower()
+    if severity == "extreme":
+        return _BIFF_MODE_SPECS["evidence-only"]
+    if "repeated_tool_or_long_turn_loop" in set(getattr(signal, "reasons", ()) or ()):
+        return _BIFF_MODE_SPECS["emergency"]
+    return mode
 
 
 def relax_biff_runtime_instability_guard_for_turn(
@@ -260,6 +344,21 @@ def apply_biff_runtime_instability_tool_guardrails(
         adjusted["runtime_instability_guard"] = {"disabled": True, "reason": "disabled_by_config"}
         return adjusted
     if not signal or not signal.active:
+        return adjusted
+    severity = str(getattr(signal, "severity", "") or "").strip().lower()
+    if severity != "extreme":
+        if "repeated_tool_or_long_turn_loop" in set(getattr(signal, "reasons", ()) or ()):
+            current_max = adjusted.get("max_tool_calls")
+            try:
+                adjusted["max_tool_calls"] = min(int(current_max), 24) if current_max is not None else 24
+            except Exception:
+                adjusted["max_tool_calls"] = 24
+            current_timeout = adjusted.get("terminal_timeout")
+            try:
+                adjusted["terminal_timeout"] = min(int(current_timeout), 45) if current_timeout is not None else 45
+            except Exception:
+                adjusted["terminal_timeout"] = 45
+        adjusted["runtime_instability_guard"] = signal.to_dict()
         return adjusted
     current_max = adjusted.get("max_tool_calls")
     try:

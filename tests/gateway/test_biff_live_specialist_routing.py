@@ -139,7 +139,7 @@ async def test_gateway_specialist_path_fails_closed_even_if_router_misclassifies
 
 
 @pytest.mark.asyncio
-async def test_runtime_instability_guard_blocks_live_specialist_dispatch(monkeypatch):
+async def test_runtime_instability_guard_does_not_block_soft_specialist_dispatch(monkeypatch):
     from gateway.session_hygiene import BiffRuntimeInstabilitySignal
 
     runner, handoff = _runner_with_mocked_handoff(monkeypatch)
@@ -149,11 +149,37 @@ async def test_runtime_instability_guard_blocks_live_specialist_dispatch(monkeyp
         lambda *args, **kwargs: BiffRuntimeInstabilitySignal(
             True,
             ("recent_gateway_restarts", "codex_empty_terminal_frames"),
-            sigterm_count=2,
-            codex_empty_output_count=2,
+            sigterm_count=4,
+            codex_empty_output_count=3,
+            severity="soft",
         ),
     )
     event = _discord_event("Have Vex QA the dashboard change and verify the live UI actually works.", "unstable-vex-msg")
+
+    response = await runner._handle_message(event)
+
+    assert response is not None
+    assert "I did not send this to Vex" not in response
+    assert handoff.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_extreme_runtime_instability_guard_blocks_live_specialist_dispatch(monkeypatch):
+    from gateway.session_hygiene import BiffRuntimeInstabilitySignal
+
+    runner, handoff = _runner_with_mocked_handoff(monkeypatch)
+    monkeypatch.setenv("HERMES_BIFF_RUNTIME_INSTABILITY_GUARD", "1")
+    monkeypatch.setattr(
+        "gateway.session_hygiene.inspect_biff_runtime_instability_logs",
+        lambda *args, **kwargs: BiffRuntimeInstabilitySignal(
+            True,
+            ("recent_gateway_restarts", "repeated_tool_or_long_turn_loop"),
+            sigterm_count=8,
+            repeated_failure_count=4,
+            severity="extreme",
+        ),
+    )
+    event = _discord_event("Have Vex QA the dashboard change and verify the live UI actually works.", "extreme-unstable-vex-msg")
 
     response = await runner._handle_message(event)
 

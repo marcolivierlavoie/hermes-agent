@@ -8637,6 +8637,7 @@ class GatewayRunner:
                 if (
                     _biff_runtime_instability is not None
                     and getattr(_biff_runtime_instability, "active", False)
+                    and str(getattr(_biff_runtime_instability, "severity", "") or "").strip().lower() == "extreme"
                     and _biff_live_route.action in {"forge_direct", "ranger_direct", "quill_direct", "vex_direct"}
                 ):
                     _role = _biff_live_route.action.removesuffix("_direct").title()

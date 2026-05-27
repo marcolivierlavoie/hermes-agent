@@ -2115,26 +2115,45 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     )
 
 
-def test_biff_runtime_instability_detection_flags_restart_and_tool_loop_patterns():
+def test_biff_runtime_instability_detection_treats_recovered_codex_frames_as_warning_only():
     signal = detect_biff_runtime_instability(
         """
-        gateway received SIGTERM during restart
-        later: signal.SIGTERM observed again
         Codex Responses stream terminal frame had output=None
         Codex Responses stream terminal frame had output=None
+        Codex Responses stream terminal frame had output=None; recovering from 2 collected output item(s).
+        Codex Responses stream terminal frame had output=None; recovering from 1 collected output item(s).
+        """
+    )
+
+    assert signal.active is False
+    assert signal.severity == "none"
+    assert "codex_empty_terminal_frames" not in signal.reasons
+
+
+def test_biff_runtime_instability_detection_ignores_small_manual_restart_batches():
+    signal = detect_biff_runtime_instability("SIGTERM\nreceived signal 15\nsignal.SIGTERM\n")
+
+    assert signal.active is False
+    assert signal.severity == "none"
+    assert "recent_gateway_restarts" not in signal.reasons
+
+
+def test_biff_runtime_instability_detection_flags_soft_tool_loop_without_evidence_only():
+    signal = detect_biff_runtime_instability(
+        """
         long_turn_repeated_failure_fallback after repeated_exact_failure_warning
+        same_tool_failure in tool loop
         """
     )
 
     assert signal.active is True
-    assert "recent_gateway_restarts" in signal.reasons
-    assert "codex_empty_terminal_frames" in signal.reasons
     assert "repeated_tool_or_long_turn_loop" in signal.reasons
+    assert signal.severity == "soft"
 
 
-def test_biff_runtime_instability_guard_downgrades_mode_and_narrows_tool_budget():
+def test_biff_runtime_instability_guard_fails_soft_for_recoverable_tool_loop():
     mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
-    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+    signal = detect_biff_runtime_instability("long_turn_repeated_failure_fallback repeated_exact_failure")
 
     guarded = apply_biff_runtime_instability_guard(mode, signal)
     adjusted = apply_biff_runtime_instability_tool_guardrails(
@@ -2142,15 +2161,34 @@ def test_biff_runtime_instability_guard_downgrades_mode_and_narrows_tool_budget(
         signal,
     )
 
+    assert guarded.name == "emergency"
+    assert adjusted["max_tool_calls"] == 24
+    assert adjusted["terminal_timeout"] == 45
+    assert adjusted["runtime_instability_guard"]["active"] is True
+    assert adjusted["runtime_instability_guard"]["severity"] == "soft"
+
+
+def test_biff_runtime_instability_guard_uses_evidence_only_for_extreme_crash_loop():
+    mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
+    signal = detect_biff_runtime_instability(
+        " ".join(["SIGTERM"] * 8 + ["long_turn_repeated_failure_fallback"] * 3)
+    )
+
+    guarded = apply_biff_runtime_instability_guard(mode, signal)
+    adjusted = apply_biff_runtime_instability_tool_guardrails(
+        {"max_tool_calls": 60, "terminal_timeout": 45},
+        signal,
+    )
+
+    assert signal.severity == "extreme"
     assert guarded.name == "evidence-only"
     assert adjusted["max_tool_calls"] == 2
     assert adjusted["terminal_timeout"] == 10
-    assert adjusted["runtime_instability_guard"]["active"] is True
 
 
 def test_biff_runtime_instability_guard_kill_switch_preserves_runtime_change_tools(monkeypatch):
     mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
-    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+    signal = detect_biff_runtime_instability(" ".join(["SIGTERM"] * 8))
     message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.]'
     configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
 
@@ -2181,7 +2219,7 @@ def test_biff_runtime_instability_guard_kill_switch_preserves_runtime_change_too
 
 def test_biff_runtime_instability_guard_relaxes_for_approved_runtime_change_bundle():
     mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
-    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+    signal = detect_biff_runtime_instability(" ".join(["SIGTERM"] * 8))
     message = '[IMPORTANT: The user has invoked the "biff-hermes-runtime-change" skill bundle.] User instruction: fix the guard'
     configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
 
@@ -2210,7 +2248,7 @@ def test_biff_runtime_instability_guard_relaxes_for_approved_runtime_change_bund
 
 def test_biff_runtime_instability_guard_config_kill_switch_preserves_budget():
     mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
-    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+    signal = detect_biff_runtime_instability(" ".join(["SIGTERM"] * 8))
     config = {"biff": {"platforms": {"discord": {"disable_instability_guard": True}}}}
 
     guarded = apply_biff_runtime_instability_guard(
@@ -2225,7 +2263,7 @@ def test_biff_runtime_instability_guard_config_kill_switch_preserves_budget():
 
 def test_biff_runtime_instability_recovery_turn_restores_execution_capable_mode():
     mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
-    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+    signal = detect_biff_runtime_instability(" ".join(["SIGTERM"] * 8))
     degraded = apply_biff_runtime_instability_guard(mode, signal)
 
     recovered = relax_biff_runtime_instability_guard_for_turn(
@@ -2267,11 +2305,24 @@ def test_biff_runtime_instability_recovery_turn_restores_execution_capable_mode(
 
 
 def test_biff_runtime_instability_log_inspector_reads_recent_gateway_logs(tmp_path):
-    (tmp_path / "gateway.error.log").write_text("old\nSIGTERM\nSIGTERM\n", encoding="utf-8")
-    (tmp_path / "errors.log").write_text("output=None\noutput=None\n", encoding="utf-8")
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    (tmp_path / "gateway.error.log").write_text((f"{stamp},000 WARNING SIGTERM\n" * 4), encoding="utf-8")
+    (tmp_path / "errors.log").write_text((f"{stamp},000 WARNING output=None\n" * 3), encoding="utf-8")
 
     signal = inspect_biff_runtime_instability_logs(tmp_path)
 
     assert signal.active is True
     assert "recent_gateway_restarts" in signal.reasons
     assert "codex_empty_terminal_frames" in signal.reasons
+    assert signal.severity == "soft"
+
+
+def test_biff_runtime_instability_log_inspector_ignores_old_restart_tail(tmp_path):
+    old = "2026-05-26 23:00:00,000 WARNING gateway.run: Received SIGTERM\n"
+    current = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    (tmp_path / "gateway.log").write_text((old * 20) + f"{current},000 INFO gateway.run: idle\n", encoding="utf-8")
+
+    signal = inspect_biff_runtime_instability_logs(tmp_path, window_seconds=600)
+
+    assert signal.active is False
+    assert signal.severity == "none"
