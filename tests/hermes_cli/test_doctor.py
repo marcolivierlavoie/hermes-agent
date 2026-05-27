@@ -5,6 +5,7 @@ import sys
 import types
 import io
 import contextlib
+import plistlib
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -203,21 +204,22 @@ class TestBiffRuntimeDoctor:
         for path in [home, broker.parent, role.parent, board.parent]:
             path.mkdir(parents=True, exist_ok=True)
         broker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        role.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
         broker.chmod(0o755)
-        role.chmod(0o755)
         board.write_text("sqlite placeholder", encoding="utf-8")
         (home / "config.yaml").write_text(
+            "model:\n  provider: openai-codex\n"
             "platform_toolsets:\n  discord: [hermes-discord, kanban]\n"
             "kanban:\n  dispatch_in_gateway: false\n",
             encoding="utf-8",
         )
         (home / ".env").write_text(
-            "OPENROUTER_API_KEY=sk-super-secret\nAPI_SERVER_KEY=another-secret\n",
+            "OPENROUTER_API_KEY=***\nOPENAI_API_KEY=***\nAPI_SERVER_KEY=another-secret\n",
             encoding="utf-8",
         )
         project = tmp_path / "runtime"
         (project / "scripts").mkdir(parents=True)
+        role.write_text(f'REPO = Path(os.environ.get("HERMES_REPO", "{project}"))\n', encoding="utf-8")
+        role.chmod(0o755)
         (project / "scripts/restart-hermes-gateway.sh").write_text("#!/bin/sh\n", encoding="utf-8")
 
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
@@ -234,8 +236,125 @@ class TestBiffRuntimeDoctor:
         assert "Biff runtime preflight passed" in out
         assert "OPENROUTER_API_KEY" in out
         assert "API_SERVER_KEY" in out
-        assert "sk-super-secret" not in out
+        assert "***" not in out
         assert "another-secret" not in out
+
+    def test_biff_runtime_doctor_fails_provider_key_name_drift(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "model:\n  provider: openrouter\n"
+            "platform_toolsets:\n  discord: [hermes-discord, kanban]\n",
+            encoding="utf-8",
+        )
+        (home / ".env").write_text("OPENAI_API_KEY=redacted\n", encoding="utf-8")
+        broker = tmp_path / ".local/bin/get_credential.sh"
+        broker.parent.mkdir(parents=True)
+        broker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        broker.chmod(0o755)
+        project = tmp_path / "runtime"
+        project.mkdir()
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setattr(doctor_mod, "_gateway_runtime_policy_result", lambda: ([], {"module_origins": {}}))
+        monkeypatch.setattr(doctor_mod, "_credential_alias_available", lambda _broker, alias: (alias != "OPENROUTER_API_KEY", f"{alias}: unavailable"))
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with pytest.raises(SystemExit) as exc:
+                doctor_mod.run_doctor(Namespace(fix=False, biff_runtime=True))
+
+        out = buf.getvalue()
+        assert exc.value.code == 1
+        assert "Provider/API key name alignment" in out
+        assert "provider=openrouter expects OPENROUTER_API_KEY" in out
+        assert "Credential broker provider alias" in out
+
+    def test_biff_runtime_doctor_fails_missing_required_broker_alias(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "model:\n  provider: openai-codex\n"
+            "platform_toolsets:\n  discord: [hermes-discord, kanban]\n",
+            encoding="utf-8",
+        )
+        (home / ".env").write_text("OPENAI_API_KEY=redacted\n", encoding="utf-8")
+        broker = tmp_path / ".local/bin/get_credential.sh"
+        broker.parent.mkdir(parents=True)
+        broker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        broker.chmod(0o755)
+        project = tmp_path / "runtime"
+        project.mkdir()
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setattr(doctor_mod, "_gateway_runtime_policy_result", lambda: ([], {"module_origins": {}}))
+        monkeypatch.setattr(doctor_mod, "_credential_alias_available", lambda _broker, alias: (alias != "discord_bot_token", f"{alias}: unavailable"))
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with pytest.raises(SystemExit) as exc:
+                doctor_mod.run_doctor(Namespace(fix=False, biff_runtime=True))
+
+        out = buf.getvalue()
+        assert exc.value.code == 1
+        assert "Credential broker alias" in out
+        assert "discord_bot_token: unavailable via --check" in out
+
+    def test_biff_runtime_doctor_fails_direct_role_wrong_repo_default(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        role = home / "scripts/biff_role_invoke.py"
+        role.parent.mkdir(parents=True)
+        role.write_text('REPO = Path(os.environ.get("HERMES_REPO", "/old/runtime"))\n', encoding="utf-8")
+        role.chmod(0o755)
+        project = tmp_path / "runtime"
+        project.mkdir()
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+
+        issues = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod._check_role_repo_pin(role, issues)
+
+        out = buf.getvalue()
+        assert "Direct role HERMES_REPO pin" in out
+        assert "/old/runtime" in out
+        assert issues
+
+    def test_biff_runtime_doctor_fails_launchd_runtime_path_drift(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        plist = home / "launchd/before-login/ai.hermes.gateway.plist"
+        plist.parent.mkdir(parents=True)
+        plist.write_bytes(plistlib.dumps({
+            "WorkingDirectory": "/wrong/runtime",
+            "EnvironmentVariables": {
+                "HERMES_CANONICAL_RUNTIME_DIR": "/wrong/runtime",
+                "HERMES_CANONICAL_VENV": "/wrong/runtime/venv",
+                "VIRTUAL_ENV": "/wrong/runtime/venv",
+            },
+        }))
+        project = tmp_path / "runtime"
+        project.mkdir()
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+
+        issues = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod._check_launchd_gateway_plist(issues)
+
+        out = buf.getvalue()
+        assert "Gateway launchd runtime path" in out
+        assert "/wrong/runtime" in out
+        assert issues
 
 
 class TestHonchoDoctorConfigDetection:
