@@ -921,12 +921,10 @@ def _should_auto_continue_after_iteration_limit(
         return False
     if not _biff_iteration_limit_auto_continue_enabled(platform_key):
         return False
-    if str(operating_mode or "").strip().lower() in {"emergency", "evidence-only"}:
-        return False
-    if live_max_iterations is not None and int(live_max_iterations) < 8:
-        return False
-    if live_max_tool_calls is not None and int(live_max_tool_calls) < 8:
-        return False
+    # BIF-1516: live caps and Emergency/evidence-only mode are exactly the
+    # situations where Marco needs Biff to continue instead of stopping with a
+    # summary. The recursion-depth gate below is the loop brake; do not use the
+    # degraded-mode guardrails themselves as a reason to suppress continuation.
     if interrupt_depth >= max_interrupt_depth:
         return False
     if agent_result.get("interrupted") or agent_result.get("failed"):

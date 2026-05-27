@@ -47,6 +47,23 @@ def _fingerprint(value: Any) -> dict[str, Any]:
     }
 
 
+def _extract_work_handle(user_request: Any, source: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return the durable work handle visible in a compact continuation artifact."""
+
+    text = str(user_request or "")
+    match = re.search(r"\bBIF[-\s]?(\d{3,6})\b", text, re.IGNORECASE)
+    if not match:
+        # Marco often says "work on 1516" in the live Discord thread; keep this
+        # conservative so random numbers do not become fake card IDs.
+        match = re.search(r"\b(?:work\s+on|continue|resume|fix|verify)\s+(\d{3,6})\b", text, re.IGNORECASE)
+    card = f"BIF-{match.group(1)}" if match else ""
+    return {
+        "active_card": card,
+        "chat_id": str((source or {}).get("chat_id") or ""),
+        "user_id": str((source or {}).get("user_id") or ""),
+    }
+
+
 def build_continuation_artifact(
     *,
     user_request: Any,
@@ -65,15 +82,20 @@ def build_continuation_artifact(
     now = time.time()
     known = _redact_text(result.get("final_response") or result.get("error") or "", 1800)
     remaining = "Resume from the artifact, verify source-of-truth state, finish remaining checks, and do not claim done without visible evidence."
+    work_handle = _extract_work_handle(user_request, source)
     return {
         "schema": "biff.live-continuation.v1",
         "created_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
         "platform": str(platform or ""),
         "session_id": str(session_id or ""),
+        "work_handle": work_handle,
         "turn_exit_reason": str(result.get("turn_exit_reason") or "cap_risk_or_hit"),
         "auto_continue_started": bool(auto_continue),
         "user_request": _fingerprint(user_request),
         "work_already_verified": known or "No useful final summary was produced before the cap event.",
+        "last_completed_step": known or "Unknown; inspect transcript and source-of-truth state before proceeding.",
+        "next_action": str(next_command or "Continue the same request from this continuation artifact with fresh budget."),
+        "verification_state": "unfinished; verification required before any done/success claim",
         "remaining_checks": remaining,
         "source_of_truth_paths": [
             "Hermes Kanban board biff-os for card/task state",
@@ -119,6 +141,7 @@ def write_continuation_artifact(**kwargs: Any) -> dict[str, Any]:
         f"Platform/session: {artifact['platform']} / {artifact['session_id']}",
         f"Exit reason: {artifact['turn_exit_reason']}",
         f"Auto-continue started: {artifact['auto_continue_started']}",
+        f"Active card: {artifact.get('work_handle', {}).get('active_card') or '(unknown)'}",
         "",
         "## User request fingerprint",
         json.dumps(artifact["user_request"], indent=2, sort_keys=True, ensure_ascii=False),
@@ -128,6 +151,11 @@ def write_continuation_artifact(**kwargs: Any) -> dict[str, Any]:
         "",
         "## Remaining checks",
         artifact["remaining_checks"],
+        "",
+        "## Continuation contract",
+        f"Last completed step: {artifact['last_completed_step']}",
+        f"Next action: {artifact['next_action']}",
+        f"Verification state: {artifact['verification_state']}",
         "",
         "## Source of truth paths",
         *[f"- {p}" for p in artifact["source_of_truth_paths"]],

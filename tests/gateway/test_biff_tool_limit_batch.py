@@ -7,6 +7,7 @@ from pathlib import Path
 
 from agent.biff_intent_router import plan_biff_turn
 from gateway.continuation_artifacts import write_continuation_artifact
+from gateway.run import _should_auto_continue_after_iteration_limit
 from gateway.session_hygiene import (
     biff_discord_quick_check_budget_prompt,
     resolve_biff_live_tool_guardrail_settings,
@@ -74,6 +75,39 @@ def test_continuation_artifact_redacts_and_writes_resume_context(tmp_path, monke
     assert data["auto_continue_started"] is True
     assert data["remaining_checks"]
     assert "SECRET" not in json_path.read_text()
+
+
+def test_continuation_artifact_records_active_bif_handle(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_BIFF_CONTINUATION_DIR", str(tmp_path))
+
+    artifact = write_continuation_artifact(
+        user_request="Work on 1516 before continuing the rest",
+        agent_result={"turn_exit_reason": "max_iterations_reached", "completed": False},
+        session_id="sess-one",
+        platform="discord",
+        source={"chat_id": "chat-1", "user_id": "marco"},
+    )
+
+    data = json.loads(Path(artifact["artifact_paths"]["json"]).read_text())
+    md = Path(artifact["artifact_paths"]["markdown"]).read_text()
+    assert data["work_handle"]["active_card"] == "BIF-1516"
+    assert data["work_handle"]["chat_id"] == "chat-1"
+    assert data["verification_state"].startswith("unfinished")
+    assert "Active card: BIF-1516" in md
+
+
+def test_iteration_limit_auto_continue_survives_emergency_low_cap_mode(monkeypatch):
+    monkeypatch.setenv("HERMES_BIFF_ITERATION_LIMIT_AUTO_CONTINUE", "1")
+
+    assert _should_auto_continue_after_iteration_limit(
+        {"turn_exit_reason": "max_iterations_reached", "completed": False},
+        platform_key="discord",
+        interrupt_depth=0,
+        max_interrupt_depth=2,
+        operating_mode="emergency",
+        live_max_iterations=2,
+        live_max_tool_calls=2,
+    ) is True
 
 
 def test_kanban_status_compact_direct_query_shapes_large_output(tmp_path, monkeypatch):
