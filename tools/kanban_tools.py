@@ -53,8 +53,40 @@ def _profile_has_kanban_toolset() -> bool:
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
+
+        # Legacy/profile-level orchestrator config used by early Kanban
+        # workers/profiles.
         toolsets = cfg.get("toolsets", [])
-        return "kanban" in toolsets
+        if isinstance(toolsets, str):
+            toolsets = [toolsets]
+        if "kanban" in (toolsets or []):
+            return True
+
+        # Current tool configuration is per-platform.  Gateway sessions expose
+        # their platform through HERMES_PLATFORM or HERMES_SESSION_PLATFORM;
+        # without this, Discord could have `platform_toolsets.discord:
+        # [kanban]` yet the kanban_* check_fn would still hide every tool.
+        platform = os.getenv("HERMES_PLATFORM")
+        if not platform:
+            try:
+                from gateway.session_context import get_session_env
+                platform = get_session_env("HERMES_SESSION_PLATFORM")
+            except Exception:
+                platform = None
+        platform_toolsets = cfg.get("platform_toolsets") or {}
+        if platform and isinstance(platform_toolsets, dict):
+            configured = platform_toolsets.get(platform) or []
+            if isinstance(configured, str):
+                configured = [configured]
+            return "kanban" in configured
+
+        # Bare CLI/orchestrator fallback: honour an explicit CLI platform entry.
+        if isinstance(platform_toolsets, dict):
+            configured = platform_toolsets.get("cli") or []
+            if isinstance(configured, str):
+                configured = [configured]
+            return "kanban" in configured
+        return False
     except Exception:
         return False
 

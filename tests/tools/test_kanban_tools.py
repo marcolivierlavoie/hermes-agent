@@ -142,6 +142,33 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_kanban_tools_visible_with_platform_toolsets(monkeypatch, tmp_path):
+    """Gateway/controller sessions should honour per-platform kanban opt-in."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PLATFORM", "discord")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  discord:\n"
+        "    - hermes-discord\n"
+        "    - kanban\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-discord")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+    assert "kanban_list" in kanban
+    assert "kanban_show" in kanban
+    assert "kanban_admin" in kanban
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
