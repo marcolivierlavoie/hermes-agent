@@ -168,6 +168,76 @@ class TestDoctorToolAvailabilityOverrides:
         assert doctor._doctor_tool_availability_detail("kanban") == "(runtime-gated; loaded only for dispatcher-spawned workers)"
 
 
+class TestBiffRuntimeDoctor:
+    def test_biff_runtime_doctor_warns_when_discord_kanban_platform_toolset_missing(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "platform_toolsets:\n  discord: [hermes-discord]\n",
+            encoding="utf-8",
+        )
+        project = tmp_path / "runtime"
+        project.mkdir()
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setattr(doctor_mod, "_gateway_runtime_policy_result", lambda: ([], {"module_origins": {}}))
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with pytest.raises(SystemExit) as exc:
+                doctor_mod.run_doctor(Namespace(fix=False, biff_runtime=True))
+
+        out = buf.getvalue()
+        assert exc.value.code == 1
+        assert "Biff Runtime Preflight" in out
+        assert "Discord platform Kanban toolset" in out
+        assert "platform_toolsets.discord" in out
+
+    def test_biff_runtime_doctor_redacts_env_values_and_prints_fixable_names(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        broker = tmp_path / ".local/bin/get_credential.sh"
+        role = home / "scripts/biff_role_invoke.py"
+        board = home / "kanban/boards/biff-os/kanban.db"
+        for path in [home, broker.parent, role.parent, board.parent]:
+            path.mkdir(parents=True, exist_ok=True)
+        broker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        role.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        broker.chmod(0o755)
+        role.chmod(0o755)
+        board.write_text("sqlite placeholder", encoding="utf-8")
+        (home / "config.yaml").write_text(
+            "platform_toolsets:\n  discord: [hermes-discord, kanban]\n"
+            "kanban:\n  dispatch_in_gateway: false\n",
+            encoding="utf-8",
+        )
+        (home / ".env").write_text(
+            "OPENROUTER_API_KEY=sk-super-secret\nAPI_SERVER_KEY=another-secret\n",
+            encoding="utf-8",
+        )
+        project = tmp_path / "runtime"
+        (project / "scripts").mkdir(parents=True)
+        (project / "scripts/restart-hermes-gateway.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(doctor_mod, "_gateway_runtime_policy_result", lambda: ([], {"module_origins": {}}))
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=False, biff_runtime=True))
+
+        out = buf.getvalue()
+        assert "Biff runtime preflight passed" in out
+        assert "OPENROUTER_API_KEY" in out
+        assert "API_SERVER_KEY" in out
+        assert "sk-super-secret" not in out
+        assert "another-secret" not in out
+
+
 class TestHonchoDoctorConfigDetection:
     def test_reports_configured_when_enabled_with_api_key(self, monkeypatch):
         fake_config = SimpleNamespace(enabled=True, api_key="***")

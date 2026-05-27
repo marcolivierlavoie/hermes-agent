@@ -334,12 +334,42 @@ def _build_apikey_providers_list() -> list:
     return _static
 
 
-def _run_gateway_runtime_doctor() -> None:
-    """Check Biff gateway cwd/venv/import policy and exit non-zero on drift."""
+def _gateway_runtime_policy_result() -> tuple[list[str], dict]:
+    """Collect Biff gateway runtime policy diagnostics without printing."""
     from gateway.runtime_policy import collect_gateway_runtime_diagnostics, gateway_runtime_policy_violations
 
     diag = collect_gateway_runtime_diagnostics()
-    violations = gateway_runtime_policy_violations(diag)
+    return gateway_runtime_policy_violations(diag), diag
+
+
+def _load_yaml_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        import yaml as _yaml
+
+        return _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _env_key_names(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    keys: list[str] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key:
+            keys.append(key)
+    return sorted(set(keys))
+
+
+def _run_gateway_runtime_doctor() -> None:
+    """Check Biff gateway cwd/venv/import policy and exit non-zero on drift."""
+    violations, diag = _gateway_runtime_policy_result()
     _section("Biff Gateway Runtime")
     check_info(f"canonical runtime: {diag.get('canonical_runtime_dir')}")
     check_info(f"canonical venv: {diag.get('canonical_venv')}")
@@ -355,6 +385,82 @@ def _run_gateway_runtime_doctor() -> None:
     check_ok("Gateway runtime policy", "(cwd, venv, and Biff imports align)")
 
 
+def _run_biff_runtime_doctor() -> None:
+    """Run Biff-specific preflight checks without printing secrets."""
+    issues: list[str] = []
+    _section("Biff Runtime Preflight")
+
+    violations, diag = _gateway_runtime_policy_result()
+    if violations:
+        for violation in violations:
+            check_fail("Gateway runtime policy", violation)
+        issues.extend(violations)
+    else:
+        check_ok("Gateway runtime policy", "(cwd, venv, and Biff imports align)")
+    for module_name, origin in (diag.get("module_origins") or {}).items():
+        check_info(f"{module_name}: {origin}")
+
+    config_path = HERMES_HOME / "config.yaml"
+    cfg = _load_yaml_config(config_path)
+    if config_path.exists():
+        check_ok("Biff config file", f"({config_path})")
+    else:
+        check_warn("Biff config file missing", f"({config_path})")
+        issues.append(f"Create or restore {config_path}")
+
+    discord_toolsets = (((cfg.get("platform_toolsets") or {}).get("discord")) or []) if isinstance(cfg, dict) else []
+    if "kanban" in discord_toolsets:
+        check_ok("Discord platform Kanban toolset", "(platform_toolsets.discord includes kanban)")
+    else:
+        check_fail("Discord platform Kanban toolset", "Add 'kanban' to platform_toolsets.discord so Biff keeps Kanban visibility")
+        issues.append("Add 'kanban' to platform_toolsets.discord in ~/.hermes/config.yaml")
+
+    dispatch = ((cfg.get("kanban") or {}).get("dispatch_in_gateway")) if isinstance(cfg, dict) else None
+    check_info(f"kanban.dispatch_in_gateway: {dispatch!r}")
+
+    env_keys = _env_key_names(HERMES_HOME / ".env")
+    sensitive_keys = [k for k in env_keys if any(token in k for token in ("KEY", "TOKEN", "SECRET"))]
+    if env_keys:
+        check_ok("Environment key names loaded", ", ".join(sensitive_keys or env_keys[:8]))
+    else:
+        check_warn("No ~/.hermes/.env key names found")
+
+    broker = Path.home() / ".local/bin/get_credential.sh"
+    if broker.exists() and os.access(broker, os.X_OK):
+        check_ok("Credential broker", f"({broker}; use --check only)")
+    else:
+        check_fail("Credential broker", f"Missing or not executable: {broker}")
+        issues.append(f"Restore executable credential broker: {broker}")
+
+    board = HERMES_HOME / "kanban/boards/biff-os/kanban.db"
+    if board.exists():
+        check_ok("biff-os Kanban board", f"({board})")
+    else:
+        check_warn("biff-os Kanban board not found", f"({board})")
+        issues.append(f"Verify canonical Kanban board path: {board}")
+
+    role_invoker = HERMES_HOME / "scripts/biff_role_invoke.py"
+    if role_invoker.exists() and os.access(role_invoker, os.X_OK):
+        check_ok("Direct role invoker", f"({role_invoker})")
+        check_info(f"Runtime role work should set HERMES_REPO={PROJECT_ROOT}")
+    else:
+        check_warn("Direct role invoker missing or not executable", f"({role_invoker})")
+        issues.append(f"Restore direct role invoker: {role_invoker}")
+
+    restart_script = PROJECT_ROOT / "scripts/restart-hermes-gateway.sh"
+    if restart_script.exists():
+        check_ok("Gateway restart wrapper", f"({restart_script})")
+    else:
+        check_warn("Gateway restart wrapper missing", f"({restart_script})")
+
+    if issues:
+        check_fail("Biff runtime preflight", f"{len(issues)} issue(s) need attention")
+        for issue in issues[:8]:
+            check_info(f"Fix: {issue}")
+        sys.exit(1)
+    check_ok("Biff runtime preflight passed", "(no secret values printed)")
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -362,6 +468,9 @@ def run_doctor(args):
 
     if getattr(args, "gateway_runtime", False):
         _run_gateway_runtime_doctor()
+        return
+    if getattr(args, "biff_runtime", False):
+        _run_biff_runtime_doctor()
         return
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability

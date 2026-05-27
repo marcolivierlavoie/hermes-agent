@@ -11057,6 +11057,11 @@ def main():
         action="store_true",
         help="Check Biff gateway cwd/venv/import policy and return non-zero on split-brain runtime drift",
     )
+    doctor_parser.add_argument(
+        "--biff-runtime",
+        action="store_true",
+        help="Run Biff reliability preflight checks for runtime, config, Kanban, credentials, and recovery wiring",
+    )
     doctor_parser.set_defaults(func=cmd_doctor)
 
     # =========================================================================
