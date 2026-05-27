@@ -17910,6 +17910,7 @@ class GatewayRunner:
             extract_biff_bundle_key,
             filter_biff_mode_enabled_toolsets,
             inspect_biff_runtime_instability_logs,
+            relax_biff_runtime_instability_guard_for_turn,
             render_plain_language_heartbeat,
             resolve_biff_live_max_iterations,
             resolve_biff_live_tool_guardrail_settings,
@@ -17992,6 +17993,30 @@ class GatewayRunner:
             message=message,
             configured_toolsets=_configured_toolsets,
         )
+        try:
+            if str(platform_key or "").strip().lower() == "discord":
+                from agent.biff_intent_router import plan_biff_turn
+
+                _turn_plan = plan_biff_turn(message, command=False)
+                _relaxed_mode = relax_biff_runtime_instability_guard_for_turn(
+                    _biff_mode,
+                    _biff_runtime_instability_signal,
+                    route_runtime=getattr(_turn_plan, "runtime", None),
+                    route_action=getattr(_turn_plan, "action", None),
+                )
+                if _relaxed_mode.name != _biff_mode.name:
+                    logger.warning(
+                        "biff_runtime_instability_recovery_tools_restored: platform=%s from=%s to=%s runtime=%s action=%s reasons=%s",
+                        platform_key,
+                        _biff_mode.name,
+                        _relaxed_mode.name,
+                        getattr(_turn_plan, "runtime", None),
+                        getattr(_turn_plan, "action", None),
+                        ",".join(getattr(_biff_runtime_instability_signal, "reasons", ()) or ()),
+                    )
+                    _biff_mode = _relaxed_mode
+        except Exception as _recovery_relax_err:
+            logger.debug("Biff runtime instability recovery relax skipped: %s", _recovery_relax_err)
         enabled_toolsets = filter_biff_mode_enabled_toolsets(
             _biff_mode,
             widen_biff_toolsets_for_bundle(

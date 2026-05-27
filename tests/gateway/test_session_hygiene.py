@@ -37,6 +37,7 @@ from gateway.session_hygiene import (
     filter_biff_mode_enabled_toolsets,
     inspect_biff_runtime_instability_logs,
     maybe_build_slow_work_deflection,
+    relax_biff_runtime_instability_guard_for_turn,
     render_plain_language_heartbeat,
     resolve_biff_live_max_iterations,
     resolve_biff_live_tool_guardrail_settings,
@@ -2086,6 +2087,35 @@ def test_biff_runtime_instability_guard_downgrades_mode_and_narrows_tool_budget(
     assert adjusted["max_tool_calls"] == 2
     assert adjusted["terminal_timeout"] == 10
     assert adjusted["runtime_instability_guard"]["active"] is True
+
+
+def test_biff_runtime_instability_recovery_turn_restores_execution_capable_mode():
+    mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
+    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+    degraded = apply_biff_runtime_instability_guard(mode, signal)
+
+    recovered = relax_biff_runtime_instability_guard_for_turn(
+        degraded,
+        signal,
+        route_runtime="tool_access_recovery",
+        route_action="route_bundle",
+    )
+    continuation = relax_biff_runtime_instability_guard_for_turn(
+        degraded,
+        signal,
+        route_runtime="continuation",
+        route_action="route_bundle",
+    )
+    unrelated = relax_biff_runtime_instability_guard_for_turn(
+        degraded,
+        signal,
+        route_runtime="direct_answer",
+        route_action="answer_now",
+    )
+
+    assert recovered.name == "emergency"
+    assert continuation.name == "emergency"
+    assert unrelated.name == "evidence-only"
 
 
 def test_biff_runtime_instability_log_inspector_reads_recent_gateway_logs(tmp_path):

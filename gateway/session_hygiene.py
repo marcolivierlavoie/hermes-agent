@@ -156,6 +156,33 @@ def apply_biff_runtime_instability_guard(
     return _BIFF_MODE_SPECS["evidence-only"]
 
 
+def relax_biff_runtime_instability_guard_for_turn(
+    mode: BiffOperatingMode,
+    signal: BiffRuntimeInstabilitySignal | None,
+    *,
+    route_runtime: Any = None,
+    route_action: Any = None,
+) -> BiffOperatingMode:
+    """Restore execution-capable tools for explicit recovery/continuation turns.
+
+    The instability guard intentionally degrades ordinary Discord turns to
+    evidence-only after crash-loop symptoms.  Recovery turns are different: if
+    Marco asks why Biff lacks tools, asks Biff to restore tools, or an empty
+    post-restart continuation is trying to resume interrupted work, evidence-only
+    filtering removes the very terminal/file/Kanban tools needed to diagnose and
+    recover.  Keep the small emergency budget, but do not strip the base operator
+    toolsets for those turn classes.
+    """
+
+    if not signal or not signal.active or mode.name != "evidence-only":
+        return mode
+    runtime = str(route_runtime or "").strip().lower()
+    action = str(route_action or "").strip().lower()
+    if runtime in {"tool_access_recovery", "continuation"} or action in {"resume_context"}:
+        return _BIFF_MODE_SPECS["emergency"]
+    return mode
+
+
 def apply_biff_runtime_instability_tool_guardrails(
     settings: Mapping[str, Any] | None,
     signal: BiffRuntimeInstabilitySignal | None,
