@@ -271,6 +271,18 @@ class TestAdapterInit:
         adapter = APIServerAdapter(config)
         assert adapter._port == 8642
 
+    def test_biff_api_key_preferred_over_generic_api_server_key(self, monkeypatch):
+        monkeypatch.setenv("API_SERVER_KEY", "generic-server-token")
+        monkeypatch.setenv("BIFF_API_KEY", "biff-env-token")
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"biff_api_key": "biff-config-token", "key": "legacy-config-token"},
+            )
+        )
+
+        assert adapter._api_key == "biff-config-token"
+
     @pytest.mark.asyncio
     async def test_fast_biff_ui_has_explicit_key_save_and_chat_auth_flow(self, monkeypatch):
         adapter = APIServerAdapter(
@@ -291,22 +303,27 @@ class TestAdapterInit:
         assert response.content_type == "text/html"
         assert response.headers["Cache-Control"] == "no-store"
         assert "<form id=\"auth\"" in html_text
-        assert "<button id=\"saveToken\" type=\"submit\">Save key</button>" in html_text
+        assert "placeholder=\"biff_api_key\"" in html_text
+        assert "aria-label=\"Biff API key\"" in html_text
+        assert "<button id=\"saveToken\" type=\"submit\">Save Biff key</button>" in html_text
         assert "<button id=\"clearToken\" type=\"button\">Clear</button>" in html_text
         assert "clearToken.addEventListener('click'" in html_text
         assert "token.addEventListener('keydown'" in html_text
         assert "event.key === 'Enter'" in html_text
+        assert "const tokenStorageKey = 'biff_api_key';" in html_text
+        assert "const legacyTokenStorageKey = 'fastBiffToken';" in html_text
         assert "localStorage.setItem(tokenStorageKey, apiToken)" in html_text
-        assert "No API key saved. Paste it at the top and press Enter or Save key." in html_text
+        assert "No biff_api_key saved. Paste it at the top and press Enter or Save Biff key." in html_text
         assert "'Authorization':'Bearer ' + apiToken" in html_text
         assert "fetch('/biff/v1/chat'" in html_text
         assert "localStorage.removeItem(tokenStorageKey)" in html_text
-        assert "Invalid API key. Paste the current key and Save again." in html_text
+        assert "Invalid biff_api_key. Paste the current Biff key and Save again." in html_text
         assert "Server error: HTTP " in html_text
         assert "Request running…" in html_text
         assert "Keep the same Session ID to continue after a gateway restart." in html_text
-        assert "Gateway unavailable or restarting. Your key and Session ID are still saved here" in html_text
+        assert "Gateway unavailable or restarting. Your Biff key and Session ID are still saved here" in html_text
         assert "API_SERVER_KEY" not in html_text
+        assert "OpenRouter" not in html_text
         assert "sk-test" not in html_text
 
     def test_create_agent_forwards_config_reasoning_effort(self, monkeypatch):

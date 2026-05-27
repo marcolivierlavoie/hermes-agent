@@ -675,7 +675,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if raw_port is None:
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
-        self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        # Fast Biff's user-facing/browser auth is named ``biff_api_key`` so it
+        # does not look like a model-provider/OpenRouter credential.  Keep the
+        # legacy ``key`` / ``API_SERVER_KEY`` fallbacks for existing generic API
+        # server clients and deployments.
+        self._api_key: str = str(
+            extra.get("biff_api_key")
+            or extra.get("key")
+            or os.getenv("BIFF_API_KEY")
+            or os.getenv("API_SERVER_KEY", "")
+        )
         self._fast_biff_enabled: bool = _coerce_config_bool(
             extra.get("fast_biff_enabled", os.getenv("API_SERVER_FAST_BIFF_ENABLED")),
             default=False,
@@ -848,7 +857,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not self._api_key:
             self._audit_fast_biff("auth_missing", request, status=401)
             return web.json_response(
-                _openai_error("Fast Biff API requires API_SERVER_KEY bearer authentication.", code="fast_biff_auth_required"),
+                _openai_error("Fast Biff API requires biff_api_key bearer authentication.", code="fast_biff_auth_required"),
                 status=401,
             )
         auth_err = self._check_auth(request)
@@ -927,19 +936,19 @@ class APIServerAdapter(BasePlatformAdapter):
 </head>
 <body>
 <main>
-  <header><h1>Fast Biff Beta</h1><p>Tailnet-only Safari chat shell. Token stays in this browser; Discord remains the fallback.</p></header>
+  <header><h1>Fast Biff Beta</h1><p>Tailnet-only Safari chat shell. Biff key stays in this browser; Discord remains the fallback.</p></header>
   <form id="auth" class="row auth-row" autocomplete="off">
-    <input id="token" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Fast Biff API token" type="password">
-    <button id="saveToken" type="submit">Save key</button>
+    <input id="token" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="biff_api_key" aria-label="Biff API key" type="password">
+    <button id="saveToken" type="submit">Save Biff key</button>
     <button id="clearToken" type="button">Clear</button>
   </form>
   <div class="row">
     <input id="session" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Session ID, optional" value="{session_prefix}:ios-beta">
-    <small id="authStatus" role="status">Key not saved yet.</small>
+    <small id="authStatus" role="status">Biff key not saved yet.</small>
   </div>
-  <div id="log" aria-live="polite"><div class="sys">Ready. Paste token once, press Enter or Save key, then ask Biff. Keep the same Session ID to continue after a gateway restart.</div></div>
+  <div id="log" aria-live="polite"><div class="sys">Ready. Paste biff_api_key once, press Enter or Save Biff key, then ask Biff. Keep the same Session ID to continue after a gateway restart.</div></div>
   <form id="chat"><textarea id="message" placeholder="Ask Biff…" required></textarea><button id="send" type="submit">Send</button></form>
-  <small>Beta: one-at-a-time requests, no attachments yet, no token is embedded in this page. Restart continuity: if the gateway reloads mid-request, wait for it to come back and resend with the same Session ID.</small>
+  <small>Beta: one-at-a-time requests, no attachments yet, no Biff key is embedded in this page. Restart continuity: if the gateway reloads mid-request, wait for it to come back and resend with the same Session ID.</small>
 </main>
 <script nonce="{nonce}">
 const $ = (id) => document.getElementById(id);
@@ -951,23 +960,26 @@ const send = $('send');
 const authStatus = $('authStatus');
 const saveToken = $('saveToken');
 const clearToken = $('clearToken');
-const tokenStorageKey = 'fastBiffToken';
+const tokenStorageKey = 'biff_api_key';
+const legacyTokenStorageKey = 'fastBiffToken';
 const sessionStorageKey = 'fastBiffSession';
+const legacyToken = localStorage.getItem(legacyTokenStorageKey) || '';
+if (!localStorage.getItem(tokenStorageKey) && legacyToken) {{ localStorage.setItem(tokenStorageKey, legacyToken); localStorage.removeItem(legacyTokenStorageKey); }}
 let savedToken = localStorage.getItem(tokenStorageKey) || '';
 token.value = savedToken;
 session.value = localStorage.getItem(sessionStorageKey) || session.value;
 function add(kind, text) {{ const el = document.createElement('div'); el.className = 'msg ' + kind; el.textContent = text; log.appendChild(el); log.scrollTop = log.scrollHeight; }}
 function setAuthStatus(text, isError) {{ authStatus.textContent = text; authStatus.className = isError ? 'err' : ''; }}
-function refreshAuthState() {{ savedToken = localStorage.getItem(tokenStorageKey) || ''; setAuthStatus(savedToken ? 'Key saved in this browser.' : 'Key not saved yet.', !savedToken); }}
+function refreshAuthState() {{ savedToken = localStorage.getItem(tokenStorageKey) || ''; setAuthStatus(savedToken ? 'Biff key saved in this browser.' : 'Biff key not saved yet.', !savedToken); }}
 function saveAuthToken(showMessage = true) {{
   const apiToken = token.value.trim();
   const sessionId = session.value.trim();
-  if (!apiToken) {{ setAuthStatus('Paste the API key, then press Enter or Save key.', true); token.focus(); return false; }}
+  if (!apiToken) {{ setAuthStatus('Paste biff_api_key, then press Enter or Save Biff key.', true); token.focus(); return false; }}
   localStorage.setItem(tokenStorageKey, apiToken);
   localStorage.setItem(sessionStorageKey, sessionId);
   savedToken = apiToken;
-  setAuthStatus('Key saved in this browser.', false);
-  if (showMessage) add('sys', 'API key saved for this browser.');
+  setAuthStatus('Biff key saved in this browser.', false);
+  if (showMessage) add('sys', 'Biff key saved for this browser.');
   message.focus();
   return true;
 }}
@@ -978,14 +990,15 @@ clearToken.addEventListener('click', () => {{
   savedToken = '';
   token.value = '';
   refreshAuthState();
-  add('sys', 'API key cleared from this browser.');
+  localStorage.removeItem(legacyTokenStorageKey);
+  add('sys', 'Biff key cleared from this browser.');
   token.focus();
 }});
 token.addEventListener('keydown', (event) => {{
   if (event.key === 'Enter') {{ event.preventDefault(); saveAuthToken(true); }}
 }});
 token.addEventListener('input', () => {{
-  if (token.value.trim() !== savedToken) setAuthStatus('Unsaved key — press Enter or Save key.', true);
+  if (token.value.trim() !== savedToken) setAuthStatus('Unsaved Biff key — press Enter or Save Biff key.', true);
   else refreshAuthState();
 }});
 session.addEventListener('keydown', (event) => {{
@@ -998,7 +1011,7 @@ $('chat').addEventListener('submit', async (event) => {{
   if (!text) return;
   let apiToken = savedToken || localStorage.getItem(tokenStorageKey) || '';
   if (!apiToken) {{
-    if (!saveAuthToken(false)) {{ add('sys err', 'No API key saved. Paste it at the top and press Enter or Save key.'); return; }}
+    if (!saveAuthToken(false)) {{ add('sys err', 'No biff_api_key saved. Paste it at the top and press Enter or Save Biff key.'); return; }}
     apiToken = savedToken;
   }}
   if (token.value.trim() && token.value.trim() !== apiToken) {{
@@ -1012,7 +1025,7 @@ $('chat').addEventListener('submit', async (event) => {{
     const resp = await fetch('/biff/v1/chat', {{ method:'POST', headers: {{ 'Authorization':'Bearer ' + apiToken, 'Content-Type':'application/json', 'X-Hermes-Session-Key': sessionId || 'fast-biff:web-beta' }}, body: JSON.stringify({{ message: text, session_id: sessionId || undefined }}) }});
     const data = await resp.json().catch(() => ({{ error: {{ message: 'Non-JSON response from server' }} }}));
     if (!resp.ok) {{
-      if (resp.status === 401) {{ localStorage.removeItem(tokenStorageKey); savedToken = ''; refreshAuthState(); setAuthStatus('Invalid API key. Paste the current key and Save again.', true); }}
+      if (resp.status === 401) {{ localStorage.removeItem(tokenStorageKey); localStorage.removeItem(legacyTokenStorageKey); savedToken = ''; refreshAuthState(); setAuthStatus('Invalid biff_api_key. Paste the current Biff key and Save again.', true); }}
       else setAuthStatus('Server error: HTTP ' + resp.status, true);
       throw new Error(data?.error?.message || ('HTTP ' + resp.status));
     }}
@@ -1023,7 +1036,7 @@ $('chat').addEventListener('submit', async (event) => {{
     const msg = String(err?.message || err || '');
     if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('Load failed')) {{
       setAuthStatus('Gateway unavailable or restarting. Wait a moment, then resend with the same Session ID.', true);
-      add('sys err', 'Gateway unavailable or restarting. Your key and Session ID are still saved here; wait a moment, then resend to continue.');
+      add('sys err', 'Gateway unavailable or restarting. Your Biff key and Session ID are still saved here; wait a moment, then resend to continue.');
     }} else {{
       add('sys err', 'Error: ' + (err?.message || err));
     }}
