@@ -2138,6 +2138,26 @@ def test_biff_runtime_instability_detection_ignores_small_manual_restart_batches
     assert "recent_gateway_restarts" not in signal.reasons
 
 
+def test_biff_runtime_instability_detection_counts_restart_events_not_sigterm_mentions():
+    signal = detect_biff_runtime_instability(
+        "\n".join(
+            [
+                "2026-05-27 09:15:12,075 INFO gateway.run: Received SIGTERM — initiating shutdown",
+                "2026-05-27 09:15:12,075 WARNING gateway.run: Shutdown context: signal=SIGTERM",
+                "2026-05-27 09:15:43,485 INFO gateway.run: Received SIGTERM — initiating shutdown",
+                "2026-05-27 09:15:43,485 WARNING gateway.run: Shutdown context: signal=SIGTERM",
+                "2026-05-27 09:16:17,739 INFO gateway.run: Received SIGTERM — initiating shutdown",
+                "2026-05-27 09:16:17,740 WARNING gateway.run: Shutdown context: signal=SIGTERM",
+            ]
+        )
+    )
+
+    assert signal.sigterm_count == 3
+    assert signal.active is False
+    assert signal.severity == "none"
+    assert "recent_gateway_restarts" not in signal.reasons
+
+
 def test_biff_runtime_instability_detection_flags_soft_tool_loop_without_evidence_only():
     signal = detect_biff_runtime_instability(
         """
@@ -2321,6 +2341,20 @@ def test_biff_runtime_instability_log_inspector_ignores_old_restart_tail(tmp_pat
     old = "2026-05-26 23:00:00,000 WARNING gateway.run: Received SIGTERM\n"
     current = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     (tmp_path / "gateway.log").write_text((old * 20) + f"{current},000 INFO gateway.run: idle\n", encoding="utf-8")
+
+    signal = inspect_biff_runtime_instability_logs(tmp_path, window_seconds=600)
+
+    assert signal.active is False
+    assert signal.severity == "none"
+
+
+def test_biff_runtime_instability_log_inspector_ignores_old_untimestamped_warning_tail(tmp_path):
+    current = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    (tmp_path / "gateway.error.log").write_text(
+        f"{current},000 INFO gateway.run: Starting Hermes Gateway...\n"
+        + ("WARNING gateway.run: Shutdown context: signal=SIGTERM\n" * 20),
+        encoding="utf-8",
+    )
 
     signal = inspect_biff_runtime_instability_logs(tmp_path, window_seconds=600)
 

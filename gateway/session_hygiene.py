@@ -99,7 +99,16 @@ def detect_biff_runtime_instability(log_text: Any) -> BiffRuntimeInstabilitySign
 
     text = str(log_text or "")[-200_000:]
     lowered = text.lower()
-    sigterm_count = len(re.findall(r"\bsigterm\b|received signal 15|signal\.sigterm", lowered))
+    sigterm_raw_count = len(re.findall(r"\bsigterm\b|received signal 15|signal\.sigterm", lowered))
+    sigterm_event_count = sum(
+        1
+        for line in lowered.splitlines()
+        if re.search(r"received\s+sigterm|received\s+signal\s+15|initiating\s+shutdown", line)
+    )
+    # A single graceful restart often emits several SIGTERM-shaped lines
+    # ("Received SIGTERM", "signal=SIGTERM", "signal.SIGTERM").  The guard is
+    # meant to react to restart events, not repeated mentions of the same event.
+    sigterm_count = sigterm_event_count or sigterm_raw_count
     codex_empty_output_raw_count = len(re.findall(r"output\s*=\s*none|output none|empty terminal frame", lowered))
     recovered_codex_empty_count = len(
         re.findall(
@@ -191,7 +200,7 @@ def _filter_recent_instability_log_text(
     for ts, line in parsed:
         if ts is not None:
             keep_continuation = ts >= cutoff
-        if keep_continuation:
+        if keep_continuation and (ts is not None or line.startswith((" ", "\t"))):
             chunks.append(line)
     return "\n".join(chunks)
 
