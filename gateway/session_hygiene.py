@@ -12,6 +12,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
@@ -62,12 +63,120 @@ class BiffOperatingMode:
         }
 
 
+@dataclass(frozen=True)
+class BiffRuntimeInstabilitySignal:
+    """Recent runtime instability signal for Discord live-turn degradation."""
+
+    active: bool
+    reasons: tuple[str, ...] = ()
+    sigterm_count: int = 0
+    codex_empty_output_count: int = 0
+    repeated_failure_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "active": self.active,
+            "reasons": list(self.reasons),
+            "sigterm_count": self.sigterm_count,
+            "codex_empty_output_count": self.codex_empty_output_count,
+            "repeated_failure_count": self.repeated_failure_count,
+        }
+
+
 _BIFF_MODE_SPECS: dict[str, BiffOperatingMode] = {
     "normal": BiffOperatingMode("normal", "Normal", "Full Biff behavior with default context/tool-output hygiene only.", None, DEFAULT_MODEL_FACING_TOOL_OUTPUT_CHARS, None, DEFAULT_TOOL_PREVIEW_CHARS),
     "economy": BiffOperatingMode("economy", "Economy", "Preserve behavior while reducing accidental context/tool/history bloat for non-critical turns.", 40, 8_000, 16_000, 800),
     "emergency": BiffOperatingMode("emergency", "Emergency", "Keep only essential context and use a short tool loop for urgent quota pressure.", 16, 4_000, 8_000, 500),
     "evidence-only": BiffOperatingMode("evidence-only", "Evidence-only", "Gather/check evidence and summarize; avoid side-effecting actions unless already explicitly approved.", 8, 2_000, 4_000, 350),
 }
+
+
+def detect_biff_runtime_instability(log_text: Any) -> BiffRuntimeInstabilitySignal:
+    """Detect crash/restart/self-loop symptoms from recent gateway log text."""
+
+    text = str(log_text or "")[-200_000:]
+    lowered = text.lower()
+    sigterm_count = len(re.findall(r"\bsigterm\b|received signal 15|signal\.sigterm", lowered))
+    codex_empty_output_count = len(re.findall(r"output\s*=\s*none|output none|empty terminal frame", lowered))
+    repeated_failure_count = len(
+        re.findall(
+            r"long_turn_repeated_failure_fallback|repeated_exact_failure|same_tool_failure|tool-loop|tool loop",
+            lowered,
+        )
+    )
+    pending_message_bug = "get_pending_message" in lowered and "attribute" in lowered
+    reasons: list[str] = []
+    if sigterm_count >= 2:
+        reasons.append("recent_gateway_restarts")
+    if codex_empty_output_count >= 2:
+        reasons.append("codex_empty_terminal_frames")
+    if repeated_failure_count >= 2:
+        reasons.append("repeated_tool_or_long_turn_loop")
+    if pending_message_bug:
+        reasons.append("discord_pending_message_adapter_error")
+    return BiffRuntimeInstabilitySignal(
+        active=bool(reasons),
+        reasons=tuple(reasons),
+        sigterm_count=sigterm_count,
+        codex_empty_output_count=codex_empty_output_count,
+        repeated_failure_count=repeated_failure_count,
+    )
+
+
+def inspect_biff_runtime_instability_logs(
+    log_dir: str | os.PathLike[str] | None = None,
+    *,
+    max_chars_per_file: int = 80_000,
+) -> BiffRuntimeInstabilitySignal:
+    """Inspect recent local gateway/error logs for live-turn instability."""
+
+    base = Path(log_dir or (Path.home() / ".hermes" / "logs"))
+    chunks: list[str] = []
+    for name in ("gateway.error.log", "errors.log", "tui_gateway_crash.log", "gateway.log"):
+        path = base / name
+        try:
+            if path.is_file():
+                text = path.read_text(errors="replace")
+                chunks.append(text[-max_chars_per_file:])
+        except OSError:
+            continue
+    return detect_biff_runtime_instability("\n".join(chunks))
+
+
+def apply_biff_runtime_instability_guard(
+    mode: BiffOperatingMode,
+    signal: BiffRuntimeInstabilitySignal | None,
+) -> BiffOperatingMode:
+    """Downgrade live Biff Discord turns while recent runtime instability exists."""
+
+    if not signal or not signal.active:
+        return mode
+    if mode.name in {"emergency", "evidence-only"}:
+        return mode
+    return _BIFF_MODE_SPECS["evidence-only"]
+
+
+def apply_biff_runtime_instability_tool_guardrails(
+    settings: Mapping[str, Any] | None,
+    signal: BiffRuntimeInstabilitySignal | None,
+) -> dict[str, Any]:
+    """Narrow tool-loop budget during unstable gateway windows."""
+
+    adjusted = dict(settings or {})
+    if not signal or not signal.active:
+        return adjusted
+    current_max = adjusted.get("max_tool_calls")
+    try:
+        adjusted["max_tool_calls"] = min(int(current_max), 2) if current_max is not None else 2
+    except Exception:
+        adjusted["max_tool_calls"] = 2
+    current_timeout = adjusted.get("terminal_timeout")
+    try:
+        adjusted["terminal_timeout"] = min(int(current_timeout), 10) if current_timeout is not None else 10
+    except Exception:
+        adjusted["terminal_timeout"] = 10
+    adjusted["runtime_instability_guard"] = signal.to_dict()
+    return adjusted
 
 
 def normalize_biff_operating_mode(value: Any) -> str:

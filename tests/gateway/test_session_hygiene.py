@@ -23,6 +23,8 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_hygiene import (
     apply_discord_slowdown_guard,
+    apply_biff_runtime_instability_guard,
+    apply_biff_runtime_instability_tool_guardrails,
     apply_biff_tool_schema_profile,
     apply_biff_turn_toolset_plan,
     apply_biff_prompt_budget,
@@ -31,7 +33,9 @@ from gateway.session_hygiene import (
     cap_hygiene_history,
     cap_model_facing_tool_outputs,
     collect_token_source_metrics,
+    detect_biff_runtime_instability,
     filter_biff_mode_enabled_toolsets,
+    inspect_biff_runtime_instability_logs,
     maybe_build_slow_work_deflection,
     render_plain_language_heartbeat,
     resolve_biff_live_max_iterations,
@@ -2049,3 +2053,47 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     assert FakeCompressAgent.last_instance is None, (
         "Compression should NOT fire at 12 messages with default hard_limit=400"
     )
+
+
+def test_biff_runtime_instability_detection_flags_restart_and_tool_loop_patterns():
+    signal = detect_biff_runtime_instability(
+        """
+        gateway received SIGTERM during restart
+        later: signal.SIGTERM observed again
+        Codex Responses stream terminal frame had output=None
+        Codex Responses stream terminal frame had output=None
+        long_turn_repeated_failure_fallback after repeated_exact_failure_warning
+        """
+    )
+
+    assert signal.active is True
+    assert "recent_gateway_restarts" in signal.reasons
+    assert "codex_empty_terminal_frames" in signal.reasons
+    assert "repeated_tool_or_long_turn_loop" in signal.reasons
+
+
+def test_biff_runtime_instability_guard_downgrades_mode_and_narrows_tool_budget():
+    mode = resolve_biff_operating_mode({"biff": {"operating_mode": "normal"}}, "discord")
+    signal = detect_biff_runtime_instability("SIGTERM SIGTERM output=None output=None")
+
+    guarded = apply_biff_runtime_instability_guard(mode, signal)
+    adjusted = apply_biff_runtime_instability_tool_guardrails(
+        {"max_tool_calls": 60, "terminal_timeout": 45},
+        signal,
+    )
+
+    assert guarded.name == "evidence-only"
+    assert adjusted["max_tool_calls"] == 2
+    assert adjusted["terminal_timeout"] == 10
+    assert adjusted["runtime_instability_guard"]["active"] is True
+
+
+def test_biff_runtime_instability_log_inspector_reads_recent_gateway_logs(tmp_path):
+    (tmp_path / "gateway.error.log").write_text("old\nSIGTERM\nSIGTERM\n", encoding="utf-8")
+    (tmp_path / "errors.log").write_text("output=None\noutput=None\n", encoding="utf-8")
+
+    signal = inspect_biff_runtime_instability_logs(tmp_path)
+
+    assert signal.active is True
+    assert "recent_gateway_restarts" in signal.reasons
+    assert "codex_empty_terminal_frames" in signal.reasons

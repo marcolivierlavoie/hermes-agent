@@ -8626,6 +8626,30 @@ class GatewayRunner:
                     _biff_live_route.max_live_tool_calls,
                     _biff_live_route.allow_bundle_selection,
                 )
+                _biff_runtime_instability = None
+                if source.platform == Platform.DISCORD and os.getenv("HERMES_BIFF_RUNTIME_INSTABILITY_GUARD", "1").lower() not in {"0", "false", "no", "off"}:
+                    try:
+                        from gateway.session_hygiene import inspect_biff_runtime_instability_logs
+
+                        _biff_runtime_instability = inspect_biff_runtime_instability_logs()
+                    except Exception as _instability_exc:
+                        logger.debug("Biff runtime instability check skipped: %s", _instability_exc)
+                if (
+                    _biff_runtime_instability is not None
+                    and getattr(_biff_runtime_instability, "active", False)
+                    and _biff_live_route.action in {"forge_direct", "ranger_direct", "quill_direct", "vex_direct"}
+                ):
+                    _role = _biff_live_route.action.removesuffix("_direct").title()
+                    logger.warning(
+                        "biff_specialist_dispatch_blocked_by_runtime_instability: platform=%s role=%s reasons=%s",
+                        source.platform.value if source.platform else "gateway",
+                        _role,
+                        ",".join(getattr(_biff_runtime_instability, "reasons", ()) or ()),
+                    )
+                    return (
+                        f"I did not send this to {_role}; the gateway looks unstable right now, so I’m staying in degraded live mode. "
+                        "I can do a narrow check here and preserve a Kanban/continuation handle instead of starting role work."
+                    )
                 if _biff_live_route.action == "resume_context":
                     try:
                         from agent.biff_continuation_context import build_resume_context_injection
@@ -17877,12 +17901,15 @@ class GatewayRunner:
         platform_key = _platform_config_key(source.platform)
         from gateway.session_hygiene import (
             apply_discord_slowdown_guard,
+            apply_biff_runtime_instability_guard,
+            apply_biff_runtime_instability_tool_guardrails,
             apply_biff_tool_schema_profile,
             apply_biff_turn_toolset_plan,
             biff_discord_quick_check_budget_prompt,
             biff_operating_mode_prompt,
             extract_biff_bundle_key,
             filter_biff_mode_enabled_toolsets,
+            inspect_biff_runtime_instability_logs,
             render_plain_language_heartbeat,
             resolve_biff_live_max_iterations,
             resolve_biff_live_tool_guardrail_settings,
@@ -17890,6 +17917,22 @@ class GatewayRunner:
             widen_biff_toolsets_for_bundle,
         )
         _biff_mode = resolve_biff_operating_mode(user_config, platform_key)
+        _biff_runtime_instability_signal = None
+        if str(platform_key or "").strip().lower() == "discord" and os.getenv("HERMES_BIFF_RUNTIME_INSTABILITY_GUARD", "1").lower() not in {"0", "false", "no", "off"}:
+            try:
+                _biff_runtime_instability_signal = inspect_biff_runtime_instability_logs()
+                _guarded_mode = apply_biff_runtime_instability_guard(_biff_mode, _biff_runtime_instability_signal)
+                if _guarded_mode.name != _biff_mode.name:
+                    logger.warning(
+                        "biff_runtime_instability_degraded_mode: platform=%s from=%s to=%s reasons=%s",
+                        platform_key,
+                        _biff_mode.name,
+                        _guarded_mode.name,
+                        ",".join(getattr(_biff_runtime_instability_signal, "reasons", ()) or ()),
+                    )
+                    _biff_mode = _guarded_mode
+            except Exception as _instability_err:
+                logger.debug("Biff runtime instability guard skipped: %s", _instability_err)
         if str(platform_key or "").strip().lower() == "discord":
             try:
                 from gateway.rate_limit_circuit import active_rate_limit
@@ -17972,6 +18015,10 @@ class GatewayRunner:
                     user_config,
                     platform_key,
                     message=message,
+                )
+                _guardrail_settings = apply_biff_runtime_instability_tool_guardrails(
+                    _guardrail_settings,
+                    _biff_runtime_instability_signal,
                 )
                 set_chat_tool_policy(
                     session_id,

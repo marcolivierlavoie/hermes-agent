@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 
 def _runner_with_mocked_handoff(monkeypatch):
     monkeypatch.setenv("HERMES_BIFF_SPECIALISTS_USE_KANBAN", "0")
+    monkeypatch.setenv("HERMES_BIFF_RUNTIME_INSTABILITY_GUARD", "0")
     runner = GatewayRunner(GatewayConfig())
     runner.adapters[Platform.DISCORD] = SimpleNamespace(send=AsyncMock())
     monkeypatch.setattr(runner, "_is_user_authorized", lambda source: True)
@@ -134,6 +135,31 @@ async def test_gateway_specialist_path_fails_closed_even_if_router_misclassifies
 
     assert response is not None
     assert "I did not send this to Vex" in response
+    assert handoff.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_instability_guard_blocks_live_specialist_dispatch(monkeypatch):
+    from gateway.session_hygiene import BiffRuntimeInstabilitySignal
+
+    runner, handoff = _runner_with_mocked_handoff(monkeypatch)
+    monkeypatch.setenv("HERMES_BIFF_RUNTIME_INSTABILITY_GUARD", "1")
+    monkeypatch.setattr(
+        "gateway.session_hygiene.inspect_biff_runtime_instability_logs",
+        lambda *args, **kwargs: BiffRuntimeInstabilitySignal(
+            True,
+            ("recent_gateway_restarts", "codex_empty_terminal_frames"),
+            sigterm_count=2,
+            codex_empty_output_count=2,
+        ),
+    )
+    event = _discord_event("Have Vex QA the dashboard change and verify the live UI actually works.", "unstable-vex-msg")
+
+    response = await runner._handle_message(event)
+
+    assert response is not None
+    assert "I did not send this to Vex" in response
+    assert "degraded live mode" in response
     assert handoff.call_count == 0
 
 
