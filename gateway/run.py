@@ -18043,6 +18043,20 @@ class GatewayRunner:
                 message=message,
             ),
         )
+        _biff_router_telemetry_context = None
+        try:
+            if str(platform_key or "").strip().lower() == "discord":
+                from gateway.biff_router_telemetry import build_biff_router_telemetry_context
+
+                _biff_router_telemetry_context = build_biff_router_telemetry_context(
+                    config=user_config,
+                    platform_key=platform_key,
+                    message=message,
+                    configured_toolsets=_configured_toolsets,
+                    selected_toolsets=enabled_toolsets,
+                )
+        except Exception as _router_telemetry_err:
+            logger.debug("Biff router telemetry context build failed: %s", _router_telemetry_err)
         try:
             from tools.chat_guardrails import ChatToolPolicy, clear_chat_tool_policy, set_chat_tool_policy
 
@@ -18798,6 +18812,7 @@ class GatewayRunner:
                             "max_iterations": max_iterations,
                             "configured_toolsets": _configured_toolsets,
                             "enabled_toolsets": enabled_toolsets,
+                            "biff_router_telemetry": _biff_router_telemetry_context.to_dict() if _biff_router_telemetry_context else None,
                         },
                     )
             except Exception:
@@ -19702,6 +19717,29 @@ class GatewayRunner:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
                 try:
                     if str(platform_key or "").strip().lower() == "discord":
+                        from gateway.biff_router_telemetry import record_biff_router_turn
+
+                        record_biff_router_turn(
+                            platform=platform_key,
+                            chat_id=getattr(source, "chat_id", None),
+                            session_id=session_id,
+                            message=message,
+                            telemetry=_biff_router_telemetry_context,
+                            model=_resolved_model,
+                            provider=runtime_kwargs.get("provider") if isinstance(runtime_kwargs, dict) else None,
+                            tool_schema_chars=_token_source_metrics.get("tool_schema_chars", 0),
+                            last_prompt_tokens=_last_prompt_toks,
+                            input_tokens=_input_toks,
+                            output_tokens=_output_toks,
+                            wall_time=float(_phase_metrics.get("agent_loop_time", 0.0) or 0.0),
+                            api_calls=result.get("api_calls", 0),
+                            outcome="no_final_response",
+                            recall_events=result.get("toolset_recall_events") or [],
+                        )
+                except Exception:
+                    logger.debug("Biff router telemetry record failed", exc_info=True)
+                try:
+                    if str(platform_key or "").strip().lower() == "discord":
                         from gateway.biff_diagnostics import record_biff_diagnostic
                         record_biff_diagnostic(
                             "turn_result",
@@ -19897,6 +19935,29 @@ class GatewayRunner:
                     pass
             _phase_metrics["gateway_agent_title_dispatch_time"] = time.monotonic() - _title_dispatch_started_at
             _phase_metrics["gateway_agent_post_loop_time"] = time.monotonic() - _agent_loop_finished_at
+            try:
+                if str(platform_key or "").strip().lower() == "discord":
+                    from gateway.biff_router_telemetry import record_biff_router_turn
+
+                    record_biff_router_turn(
+                        platform=platform_key,
+                        chat_id=getattr(source, "chat_id", None),
+                        session_id=effective_session_id,
+                        message=message,
+                        telemetry=_biff_router_telemetry_context,
+                        model=_resolved_model,
+                        provider=runtime_kwargs.get("provider") if isinstance(runtime_kwargs, dict) else None,
+                        tool_schema_chars=_token_source_metrics.get("tool_schema_chars", 0),
+                        last_prompt_tokens=_last_prompt_toks,
+                        input_tokens=_input_toks,
+                        output_tokens=_output_toks,
+                        wall_time=time.monotonic() - _prep_started_at,
+                        api_calls=result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
+                        outcome="final_response",
+                        recall_events=result.get("toolset_recall_events") or [],
+                    )
+            except Exception:
+                logger.debug("Biff router telemetry record failed", exc_info=True)
             try:
                 if str(platform_key or "").strip().lower() == "discord":
                     from gateway.biff_diagnostics import record_biff_diagnostic, text_fingerprint
