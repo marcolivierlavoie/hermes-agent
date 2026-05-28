@@ -134,11 +134,17 @@ def should_use_biff_compact_identity(
         return False
     try:
         from agent.biff_intent_router import plan_biff_turn
+        from gateway.biff_memory_tiers import classify_biff_memory_tier
 
         plan = plan_biff_turn(str(query or ""), command=False)
+        memory_tier = classify_biff_memory_tier(query or "", plan)
     except Exception:
         return False
-    return plan.action == "answer_now" and plan.runtime == "direct_answer"
+    return (
+        plan.action == "answer_now"
+        and plan.runtime == "direct_answer"
+        and memory_tier.tier == "no-memory"
+    )
 
 
 def build_biff_compact_identity(config: Mapping[str, Any] | None = None) -> str:
@@ -187,7 +193,22 @@ def build_biff_hot_context(
     if cached and now - cached[0] <= max(1, int(ttl_seconds)):
         return cached[1]
 
+    try:
+        from agent.biff_intent_router import plan_biff_turn
+        from gateway.biff_memory_tiers import classify_biff_memory_tier
+
+        turn_plan = plan_biff_turn(str(query or ""), command=False)
+        memory_tier = classify_biff_memory_tier(query or "", turn_plan)
+    except Exception:
+        turn_plan = None
+        memory_tier = None
+
     if should_use_biff_compact_identity(config, platform_key=platform_key, query=query):
+        capsule = build_biff_compact_identity(config)
+        _CACHE[key] = (now, capsule)
+        return capsule
+
+    if memory_tier is not None and memory_tier.tier == "no-memory":
         capsule = build_biff_compact_identity(config)
         _CACHE[key] = (now, capsule)
         return capsule
@@ -197,6 +218,8 @@ def build_biff_hot_context(
         "Use this small local snapshot before reaching for tools. Discord live-budget contract: answer direct/casual questions inline with no tools; use at most 1-2 narrow tool calls for quick checks; for multi-step verification, broad repo/archive/board work, or anything likely to need repeated checks, give the concise current answer and create/use a Kanban, role, or working-set continuation handle instead of exhausting the live turn.",
         "- Direct-query first: K-id status/attention questions should use the compact Kanban brief lane before file/session searches; shape SQL/Python/JSON output before it enters chat context.",
     ]
+    if memory_tier is not None:
+        lines.append(f"- Memory tier: {memory_tier.tier} — {memory_tier.reason}.")
     kcfg = _kanban_config_line(config)
     if kcfg:
         lines.append(f"- Kanban config: {kcfg}.")
@@ -208,14 +231,19 @@ def build_biff_hot_context(
     if task_lines:
         lines.append("- Recent Kanban cards:")
         lines.extend(task_lines)
-    try:
-        from gateway.biff_fast_memory import build_biff_fast_memory_snapshot
+    if memory_tier is not None and memory_tier.allow_mnemosyne_snapshot:
+        try:
+            from gateway.biff_fast_memory import build_biff_fast_memory_snapshot
 
-        memory_snapshot = build_biff_fast_memory_snapshot(config, max_chars=650)
-        if memory_snapshot:
-            lines.append(memory_snapshot)
-    except Exception:
-        pass
+            memory_snapshot = build_biff_fast_memory_snapshot(
+                config,
+                query=query or "Biff Discord Kanban Mnemosyne Obsidian source of truth roles",
+                max_chars=memory_tier.max_snapshot_chars,
+            )
+            if memory_snapshot:
+                lines.append(memory_snapshot)
+        except Exception:
+            pass
     try:
         from agent.biff_rag_router import secondbrain_rag_context
 
