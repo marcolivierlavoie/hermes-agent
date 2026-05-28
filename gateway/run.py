@@ -9416,6 +9416,7 @@ class GatewayRunner:
                 _load_gateway_config(),
                 platform_key=_platform_config_key(source.platform),
                 session_key=session_key,
+                query=getattr(event, "text", None),
             )
             if _hot_context:
                 context_prompt = context_prompt + "\n\n" + _hot_context

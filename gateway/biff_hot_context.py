@@ -86,6 +86,80 @@ def _kanban_config_line(config: Mapping[str, Any] | None) -> str | None:
     return ", ".join(pieces) if pieces else None
 
 
+def _discord_biff_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    cfg = config if isinstance(config, Mapping) else {}
+    raw_biff = cfg.get("biff")
+    biff_cfg = raw_biff if isinstance(raw_biff, Mapping) else {}
+    raw_platforms = biff_cfg.get("platforms")
+    platforms = raw_platforms if isinstance(raw_platforms, Mapping) else {}
+    raw_discord = platforms.get("discord")
+    return raw_discord if isinstance(raw_discord, Mapping) else {}
+
+
+def _compact_identity_enabled(discord_cfg: Mapping[str, Any]) -> bool:
+    """Return whether Biff's compact identity tier may replace hot context.
+
+    Rollback knobs:
+    - config: biff.platforms.discord.compact_identity: false
+    - env: HERMES_BIFF_COMPACT_IDENTITY=0
+    """
+
+    import os
+
+    env_value = os.getenv("HERMES_BIFF_COMPACT_IDENTITY")
+    if env_value is not None:
+        return _truthy(env_value, default=True)
+    return _truthy(discord_cfg.get("compact_identity", True), default=True)
+
+
+def should_use_biff_compact_identity(
+    config: Mapping[str, Any] | None,
+    *,
+    platform_key: str | None,
+    query: str | None = None,
+) -> bool:
+    """Choose compact identity for short direct Discord turns only.
+
+    This intentionally stays conservative: any memory/history/repo/Kanban/tool
+    work keeps the full hot-context capsule, while simple answer-now turns get a
+    small policy identity that preserves the non-negotiable Biff contract.
+    """
+
+    if str(platform_key or "").strip().lower() != "discord":
+        return False
+    discord_cfg = _discord_biff_config(config)
+    if not _compact_identity_enabled(discord_cfg):
+        return False
+    if not str(query or "").strip():
+        return False
+    try:
+        from agent.biff_intent_router import plan_biff_turn
+
+        plan = plan_biff_turn(str(query or ""), command=False)
+    except Exception:
+        return False
+    return plan.action == "answer_now" and plan.runtime == "direct_answer"
+
+
+def build_biff_compact_identity(config: Mapping[str, Any] | None = None) -> str:
+    """Return a minimal, policy-complete Biff identity for no-tool live turns."""
+
+    lines = [
+        "## Biff Compact Identity",
+        "- Discord #hermes is Marco's primary live command surface; answer first, concise, action-led, and stay on the current thread.",
+        "- Native Hermes Kanban board `biff-os` is the source of truth for Biff OS work; use BIF-### in human-facing updates.",
+        "- Role handoff is explicit-consent only: Forge/Vex/Quill/Ranger role names alone are conversation, not approval; never dispatch from quoted/prior text.",
+        "- Use tools when required for correctness; direct/casual replies should stay no-tool, quick checks should be narrow, and broad work should use Kanban or working-set continuation handles.",
+        "- Keep safety gates: ask before spend, external sends, destructive/security/access changes, protected merges, or private/family-sensitive actions.",
+        "- Care/Spark/Radar stay active: be caring, occasionally creative, and notice leverage without pushing productivity through tenderness.",
+        "- Rollback: set `biff.platforms.discord.compact_identity: false` or `HERMES_BIFF_COMPACT_IDENTITY=0` to force full hot context.",
+    ]
+    kcfg = _kanban_config_line(config)
+    if kcfg:
+        lines.append(f"- Kanban config: {kcfg}.")
+    return _clip("\n".join(lines), 1400)
+
+
 def build_biff_hot_context(
     config: Mapping[str, Any] | None,
     *,
@@ -103,9 +177,7 @@ def build_biff_hot_context(
 
     if str(platform_key or "").strip().lower() != "discord":
         return ""
-    biff_cfg = (config or {}).get("biff") if isinstance((config or {}).get("biff"), Mapping) else {}
-    platforms = biff_cfg.get("platforms") if isinstance(biff_cfg.get("platforms"), Mapping) else {}
-    discord_cfg = platforms.get("discord") if isinstance(platforms.get("discord"), Mapping) else {}
+    discord_cfg = _discord_biff_config(config)
     if not _truthy(discord_cfg.get("hot_context", True)):
         return ""
 
@@ -114,6 +186,11 @@ def build_biff_hot_context(
     cached = _CACHE.get(key)
     if cached and now - cached[0] <= max(1, int(ttl_seconds)):
         return cached[1]
+
+    if should_use_biff_compact_identity(config, platform_key=platform_key, query=query):
+        capsule = build_biff_compact_identity(config)
+        _CACHE[key] = (now, capsule)
+        return capsule
 
     lines = [
         "## Biff Hot Context",
