@@ -83,9 +83,23 @@ _VISION_REQUEST_RE = re.compile(
     r"(?:missing|lost|restore|recover|enable|use)\s+vision)\b",
     re.IGNORECASE,
 )
+_REMINDER_RE = re.compile(
+    r"\b(?:set\s+(?:a|the|my)\s+reminder|remind\s+(?:me|us)\s+(?:about|to|that)|create\s+(?:a|the)\s+reminder|schedule\s+(?:a|the)\s+reminder|reminder\s+(?:to|about))\b",
+    re.IGNORECASE,
+)
+_FORGET_DISMISS_RE = re.compile(
+    r"\b(?:never\s+mind|scratch\s+that|forget\s+(?:it|about\s+it|that|this)|dismiss|ignore\s+(?:that|this|it|me))\b",
+    re.IGNORECASE,
+)
 _MEMORY_TOOL_RE = re.compile(
-    r"\b(?:remember\s+this|save\s+this\s+(?:to|in)\s+(?:memory|mnemosyne)|what\s+do\s+you\s+remember|"
-    r"recall\s+(?:memory|mnemosyne)|memory\s+(?:check|lookup|recall)|mnemosyne\s+(?:recall|memory|candidate))\b",
+    r"\b(?:"
+    r"remember\s+(?:this|that|to|me\s+to|this\s+for|i\s+(?:s[ah]w?|talked|was|need|have|met|put|left)|we\s+(?:were|talked|decided|agreed|discussed|set|put))"
+    r"|save\s+this\s+(?:to|in)\s+(?:memory|mnemosyne)"
+    r"|what\s+do\s+you\s+remember"
+    r"|recall\s+(?:memory|mnemosyne)"
+    r"|memory\s+(?:check|lookup|recall)"
+    r"|mnemosyne\s+(?:recall|memory|candidate)"
+    r")\b",
     re.IGNORECASE,
 )
 _TERMINAL_TOOL_RE = re.compile(
@@ -461,6 +475,10 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("kanban_status", "read-only Kanban/status request", "kanban_read", 2, False, "kanban")
     if is_early_kanban_admin and not has_early_broad_quantifier:
         return BiffTurnPlan("kanban_admin", "bounded Kanban administration request", "kanban_admin", 4, False, "kanban")
+    if _REMINDER_RE.search(body):
+        return BiffTurnPlan("answer_now", "reminder request can be answered immediately without broad workflow context", "direct_answer", 0, False, "none")
+    if _FORGET_DISMISS_RE.search(body):
+        return BiffTurnPlan("answer_now", "dismissal/forget request is a conversational signal, not a workflow", "direct_answer", 0, False, "none")
     if _MEMORY_TOOL_RE.search(body):
         return BiffTurnPlan("memory_lookup", "memory/Mnemosyne request needs the narrow memory tool lane", "memory_lookup", 2, False, "memory")
     if _TERMINAL_TOOL_RE.search(body):
