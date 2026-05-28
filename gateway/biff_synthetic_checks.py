@@ -17,7 +17,9 @@ from typing import Any, Iterable
 PASS = "pass"
 FAIL = "fail"
 
-BIFF_V3_SPECIALIST_TOOLSETS = ("file", "kanban", "memory", "search", "skills-read", "terminal", "todo", "web")
+# Canonical v3 toolset — mirrors _V3_BIFF_TOOLSETS in session_hygiene.py.
+# Kept at module scope (not lazy-imported) because DEFAULT_SCENARIOS references it.
+BIFF_CANONICAL_V3_TOOLSETS = ("file", "kanban", "memory", "search", "session_search", "skills-read", "terminal", "todo", "web")
 
 
 @dataclass(frozen=True)
@@ -86,7 +88,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Search my entire SecondBrain and Smart Connections history for every old decision about Biff and summarize all of it.",
         expected_action="route_bundle",
         expected_runtime="workflow",
-        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
+        expected_toolsets=BIFF_CANONICAL_V3_TOOLSETS,
         max_tool_calls=36,
     ),
     SyntheticScenario(
@@ -118,7 +120,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Delete Cockpit from the Hermes dashboard sidebar and verify it is gone.",
         expected_action="route_bundle",
         expected_runtime="workflow",
-        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
+        expected_toolsets=BIFF_CANONICAL_V3_TOOLSETS,
         max_tool_calls=36,
     ),
     SyntheticScenario(
@@ -126,7 +128,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Have Vex QA the dashboard change and verify the live UI actually works.",
         expected_action="vex_direct",
         expected_runtime="specialist_work",
-        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
+        expected_toolsets=BIFF_CANONICAL_V3_TOOLSETS,
         max_tool_calls=24,
         expected_background=True,
         expected_specialist="vex",
@@ -136,7 +138,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Have Quill research and document the new Biff routing contract in Obsidian.",
         expected_action="quill_direct",
         expected_runtime="specialist_work",
-        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
+        expected_toolsets=BIFF_CANONICAL_V3_TOOLSETS,
         max_tool_calls=24,
         expected_background=True,
         expected_specialist="quill",
@@ -146,7 +148,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Continue the current task, but do not resume stale emergency summary turns.",
         expected_action="route_bundle",
         expected_runtime="continuation",
-        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
+        expected_toolsets=BIFF_CANONICAL_V3_TOOLSETS,
         max_tool_calls=16,
     ),
     SyntheticScenario(
@@ -162,7 +164,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Archive every old Kanban card and scan the entire Obsidian workspace for references before updating the board.",
         expected_action="route_bundle",
         expected_runtime="workflow",
-        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
+        expected_toolsets=BIFF_CANONICAL_V3_TOOLSETS,
         max_tool_calls=36,
     ),
     SyntheticScenario(
@@ -170,7 +172,7 @@ DEFAULT_SCENARIOS: tuple[SyntheticScenario, ...] = (
         prompt="Verify this is completely done across the repo, Kanban evidence, database state, schedules, service health, and all blocker comments.",
         expected_action="route_bundle",
         expected_runtime="workflow",
-        expected_toolsets=BIFF_V3_SPECIALIST_TOOLSETS,
+        expected_toolsets=BIFF_CANONICAL_V3_TOOLSETS,
         max_tool_calls=36,
     ),
     SyntheticScenario(
