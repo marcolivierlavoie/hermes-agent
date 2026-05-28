@@ -504,30 +504,11 @@ BIFF_CORE_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
     }
 )
 
-# Default Biff Discord schema profile v2: the smallest safe fixed allowlist
-# for Biff's common build/ops lane. It keeps the shell/file/code/skills/memory
-# surfaces needed to work Kanban-backed Biff OS tasks (including explicit legacy-tracker access via
-# terminal + credential helper), named-role delegation, and todo planning, while
-# omitting large or nice-to-have schemas. Operators can still select ``full``
-# via config or HERMES_BIFF_TOOL_SCHEMA_PROFILE for rollback/escalation.
-BIFF_DISCORD_V2_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
-    {
-        "terminal",
-        "file",
-        "memory",
-        "skills",
-        "todo",
-        "code_execution",
-        "delegation",
-        "kanban",
-    }
-)
-
-# Discord profile v3 is the skill-bundle-era default. It keeps direct build/fix
-# capability and memory, but drops high-cost always-on schemas that are better
-# escalated explicitly for a specific task: delegation, ad hoc code execution,
-# and skill editing.
-BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
+# Discord profile v3: the skill-bundle-era default profile for Biff Discord
+# toolset narrowing. Keeps direct build/fix capability and memory, but drops
+# high-cost always-on schemas (delegation, ad hoc code execution, skill editing)
+# that are better escalated explicitly.
+_V3_BIFF_TOOLSETS: frozenset[str] = frozenset(
     {
         "web",
         "search",
@@ -556,9 +537,9 @@ BIFF_TURN_TOOLSET_PROFILES: dict[str, frozenset[str]] = {
     # source retrieval.
     "mental_health": frozenset(),
     "dashboard": frozenset(),
-    "base": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
-    "specialist": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
-    "command": BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS,
+    "base": _V3_BIFF_TOOLSETS,
+    "specialist": _V3_BIFF_TOOLSETS,
+    "command": _V3_BIFF_TOOLSETS,
 }
 
 BIFF_BUNDLE_TOOLSET_ESCALATIONS: dict[str, frozenset[str]] = {
@@ -1068,10 +1049,6 @@ def _normalize_biff_tool_schema_profile(value: Any) -> str:
         "lean": "v3",
         "reduced": "v3",
         "biff-core": "core",
-        "v2": "v2",
-        "profile-v2": "v2",
-        "discord-v2": "v2",
-        "biff-discord-v2": "v2",
         "v3": "v3",
         "profile-v3": "v3",
         "discord-v3": "v3",
@@ -1079,7 +1056,7 @@ def _normalize_biff_tool_schema_profile(value: Any) -> str:
         "minimal": "v3",
         "essentials": "v3",
     }
-    return aliases.get(raw, raw) if aliases.get(raw, raw) in {"full", "core", "v2", "v3"} else "full"
+    return aliases.get(raw, raw) if aliases.get(raw, raw) in {"full", "core", "v3"} else "full"
 
 
 def resolve_biff_tool_schema_profile(config: Mapping[str, Any] | None = None, platform_key: str | None = None) -> str:
@@ -1114,23 +1091,30 @@ def apply_biff_tool_schema_profile(
     platform_key: str | None,
     enabled_toolsets: Iterable[str] | None,
 ) -> list[str]:
-    """Apply Biff's fixed tool-schema narrowing.
+    """Apply Biff's fixed tool-schema narrowing.  Legacy compatibility wrapper.
 
-    The core/v2 profiles only remove toolsets from the already-configured
-    platform selection; they never grant new toolsets. Full-tool escalation is
-    preserved by the full profile and the HERMES_BIFF_TOOL_SCHEMA_PROFILE=full
+    The v3 profile removes toolsets from the already-configured platform
+    selection; it never grants new toolsets.  Full-tool escalation is preserved
+    by the ``full`` profile and the HERMES_BIFF_TOOL_SCHEMA_PROFILE=full
     override.
+
+    ``core`` is the widest safe narrowing for non-Discord platforms.
+
+    .. deprecated::
+        This function is a legacy pre-router path.  When the
+        ``HERMES_BIFF_TOOLSET_ROUTER`` flag is on, the router in
+        ``apply_biff_turn_toolset_plan`` completely replaces the profile
+        selection.  The profile is kept for the fallback path until the router
+        flag becomes the default.
     """
 
     original = [str(toolset) for toolset in (enabled_toolsets or []) if str(toolset).strip()]
     profile = resolve_biff_tool_schema_profile(config, platform_key)
     if profile == "v3":
-        narrowed = {toolset for toolset in original if toolset in BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS}
+        narrowed = {toolset for toolset in original if toolset in _V3_BIFF_TOOLSETS}
         if "skills" in original:
             narrowed.add("skills-read")
         return sorted(narrowed)
-    if profile == "v2":
-        return sorted({toolset for toolset in original if toolset in BIFF_DISCORD_V2_TOOL_SCHEMA_TOOLSETS})
     if profile != "core":
         return sorted(dict.fromkeys(original))
     return sorted({toolset for toolset in original if toolset in BIFF_CORE_TOOL_SCHEMA_TOOLSETS})

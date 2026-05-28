@@ -1206,41 +1206,6 @@ class TestSessionHygieneCaps:
             "web",
         ]
 
-    def test_biff_discord_tool_schema_profile_v2_keeps_previous_build_ops_allowlist(self, monkeypatch):
-        monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
-        configured = [
-            "terminal",
-            "file",
-            "memory",
-            "session_search",
-            "skills",
-            "todo",
-            "clarify",
-            "code_execution",
-            "delegation",
-            "web",
-            "vision",
-            "browser",
-            "cronjob",
-            "image_gen",
-            "messaging",
-            "tts",
-            "kanban",
-            "discord",
-        ]
-        cfg = {"biff": {"platforms": {"discord": {"tool_schema_profile": "v2"}}}}
-
-        assert apply_biff_tool_schema_profile(cfg, "discord", configured) == [
-            "code_execution",
-            "delegation",
-            "file",
-            "kanban",
-            "memory",
-            "skills",
-            "terminal",
-            "todo",
-        ]
-
     def test_biff_tool_schema_profile_core_keeps_legacy_wider_core(self, monkeypatch):
         monkeypatch.delenv("HERMES_BIFF_TOOL_SCHEMA_PROFILE", raising=False)
         configured = [
