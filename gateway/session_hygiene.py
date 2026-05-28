@@ -89,7 +89,7 @@ class BiffRuntimeInstabilitySignal:
 _BIFF_MODE_SPECS: dict[str, BiffOperatingMode] = {
     "normal": BiffOperatingMode("normal", "Normal", "Full Biff behavior with default context/tool-output hygiene only.", None, DEFAULT_MODEL_FACING_TOOL_OUTPUT_CHARS, None, DEFAULT_TOOL_PREVIEW_CHARS),
     "economy": BiffOperatingMode("economy", "Economy", "Preserve behavior while reducing accidental context/tool/history bloat for non-critical turns.", 40, 8_000, 16_000, 800),
-    "emergency": BiffOperatingMode("emergency", "Emergency", "Keep only essential context and use a short tool loop for urgent quota pressure.", 16, 4_000, 8_000, 500),
+    "emergency": BiffOperatingMode("emergency", "Emergency", "Keep only essential context while preserving enough iteration budget to complete bounded Discord work.", 60, 4_000, 8_000, 500),
     "evidence-only": BiffOperatingMode("evidence-only", "Evidence-only", "Gather/check evidence and summarize; avoid side-effecting actions unless already explicitly approved.", 8, 2_000, 4_000, 350),
 }
 
@@ -543,6 +543,8 @@ BIFF_DISCORD_V3_TOOL_SCHEMA_TOOLSETS: frozenset[str] = frozenset(
 BIFF_TURN_TOOLSET_PROFILES: dict[str, frozenset[str]] = {
     "none": frozenset(),
     "status": frozenset({"terminal", "file", "kanban"}),
+    "terminal": frozenset({"terminal", "file"}),
+    "memory": frozenset({"memory", "session_search", "terminal"}),
     "kanban": frozenset({"kanban", "terminal"}),
     "resume": frozenset({"session_search", "terminal", "file", "kanban"}),
     "secondbrain": frozenset({"terminal", "file"}),

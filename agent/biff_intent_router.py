@@ -83,6 +83,17 @@ _VISION_REQUEST_RE = re.compile(
     r"(?:missing|lost|restore|recover|enable|use)\s+vision)\b",
     re.IGNORECASE,
 )
+_MEMORY_TOOL_RE = re.compile(
+    r"\b(?:remember\s+this|save\s+this\s+(?:to|in)\s+(?:memory|mnemosyne)|what\s+do\s+you\s+remember|"
+    r"recall\s+(?:memory|mnemosyne)|memory\s+(?:check|lookup|recall)|mnemosyne\s+(?:recall|memory|candidate))\b",
+    re.IGNORECASE,
+)
+_TERMINAL_TOOL_RE = re.compile(
+    r"\b(?:what\s+(?:time|date)\s+is\s+it|current\s+(?:time|date)|today'?s\s+date|"
+    r"calculate|compute|arithmetic|checksum|sha256|hash|base64|git\s+(?:status|diff|log|branch)|"
+    r"run\s+(?:the\s+)?(?:tests?|pytest|lint|typecheck)|pytest|system\s+state|disk\s+space|ports?)\b",
+    re.IGNORECASE,
+)
 _ACTION_RE = re.compile(
     r"\b(implement|fix|change|patch|create|write|save|remember|forget|add|update|archive|migrate|sync|run|continue|finish|complete|close|debug|deploy|configure|install|delete|remove|make|build|execute|proceed|ship|work on|get it done|let me know|document|specify|triage|do)\b",
     re.IGNORECASE,
@@ -450,6 +461,10 @@ def plan_biff_turn(text: Any, *, command: bool = False) -> BiffTurnPlan:
         return BiffTurnPlan("kanban_status", "read-only Kanban/status request", "kanban_read", 2, False, "kanban")
     if is_early_kanban_admin and not has_early_broad_quantifier:
         return BiffTurnPlan("kanban_admin", "bounded Kanban administration request", "kanban_admin", 4, False, "kanban")
+    if _MEMORY_TOOL_RE.search(body):
+        return BiffTurnPlan("memory_lookup", "memory/Mnemosyne request needs the narrow memory tool lane", "memory_lookup", 2, False, "memory")
+    if _TERMINAL_TOOL_RE.search(body):
+        return BiffTurnPlan("terminal_lookup", "system/git/test/math/date request needs the narrow terminal tool lane", "terminal_lookup", 2, False, "terminal")
     if _FOLLOW_UP_ACTION_RE.search(body):
         return BiffTurnPlan("route_bundle", "short follow-up should continue prior work context", "continuation", 2, True, "base")
     if _FOLLOW_UP_ACTION_LEAD_RE.search(body):

@@ -384,7 +384,7 @@ def test_public_status_includes_active_biff_operating_mode(client, monkeypatch):
     mode = response.json()["biff_operating_mode"]
     assert mode["name"] == "emergency"
     assert mode["label"] == "Emergency"
-    assert mode["max_iterations"] == 16
+    assert mode["max_iterations"] == 60
 
 
 def test_cockpit_n8n_checks_returns_read_only_inventory_with_live_or_fallback_source(client, auth_headers):

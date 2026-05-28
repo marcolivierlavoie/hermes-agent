@@ -198,6 +198,64 @@ def test_toolset_router_unknown_route_fails_open():
     assert list(decision.selected_toolsets) == ["file", "kanban", "terminal"]
 
 
+def test_toolset_router_enabled_selects_terminal_lane_for_mandatory_tool_queries(monkeypatch):
+    monkeypatch.setenv("HERMES_BIFF_TOOLSET_ROUTER", "1")
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search", "browser"]
+
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        configured,
+        configured_toolsets=configured,
+        message="What time is it and can you calculate 21 * 6?",
+    )
+
+    assert enabled == ["file", "terminal"]
+
+
+def test_toolset_router_enabled_selects_memory_lane_for_memory_queries(monkeypatch):
+    monkeypatch.setenv("HERMES_BIFF_TOOLSET_ROUTER", "1")
+    configured = ["terminal", "file", "memory", "session_search", "skills-read", "todo", "kanban", "web"]
+
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        configured,
+        configured_toolsets=configured,
+        message="What do you remember about my Biff tool preferences?",
+    )
+
+    assert enabled == ["memory", "session_search", "terminal"]
+
+
+def test_toolset_router_enabled_schema_names_match_terminal_route(monkeypatch):
+    from model_tools import get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    monkeypatch.setenv("HERMES_BIFF_TOOLSET_ROUTER", "1")
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search", "browser"]
+
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        configured,
+        configured_toolsets=configured,
+        message="Run pytest for the focused router tests.",
+    )
+
+    invalidate_check_fn_cache()
+    names = {
+        tool["function"]["name"]
+        for tool in get_tool_definitions(enabled, [], quiet_mode=True)
+        if isinstance(tool, dict) and "function" in tool
+    }
+    assert enabled == ["file", "terminal"]
+    assert "terminal" in names
+    assert "read_file" in names
+    assert "web_search" not in names
+    assert "kanban_show" not in names
+
+
 def test_turn_toolset_plan_recovers_operator_tools_when_user_flags_missing_tool_access():
     configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search"]
 
@@ -1048,6 +1106,7 @@ class TestSessionHygieneCaps:
 
     def test_biff_mode_caps_model_facing_text_without_mutating_transcript(self):
         mode = resolve_biff_operating_mode({"quota_economy": {"mode": "emergency"}}, "discord")
+        assert mode.max_iterations == 60
         history = [
             {"role": "user", "content": "u" * 9000},
             {"role": "assistant", "content": "ok"},
