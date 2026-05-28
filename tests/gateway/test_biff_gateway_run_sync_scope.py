@@ -58,3 +58,29 @@ def test_run_sync_initializes_max_iterations_before_agent_construction():
     assert max_assignment_lines, "run_sync must initialize max_iterations"
     assert max_use_lines, "run_sync should pass max_iterations into AIAgent"
     assert min(max_assignment_lines) < min(max_use_lines)
+
+
+def test_run_sync_sets_toolset_recall_ceiling_before_run_conversation():
+    """Selective Biff tool routing must preserve the configured ceiling.
+
+    Recall-on-miss can safely widen a narrowed live tool schema only if the
+    gateway gives the agent the platform-configured ceiling before the turn
+    enters run_conversation.
+    """
+
+    source = textwrap.dedent(inspect.getsource(GatewayRunner._run_agent))
+    ceiling_idx = source.index("agent._toolset_recall_ceiling = list(_configured_toolsets)")
+    run_idx = source.index("result = agent.run_conversation(")
+
+    assert ceiling_idx < run_idx
+
+
+def test_run_sync_evicts_cached_agent_after_toolset_recall_events():
+    """A recall-widened cached agent must not leak tools into next narrow turn."""
+
+    source = textwrap.dedent(inspect.getsource(GatewayRunner._run_agent))
+    run_idx = source.index("result = agent.run_conversation(")
+    event_idx = source.index('result.get("toolset_recall_events")')
+    evict_idx = source.index("self._evict_cached_agent(session_key)", event_idx)
+
+    assert run_idx < event_idx < evict_idx

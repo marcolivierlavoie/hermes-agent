@@ -275,6 +275,9 @@ def run_conversation(
     # Reset retry counters and iteration budget at the start of each turn
     # so subagent usage from a previous turn doesn't eat into the next one.
     agent._invalid_tool_retries = 0
+    agent._toolset_recall_attempts = 0
+    agent._toolset_recall_max_attempts = 1
+    agent._toolset_recall_events = []
     agent._invalid_json_retries = 0
     agent._empty_content_retries = 0
     agent._incomplete_scratchpad_retries = 0
@@ -3130,42 +3133,64 @@ def run_conversation(
                     if tc.function.name not in agent.valid_tool_names
                 ]
                 if invalid_tool_calls:
-                    # Track retries for invalid tool calls
-                    agent._invalid_tool_retries += 1
-
-                    # Return helpful error to model — model can agent-correct next turn
-                    available = ", ".join(sorted(agent.valid_tool_names))
                     invalid_name = invalid_tool_calls[0]
-                    invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
-                    agent._vprint(f"{agent.log_prefix}⚠️  Unknown tool '{invalid_preview}' — sending error to model for agent-correction ({agent._invalid_tool_retries}/3)")
+                    try:
+                        from agent.toolset_recall import widen_agent_tools_for_missing_tool
 
-                    if agent._invalid_tool_retries >= 3:
-                        agent._vprint(f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
-                        agent._invalid_tool_retries = 0
-                        agent._persist_session(messages, conversation_history)
-                        return {
-                            "final_response": None,
-                            "messages": messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "partial": True,
-                            "error": f"Model generated invalid tool call: {invalid_preview}"
-                        }
-
-                    assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                    messages.append(assistant_msg)
-                    for tc in assistant_message.tool_calls:
-                        if tc.function.name not in agent.valid_tool_names:
-                            content = f"Tool '{tc.function.name}' does not exist. Available tools: {available}"
+                        recall_event = widen_agent_tools_for_missing_tool(agent, invalid_name)
+                    except Exception:
+                        logger.debug("toolset recall-on-miss failed", exc_info=True)
+                        recall_event = None
+                    if recall_event:
+                        agent._emit_status("↻ Needed tool was outside the narrow route — widening safely and continuing")
+                        invalid_tool_calls = [
+                            tc.function.name for tc in assistant_message.tool_calls
+                            if tc.function.name not in agent.valid_tool_names
+                        ]
+                        if not invalid_tool_calls:
+                            logger.info(
+                                "Recovered missing tool via toolset recall: tool=%s added_toolsets=%s",
+                                invalid_name,
+                                recall_event.get("added_toolsets"),
+                            )
                         else:
-                            content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
-                        messages.append({
-                            "role": "tool",
-                            "name": tc.function.name,
-                            "tool_call_id": tc.id,
-                            "content": content,
-                        })
-                    continue
+                            invalid_name = invalid_tool_calls[0]
+                    if invalid_tool_calls:
+                        # Track retries for invalid tool calls
+                        agent._invalid_tool_retries += 1
+
+                        # Return helpful error to model — model can agent-correct next turn
+                        available = ", ".join(sorted(agent.valid_tool_names))
+                        invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
+                        agent._vprint(f"{agent.log_prefix}⚠️  Unknown tool '{invalid_preview}' — sending error to model for agent-correction ({agent._invalid_tool_retries}/3)")
+
+                        if agent._invalid_tool_retries >= 3:
+                            agent._vprint(f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
+                            agent._invalid_tool_retries = 0
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": None,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "error": f"Model generated invalid tool call: {invalid_preview}"
+                            }
+
+                        assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                        messages.append(assistant_msg)
+                        for tc in assistant_message.tool_calls:
+                            if tc.function.name not in agent.valid_tool_names:
+                                content = f"Tool '{tc.function.name}' does not exist. Available tools: {available}"
+                            else:
+                                content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
+                            messages.append({
+                                "role": "tool",
+                                "name": tc.function.name,
+                                "tool_call_id": tc.id,
+                                "content": content,
+                            })
+                        continue
                 # Reset retry counter on successful tool call validation
                 agent._invalid_tool_retries = 0
 
@@ -4036,6 +4061,8 @@ def run_conversation(
         "cost_status": agent.session_cost_status,
         "cost_source": agent.session_cost_source,
     }
+    if getattr(agent, "_toolset_recall_events", None):
+        result["toolset_recall_events"] = list(agent._toolset_recall_events)
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     if _long_turn_metrics is not None:

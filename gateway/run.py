@@ -13343,6 +13343,11 @@ class GatewayRunner:
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
+                # The background/quick lane may start from a narrowed tool
+                # schema.  Preserve the platform-configured ceiling so
+                # agent.toolset_recall can recover a safe missing tool without
+                # granting anything outside the platform's configured surface.
+                agent._toolset_recall_ceiling = list(configured_toolsets)
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -19030,6 +19035,12 @@ class GatewayRunner:
             agent.service_tier = self._service_tier
             agent.max_iterations = max_iterations
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            # Preserve the platform-configured ceiling for recall-on-miss.
+            # enabled_toolsets may be selectively narrowed for the live Biff
+            # route, but a safe missing tool can widen back up to this ceiling
+            # for the current turn only.  This must be refreshed on cached
+            # agents too, because the ceiling comes from config for this turn.
+            agent._toolset_recall_ceiling = list(_configured_toolsets)
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
@@ -19556,6 +19567,22 @@ class GatewayRunner:
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
                 _agent_loop_finished_at = time.monotonic()
                 _phase_metrics["agent_loop_time"] = _agent_loop_finished_at - _agent_loop_started_at
+                try:
+                    if isinstance(result, dict) and result.get("toolset_recall_events"):
+                        # Recall-on-miss mutates the cached AIAgent's live tool
+                        # schema.  The cache signature still represents the
+                        # pre-recall narrowed schema, so evict this instance;
+                        # otherwise the next narrow turn could incorrectly
+                        # reuse widened tools and defeat selective routing.
+                        logger.info(
+                            "Evicting cached agent after toolset recall-on-miss: session=%s events=%d",
+                            session_key,
+                            len(result.get("toolset_recall_events") or []),
+                        )
+                        self._evict_cached_agent(session_key)
+                        self._release_evicted_agent_soft(agent)
+                except Exception:
+                    logger.debug("toolset recall cache eviction failed", exc_info=True)
                 try:
                     if str(platform_key or "").strip().lower() == "discord":
                         from gateway.rate_limit_circuit import (
