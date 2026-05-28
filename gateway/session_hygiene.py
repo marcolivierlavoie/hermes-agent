@@ -1159,9 +1159,29 @@ def apply_biff_turn_toolset_plan(
         from agent.biff_intent_router import plan_biff_turn
 
         plan = plan_biff_turn(message, command=False)
-        allowed = BIFF_TURN_TOOLSET_PROFILES.get(plan.toolset_profile)
     except Exception:
-        allowed = None
+        plan = None
+    if plan is None:
+        return sorted(dict.fromkeys(original))
+    if str(platform_key or "").strip().lower() == "discord":
+        try:
+            from gateway.biff_toolset_router import (
+                biff_toolset_router_enabled,
+                select_biff_toolsets_with_router,
+            )
+
+            if biff_toolset_router_enabled(config, platform_key):
+                decision = select_biff_toolsets_with_router(
+                    plan=plan,
+                    enabled_toolsets=original,
+                    configured_toolsets=configured,
+                    profile_toolsets=BIFF_TURN_TOOLSET_PROFILES,
+                )
+                return list(decision.selected_toolsets)
+        except Exception:
+            # Router failures must fail open to the already-profiled surface.
+            return sorted(dict.fromkeys(original))
+    allowed = BIFF_TURN_TOOLSET_PROFILES.get(plan.toolset_profile)
     if allowed is None:
         return sorted(dict.fromkeys(original))
     if str(platform_key or "").strip().lower() != "discord" and allowed:

@@ -129,6 +129,75 @@ def test_turn_toolset_plan_removes_tools_for_casual_answer():
     assert enabled == []
 
 
+def test_toolset_router_flag_defaults_off_and_preserves_current_turn_plan(monkeypatch):
+    from gateway.biff_toolset_router import biff_toolset_router_enabled
+
+    monkeypatch.delenv("HERMES_BIFF_TOOLSET_ROUTER", raising=False)
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
+    config = {"biff": {"platforms": {"discord": {}}}}
+
+    assert biff_toolset_router_enabled(config, "discord") is False
+    assert apply_biff_turn_toolset_plan(
+        config,
+        "discord",
+        configured,
+        configured_toolsets=configured,
+        message="Status check only: tell me what BIF-1522 currently says on the Kanban board.",
+    ) == ["kanban", "terminal"]
+
+
+def test_toolset_router_enabled_keeps_conservative_workflow_surface(monkeypatch):
+    from gateway.biff_toolset_router import biff_toolset_router_enabled
+
+    monkeypatch.delenv("HERMES_BIFF_TOOLSET_ROUTER", raising=False)
+    config = {"biff": {"platforms": {"discord": {"toolset_router": True}}}}
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
+
+    assert biff_toolset_router_enabled(config, "discord") is True
+    assert apply_biff_turn_toolset_plan(
+        config,
+        "discord",
+        configured,
+        configured_toolsets=configured,
+        message="Continue BIF-1522 and implement the feature-flagged router skeleton.",
+    ) == sorted(configured)
+
+
+def test_toolset_router_enabled_does_not_infer_specialist_from_bare_role_mention(monkeypatch):
+    monkeypatch.setenv("HERMES_BIFF_TOOLSET_ROUTER", "1")
+    configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "delegation"]
+
+    enabled = apply_biff_turn_toolset_plan(
+        {},
+        "discord",
+        configured,
+        configured_toolsets=configured,
+        message="Vex should probably verify this runtime change, but don't hand it off yet.",
+    )
+
+    assert enabled == sorted(configured)
+    # Bare role mentions stay in Biff/controller; delegation is only retained
+    # because this is a conservative workflow fallback, not a specialist route.
+    assert "delegation" in enabled
+
+
+def test_toolset_router_unknown_route_fails_open():
+    from types import SimpleNamespace
+
+    from gateway.biff_toolset_router import select_biff_toolsets_with_router
+
+    decision = select_biff_toolsets_with_router(
+        plan=SimpleNamespace(action="mystery", runtime="unknown", toolset_profile="not-a-profile"),
+        enabled_toolsets=["terminal", "file", "kanban"],
+        configured_toolsets=["terminal", "file", "kanban", "web"],
+        profile_toolsets={"status": frozenset({"terminal"})},
+    )
+
+    assert decision.fallback is True
+    assert decision.route_class == "conservative_full"
+    assert list(decision.selected_toolsets) == ["file", "kanban", "terminal"]
+
+
 def test_turn_toolset_plan_recovers_operator_tools_when_user_flags_missing_tool_access():
     configured = ["terminal", "file", "memory", "skills-read", "todo", "kanban", "web", "search"]
 
