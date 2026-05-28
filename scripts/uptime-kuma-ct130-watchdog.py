@@ -100,6 +100,12 @@ def check_endpoint(url: str, timeout: float) -> tuple[bool, str, int | None]:
     except urllib.error.HTTPError as exc:
         code = int(exc.code)
         return 200 <= code <= 399, f"HTTP {code}", code
+    except urllib.error.URLError as exc:
+        msg = str(exc.reason) if exc.reason else str(exc)
+        # DNS resolution failure → infrastructure failure, NOT service-down
+        if "Errno 8" in msg or "Name or service not known" in msg or "Temporary failure in name resolution" in msg or "getaddrinfo" in msg.lower():
+            return False, "DNS_RESOLUTION_FAILURE", None
+        return False, f"URLError: {sanitize(msg)}", None
     except Exception as exc:
         return False, f"{type(exc).__name__}: {sanitize(exc)}", None
 
@@ -196,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         ok, detail, code = False, "simulated_down", None
     else:
         ok, detail, code = check_endpoint(args.url, args.timeout)
+    is_dns_failure = detail == "DNS_RESOLUTION_FAILURE"
 
     current = {
         "type": "uptime_kuma_ct130_watchdog",
@@ -218,7 +225,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.report_current:
             lines.append(json.dumps({**current, "status": "healthy"}, sort_keys=True))
     else:
-        remediation_outcome = maybe_remediate_uptime_kuma_down(state)
+        remediation_outcome = maybe_remediate_uptime_kuma_down(state) if not is_dns_failure else {
+            "type": "uptime_kuma_ct130_remediation",
+            "rule": REMEDIATION_RULE,
+            "target": REMEDIATION_TARGET,
+            "status": "skipped_dns_failure",
+        }
         status = "down"
         if previous_ok is None:
             status = "initial_down"

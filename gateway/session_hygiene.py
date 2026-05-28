@@ -335,6 +335,8 @@ def relax_biff_runtime_instability_guard_for_turn(
         "kanban_admin",
         "biff-hermes-runtime-change",
         "runtime_change",
+        "biff-issue-execution",
+        "issue_execution",
     } or action in {"resume_context", "kanban_status", "kanban_admin"}:
         return _BIFF_MODE_SPECS["emergency"]
     return mode
