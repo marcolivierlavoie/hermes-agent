@@ -112,12 +112,13 @@ def test_explicit_fresh_or_online_lookup_routes_quick_web():
     assert route.max_live_tool_calls == 3
 
 
-def test_live_sports_score_routes_quick_web():
+def test_live_sports_score_does_not_route_quick_web():
+    """Sports queries are no longer pre-classified as web lookups."""
     route = route_biff_live_intent("What's the score for the Habs game btw?")
 
-    assert route.action == "quick_web"
+    assert route.action == "answer_now"
     assert route.allow_bundle_selection is False
-    assert route.max_live_tool_calls == 3
+    assert route.max_live_tool_calls == 0
 
 
 def test_casual_right_now_without_current_lookup_does_not_route_quick_web():

@@ -60,8 +60,7 @@ _QUICK_WEB_RE = re.compile(
     r"look\s*(?:it|this|that)?\s*up|search\s+(?:the\s+)?web|google|online|"
     r"(?:can\s+you\s+)?(?:see|open|read|inspect|check)\s+(?:this|that|the)?\s*(?:link|url|thread|post|page|site)|"
     r"current|latest|today|recent|near\s+me|open\s+now|"
-    r"deals?|sale|coupon|price|prices|availability|"
-    r"score|scores|live\s+score|game|match|fixture|standings|schedule"
+    r"deals?|sale|coupon|price|prices|availability"
     r")\b",
     re.IGNORECASE,
 )
