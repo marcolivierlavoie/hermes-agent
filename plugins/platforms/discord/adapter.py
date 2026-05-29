@@ -762,6 +762,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
             @self._client.event
+            async def on_disconnect():
+                logger.warning(
+                    "[%s] Discord WebSocket disconnected — "
+                    "library will attempt automatic reconnection",
+                    adapter_self.name,
+                )
+
+            @self._client.event
+            async def on_resumed():
+                logger.info("[%s] Discord WebSocket reconnected via RESUME", adapter_self.name)
+
+            @self._client.event
             async def on_message(message: DiscordMessage):
                 # Block until _resolve_allowed_usernames has swapped
                 # any raw usernames in DISCORD_ALLOWED_USERS for numeric
