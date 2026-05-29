@@ -19754,8 +19754,13 @@ class GatewayRunner:
             #      - These must be passed through intact so the API sees valid
             #        assistant→tool sequences (dropping tool_calls causes 500 errors)
             # Biff: build agent_history with tool output capping, prompt budget, and metrics
+            # Also extract Telegram observed group context (observed=True rows are
+            # attached to the current turn as API-only context rather than replayed
+            # as prior user turns).
             agent_history = []
-            for _transcript_message_index, msg in enumerate(history):
+            _separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
+            _observed_group_context_list: list[str] = []
+            for _transcript_message_index, msg in enumerate(history or []):
                 role = msg.get("role")
                 if not role:
                     continue
@@ -19768,7 +19773,16 @@ class GatewayRunner:
                 # Skip system messages -- the agent rebuilds its own system prompt
                 if role == "system":
                     continue
-                
+
+                # Observed context: Telegram group messages that weren't directed
+                # at the bot are stored as observed=True transcript rows.  These
+                # are withheld from replayable history and attached to the current
+                # addressed message as API-only context instead.
+                _obs_content = msg.get("content")
+                if _separate_observed_context and msg.get("observed") and role == "user" and _obs_content:
+                    _observed_group_context_list.append(str(_obs_content).strip())
+                    continue
+
                 # Rich agent messages (tool_calls, tool results) must be passed
                 # through intact so the API sees valid assistant→tool sequences
                 has_tool_calls = "tool_calls" in msg
@@ -19795,6 +19809,9 @@ class GatewayRunner:
                         entry = _build_replay_entry(role, content, msg)
                         entry["_transcript_message_index"] = _transcript_message_index
                         agent_history.append(entry)
+
+            # Build Telegram observed group context string from collected rows
+            observed_group_context = "\n".join(_observed_group_context_list).strip() or None
 
             from gateway.session_hygiene import (
                 apply_biff_prompt_budget,

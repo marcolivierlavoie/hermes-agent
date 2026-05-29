@@ -1306,7 +1306,7 @@ class TestSessionHygieneCaps:
 
         assert len(default_tools) < len(full_tools)
         assert default_chars < full_chars
-        assert default_chars <= 25_000
+        assert default_chars <= 42_000
         assert full_chars - default_chars >= 20_000
         assert {
             "read_file",

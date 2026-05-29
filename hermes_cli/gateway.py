@@ -3033,34 +3033,40 @@ def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.
 def launchd_restart():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
-    drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
     try:
         pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
+        if pid is not None:
+            # Send SIGUSR1 for graceful drain (exit code 75 → unsuccessful →
+            # launchd KeepAlive auto-restarts).  This is the preferred path:
+            # the gateway drains active agents before exiting.
+            if hasattr(signal, "SIGUSR1"):
+                os.kill(pid, signal.SIGUSR1)
+            else:
+                # POSIX safety — SIGUSR1 unavailable, fall back to SIGTERM.
+                # KeepAlive still restarts because exit code 1 is not
+                # successful (KeepAlive.SuccessfulExit=false).
+                os.kill(pid, signal.SIGTERM)
             print("✓ Service restart requested")
             return
-        if pid is not None:
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart")
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
-        print("✓ Service restarted")
-    except subprocess.CalledProcessError as e:
-        if e.returncode not in {3, 113}:
-            raise
-        # Job not loaded — bootstrap and start fresh
-        print("↻ launchd job was unloaded; reloading")
-        plist_path = get_launchd_plist_path()
-        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
-        subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
-        print("✓ Service restarted")
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    # If PID not found or signal failed, tell launchd to kickstart the service.
+    # We do this asynchronously so the CLI returns immediately — launchd handles
+    # the full lifecycle (killing the old process if still alive, spawning the
+    # replacement, and KeepAlive ensures it stays running).
+    try:
+        subprocess.Popen(
+            ["launchctl", "kickstart", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("✓ Service restart requested")
+    except OSError:
+        print("✗ Failed to kickstart launchd service")
+        sys.exit(1)
 
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
