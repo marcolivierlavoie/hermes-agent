@@ -20114,7 +20114,7 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
-_agent_loop_started_at = time.monotonic()
+                _agent_loop_started_at = time.monotonic()
                 _phase_metrics["gateway_prep_time"] = _agent_loop_started_at - _prep_started_at
                 # Adopt upstream's observed context wrapping
                 _api_run_message = _wrap_current_message_with_observed_context(
