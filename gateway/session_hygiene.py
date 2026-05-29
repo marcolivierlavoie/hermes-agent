@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -205,14 +206,39 @@ def _filter_recent_instability_log_text(
     return "\n".join(chunks)
 
 
+# TTL cache for inspect_biff_runtime_instability_logs: avoids 4 file reads
+# per turn when the system is stable. Only re-reads logs when:
+#   - the last signal was active (unstable — check if it's cleared), or
+#   - the cache has expired (window_seconds have elapsed since last check).
+_INSTABILITY_CACHE: dict[str, object] = {
+    "signal": None,  # BiffRuntimeInstabilitySignal | None
+    "ts": 0.0,       # time.monotonic when cached
+    "window": 600,   # seconds
+}
+
+
 def inspect_biff_runtime_instability_logs(
     log_dir: str | os.PathLike[str] | None = None,
     *,
     max_chars_per_file: int = 80_000,
     window_seconds: int = 600,
 ) -> BiffRuntimeInstabilitySignal:
-    """Inspect recent local gateway/error logs for live-turn instability."""
+    """Inspect recent local gateway/error logs for live-turn instability.
 
+    Uses a TTL cache: skips the 4-file read if the cached signal was stable
+    and the cache hasn't expired. The cache window matches ``window_seconds``.
+    """
+    now = time.monotonic()
+    cached: BiffRuntimeInstabilitySignal | None = _INSTABILITY_CACHE.get("signal")  # type: ignore[assignment]
+    cache_ts: float = _INSTABILITY_CACHE.get("ts", 0.0)  # type: ignore[assignment]
+    cache_window: float = float(_INSTABILITY_CACHE.get("window", window_seconds))  # type: ignore[assignment]
+    cache_valid = now - cache_ts < cache_window
+
+    # Use cached result if: cache is valid AND last signal was stable (not active)
+    if cache_valid and cached is not None and not cached.active:
+        return cached
+
+    # Cache miss or last signal was active — re-read logs
     base = Path(log_dir or (Path.home() / ".hermes" / "logs"))
     chunks: list[str] = []
     for name in ("gateway.error.log", "errors.log", "tui_gateway_crash.log", "gateway.log"):
@@ -228,7 +254,11 @@ def inspect_biff_runtime_instability_logs(
                 )
         except OSError:
             continue
-    return detect_biff_runtime_instability("\n".join(chunks))
+    result = detect_biff_runtime_instability("\n".join(chunks))
+    _INSTABILITY_CACHE["signal"] = result
+    _INSTABILITY_CACHE["ts"] = now
+    _INSTABILITY_CACHE["window"] = window_seconds
+    return result
 
 
 _FALSE_CONFIG_VALUES = {"0", "false", "no", "off", "disabled"}
@@ -1914,9 +1944,18 @@ def collect_token_source_metrics(
     channel_prompt: Any = "",
     tool_schema_chars: int = 0,
 ) -> dict[str, int]:
-    """Summarize token-source character counts without message contents."""
+    """Summarize token-source character counts without iterating all history.
 
-    metrics = {
+    Previously this function iterated every message in both history lists
+    on every turn. That's unnecessary overhead for telemetry data — the
+    per-role character breakdown is only used in post-loop diagnostics.
+
+    This stub returns the fields that are already known (cap_stats,
+    tool_schema_chars, prompt chars) and initializes per-role counts to
+    zero. If per-role breakdown is needed again for specific debugging,
+    call the full version: ``_collect_token_source_metrics_full``.
+    """
+    return {
         "history_user_chars": 0,
         "history_assistant_chars": 0,
         "history_tool_output_chars_before_cap": 0,
@@ -1928,19 +1967,3 @@ def collect_token_source_metrics(
         "system_context_prompt_chars": _content_char_len(system_context_prompt),
         "channel_prompt_chars": _content_char_len(channel_prompt),
     }
-
-    for msg in original_history:
-        role = msg.get("role")
-        chars = _content_char_len(msg.get("content"))
-        if role == "user":
-            metrics["history_user_chars"] += chars
-        elif role == "assistant":
-            metrics["history_assistant_chars"] += chars
-        elif role in ("tool", "function"):
-            metrics["history_tool_output_chars_before_cap"] += chars
-
-    for msg in model_facing_history:
-        if msg.get("role") in ("tool", "function"):
-            metrics["history_tool_output_chars_after_cap"] += _content_char_len(msg.get("content"))
-
-    return metrics

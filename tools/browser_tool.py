@@ -1471,7 +1471,7 @@ atexit.register(_stop_browser_cleanup_thread)
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_navigate",
-        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+        "description": "🚫 LAST RESORT — DO NOT use this tool for simple content retrieval. You MUST try web_search, web_extract, or terminal(curl) FIRST. Browser is only for pages that REQUIRE JavaScript rendering, form interaction, authentication flows, or CAPTCHAs. It is slow, expensive, and unstable. If the URL ends in .md, .txt, .json, .yaml, .yml, .csv, .xml, is a documented API endpoint, or is a documentation page — use web_extract or curl. Only reach for browser_navigate when every other approach has failed or is clearly impossible. Initializes the session and loads the page. Returns a compact page snapshot with interactive elements and ref IDs.",
         "parameters": {
             "type": "object",
             "properties": {

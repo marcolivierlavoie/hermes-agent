@@ -26,7 +26,12 @@ Lifecycle:
 """
 
 from abc import ABC, abstractmethod
+import logging
 from typing import Any, Dict, List
+
+from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+
+logger = logging.getLogger(__name__)
 
 
 class ContextEngine(ABC):
@@ -214,4 +219,17 @@ class ContextEngine(ABC):
         (e.g. recalculate DAG budgets, switch summary models).
         """
         self.context_length = context_length
-        self.threshold_tokens = int(context_length * self.threshold_percent)
+        # Safety ceiling: cap context_length at MAXIMUM_SANE_CONTEXT_LENGTH.
+        # Protects against garbage values from provider metadata or
+        # unit-conversion bugs (e.g. bytes treated as tokens).
+        from agent.model_metadata import MAXIMUM_SANE_CONTEXT_LENGTH
+        if context_length > MAXIMUM_SANE_CONTEXT_LENGTH:
+            logger.warning(
+                "Clamping context_length %d → %d — likely upstream resolution bug",
+                context_length, MAXIMUM_SANE_CONTEXT_LENGTH,
+            )
+            self.context_length = MAXIMUM_SANE_CONTEXT_LENGTH
+        self.threshold_tokens = max(
+            int(self.context_length * self.threshold_percent),
+            MINIMUM_CONTEXT_LENGTH,
+        )

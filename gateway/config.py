@@ -1315,6 +1315,19 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     
     # Discord
     discord_token = os.getenv("DISCORD_BOT_TOKEN")
+    if not discord_token:
+        # Fallback: try the Infisical credential helper so manual
+        # `hermes gateway restart` works without the launch script.
+        import subprocess
+        try:
+            _helper = Path.home() / ".local/bin/get_credential.sh"
+            if _helper.exists():
+                discord_token = subprocess.check_output(
+                    ["bash", str(_helper), "discord_bot_token"],
+                    text=True, timeout=10,
+                ).strip()
+        except Exception:
+            discord_token = None
     if discord_token:
         if Platform.DISCORD not in config.platforms:
             config.platforms[Platform.DISCORD] = PlatformConfig()

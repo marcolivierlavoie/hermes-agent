@@ -497,10 +497,27 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
+        # Safety ceiling: cap context_length at MAXIMUM_SANE_CONTEXT_LENGTH.
+        from agent.model_metadata import MAXIMUM_SANE_CONTEXT_LENGTH
+        if context_length > MAXIMUM_SANE_CONTEXT_LENGTH:
+            logger.warning(
+                "Clamping context_length %d → %d — likely upstream resolution bug",
+                context_length, MAXIMUM_SANE_CONTEXT_LENGTH,
+            )
+            self.context_length = MAXIMUM_SANE_CONTEXT_LENGTH
         self.threshold_tokens = max(
-            int(context_length * self.threshold_percent),
+            int(self.context_length * self.threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
+        # Safety ceiling: threshold can never exceed context_length.
+        if self.threshold_tokens > self.context_length:
+            logger.warning(
+                "Clamping threshold_tokens %d → %d (context_length=%d, "
+                "threshold_percent=%.4f) — likely upstream resolution bug",
+                self.threshold_tokens, self.context_length, self.context_length,
+                self.threshold_percent,
+            )
+            self.threshold_tokens = self.context_length
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
@@ -546,6 +563,14 @@ class ContextCompressor(ContextEngine):
             config_context_length=config_context_length,
             provider=provider,
         )
+        # Safety ceiling: cap context_length at MAXIMUM_SANE_CONTEXT_LENGTH.
+        from agent.model_metadata import MAXIMUM_SANE_CONTEXT_LENGTH
+        if self.context_length > MAXIMUM_SANE_CONTEXT_LENGTH:
+            logger.warning(
+                "Clamping context_length %d → %d — likely upstream resolution bug",
+                self.context_length, MAXIMUM_SANE_CONTEXT_LENGTH,
+            )
+            self.context_length = MAXIMUM_SANE_CONTEXT_LENGTH
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
         # the percentage would suggest a lower value.  This prevents premature
         # compression on large-context models at 50% while keeping the % sane
@@ -554,6 +579,15 @@ class ContextCompressor(ContextEngine):
             int(self.context_length * threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
+        # Safety ceiling: threshold can never exceed context_length.
+        if self.threshold_tokens > self.context_length:
+            logger.warning(
+                "Clamping threshold_tokens %d → %d (context_length=%d, "
+                "threshold_percent=%.4f) — likely upstream resolution bug",
+                self.threshold_tokens, self.context_length, self.context_length,
+                threshold_percent,
+            )
+            self.threshold_tokens = self.context_length
         self.compression_count = 0
 
         # Derive token budgets: ratio is relative to the threshold, not total context

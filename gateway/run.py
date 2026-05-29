@@ -10469,6 +10469,12 @@ class GatewayRunner:
                 _run_agent_wall_time
                 - float(_phase.get("gateway_prep_time", 0.0) or 0.0)
                 - float(_phase.get("agent_loop_time", 0.0) or 0.0)
+                - float(_phase.get("gateway_agent_post_loop_time", 0.0) or 0.0)
+                - float(_phase.get("gateway_agent_token_metrics_time", 0.0) or 0.0)
+                - float(_phase.get("gateway_agent_media_scan_time", 0.0) or 0.0)
+                - float(_phase.get("gateway_agent_session_sync_time", 0.0) or 0.0)
+                - float(_phase.get("gateway_agent_title_dispatch_time", 0.0) or 0.0)
+                - float(_phase.get("gateway_agent_pre_prep_setup_time", 0.0) or 0.0)
             )
             _wall_metrics = _gateway_turn_wall_metrics(
                 wall_time=time.monotonic() - _msg_start_monotonic,
@@ -18423,6 +18429,8 @@ class GatewayRunner:
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        
+        _pre_prep_started_at = time.monotonic()
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -18589,19 +18597,11 @@ class GatewayRunner:
             ),
         )
         _biff_router_telemetry_context = None
-        try:
-            if str(platform_key or "").strip().lower() == "discord":
-                from gateway.biff_router_telemetry import build_biff_router_telemetry_context
-
-                _biff_router_telemetry_context = build_biff_router_telemetry_context(
-                    config=user_config,
-                    platform_key=platform_key,
-                    message=message,
-                    configured_toolsets=_configured_toolsets,
-                    selected_toolsets=enabled_toolsets,
-                )
-        except Exception as _router_telemetry_err:
-            logger.debug("Biff router telemetry context build failed: %s", _router_telemetry_err)
+        # Router telemetry context removed from hot path per Biff optimization:
+        # it's debug-only observability data that doesn't affect routing.
+        # If needed for debugging, re-enable with:
+        #   from gateway.biff_router_telemetry import build_biff_router_telemetry_context
+        #   _biff_router_telemetry_context = build_biff_router_telemetry_context(...)
         try:
             from tools.chat_guardrails import ChatToolPolicy, clear_chat_tool_policy, set_chat_tool_policy
 
@@ -19222,6 +19222,7 @@ class GatewayRunner:
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
         _phase_metrics: Dict[str, float] = {}
+        _phase_metrics["gateway_agent_pre_prep_setup_time"] = time.monotonic() - _pre_prep_started_at
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -19877,25 +19878,10 @@ class GatewayRunner:
                         "prompt_budget_kept_chars": 0,
                     }
                 )
-            try:
-                if str(platform_key or "").strip().lower() == "discord":
-                    from gateway.biff_diagnostics import record_biff_diagnostic
-                    record_biff_diagnostic(
-                        "prompt_prepared",
-                        {
-                            "platform": platform_key,
-                            "session_id": session_id,
-                            "agent_history_messages": len(agent_history),
-                            "tool_schema_chars": _tool_schema_chars,
-                            "system_context_prompt_chars": len(str(context_prompt or "")),
-                            "channel_prompt_chars": len(str(channel_prompt or "")),
-                            "token_source_metrics": _token_source_metrics,
-                        },
-                    )
-            except Exception:
-                logger.debug("Biff diagnostic prompt_prepared failed", exc_info=True)
-            # Adopt upstream's observed_group_context for Telegram group context
-            observed_group_context = None
+# prompt_prepared diagnostic removed per Biff optimization:
+            # turn_start diagnostic provides the same observability without
+            # a second sync file write per turn. Token source metrics collection
+            # was also de-hotpatched (see collect_token_source_metrics stub).
             
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
