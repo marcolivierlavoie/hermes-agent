@@ -312,53 +312,50 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
         assert len(following_results) == len(call_ids)
 
 
-def test_long_turn_repeated_failure_fallback_pause_path(tmp_path):
-    agent = _make_agent("terminal", max_iterations=10)
-    same_args = {"test": "pytest tests/foo.py::test_bar", "hypothesis": "same idea"}
+def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
+    """Regression for #30770: when the guardrail halts the loop, the
+    synthesized halt message must be pushed through ``stream_delta_callback``
+    so SSE/TUI clients see why the agent stopped instead of a silent stream
+    close.  Without this the chat-completions SSE writer drains an empty
+    queue and emits a finish chunk with zero content (indistinguishable
+    from a crash for Open WebUI and similar clients).
+    """
+    agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
+    same_args = {"query": "same"}
     responses = [
         _mock_response(
             content="",
             finish_reason="tool_calls",
-            tool_calls=[_mock_tool_call("terminal", json.dumps(same_args), f"c{i}")],
+            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
         )
-        for i in range(1, 5)
+        for i in range(1, 10)
     ]
     agent.client.chat.completions.create.side_effect = responses
 
+    deltas: list = []
+    agent.stream_delta_callback = lambda d: deltas.append(d)
+    # The mocked client returns SimpleNamespace responses which aren't
+    # iterable as streaming chunks; force the non-streaming code path so
+    # the guardrail-halt branch is reached without engaging the real
+    # streaming machinery.
+    agent._disable_streaming = True
+
     with (
-        patch("run_agent.handle_function_call", return_value=json.dumps({"exit_code": 1, "stderr": "AssertionError: expected 1 got 2"})) as mock_hfc,
-        patch.object(agent, "_long_turn_persist_dir", return_value=tmp_path),
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("fix repeated failing test")
+        result = agent.run_conversation("search repeatedly")
 
-    assert mock_hfc.call_count == 2
-    assert result["turn_exit_reason"] == "long_turn_fallback_pause"
-    assert result["long_turn"]["fallback_decision"]["reason"] == "repeated_failure_same_hypothesis"
-    resume_path = result["long_turn"]["resume_packet_path"]
-    packet = json.loads(open(resume_path).read())
-    assert packet["fallback_decision"] == result["long_turn"]["fallback_decision"]
-    assert packet["closure_contract"]["fallback_decision"] == result["long_turn"]["fallback_decision"]
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    halt_text = result["final_response"]
+    assert "stopped retrying" in halt_text
 
-
-def test_interrupted_run_persists_long_turn_resume_packet(tmp_path):
-    agent = _make_agent("web_search", max_iterations=10)
-    agent.interrupt("new user input")
-
-    with (
-        patch.object(agent, "_long_turn_persist_dir", return_value=tmp_path),
-        patch.object(agent, "_persist_session"),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-    ):
-        result = agent.run_conversation("do long work")
-
-    assert result["interrupted"] is True
-    assert result["turn_exit_reason"] == "interrupted_by_user"
-    resume_path = result["long_turn"]["resume_packet_path"]
-    assert resume_path
-    packet = json.loads(open(resume_path).read())
-    assert packet["reason"] == "interrupted_by_user"
-    assert packet["runtime_signal"]["resume_packet_path"] == resume_path
+    # The halt message must have been pushed through the callback at least
+    # once.  Empty-queue SSE writers were the bug — clients saw no content
+    # delta before the finish chunk.
+    text_deltas = [d for d in deltas if isinstance(d, str)]
+    assert halt_text in text_deltas, (
+        f"halt message was never streamed; callback only saw {deltas!r}"
+    )

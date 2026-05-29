@@ -23,8 +23,8 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
-import { Typography } from "@/components/NouiTypography";
-import { HERMES_BASE_PATH } from "@/lib/api";
+import { Typography } from "@nous-research/ui/ui/components/typography/index";
+import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { CheckCircle2, Copy, Loader2, PanelRight, RotateCw, WifiOff, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -38,12 +38,15 @@ import { api, type SessionQuotaRecommendation } from "@/lib/api";
 import { PluginSlot } from "@/plugins";
 
 function buildWsUrl(
-  token: string,
+  authParam: [string, string],
   resume: string | null,
   channel: string,
 ): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const qs = new URLSearchParams({ token, channel });
+  // ``authParam`` is ``["token", <session>]`` in loopback mode and
+  // ``["ticket", <minted>]`` in gated mode. The server-side helper
+  // ``_ws_auth_ok`` picks whichever shape matches the current gate state.
+  const qs = new URLSearchParams({ [authParam[0]]: authParam[1], channel });
   if (resume) qs.set("resume", resume);
   return `${proto}//${window.location.host}${HERMES_BASE_PATH}/api/pty?${qs.toString()}`;
 }
@@ -294,8 +297,8 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
         aria-controls="chat-side-panel"
         className={cn(
           "shrink-0 rounded border border-current/20",
-          "px-2 py-1 text-[0.65rem] font-medium tracking-wide normal-case",
-          "text-midground/80 hover:text-midground hover:bg-midground/5",
+          "px-2 py-1 text-xs font-medium tracking-wide",
+          "text-text-secondary hover:text-midground hover:bg-midground/5",
         )}
       >
         <span className="inline-flex items-center gap-1.5">
@@ -682,32 +685,21 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
       });
     });
 
-    // WebSocket
-    const url = buildWsUrl(token, resumeParam, channel);
-    setPtyRecoveryState(everOpenedRef.current ? "reconnecting" : "connecting");
-    const scheduleReconnect = () => {
-      if (unmounting || reconnectTimerRef.current) return;
-      const attempt = reconnectAttemptsRef.current + 1;
-      reconnectAttemptsRef.current = attempt;
-      if (attempt > PTY_RECONNECT_MAX_ATTEMPTS) {
-        setPtyRecoveryState("failed");
-        setBanner("Local chat could not reconnect automatically. Retry uses the same dashboard session token; manual page refresh should not be normal recovery.");
-        return;
-      }
-      const delay = Math.min(PTY_RECONNECT_MAX_MS, PTY_RECONNECT_BASE_MS * 2 ** (attempt - 1));
-      setPtyRecoveryState("reconnecting");
-      reconnectTimerRef.current = setTimeout(() => {
-        reconnectTimerRef.current = null;
-        setReconnectKey((key) => key + 1);
-      }, delay);
-    };
-    const ws = new WebSocket(url);
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
-    // Suppress banner/terminal side-effects when cleanup() calls `ws.close()`
-    // (React StrictMode remount, route change) so we never write to a
-    // disposed xterm or setState on an unmounted tree.
+    // in loopback mode it resolves synchronously against the injected
+    // session token. The IIFE keeps the outer effect synchronous so its
+    // ``return cleanup`` stays at the top level; handlers + disposables
+    // are hoisted to ``let`` bindings the cleanup closes over.
+>>>>>>> origin/main
     let unmounting = false;
+    let onDataDisposable: { dispose(): void } | null = null;
+    let onResizeDisposable: { dispose(): void } | null = null;
+    void (async () => {
+      const authParam = await buildWsAuthParam();
+      if (unmounting) return;
+      const url = buildWsUrl(authParam, resumeParam, channel);
+      const ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
 
     ws.onopen = () => {
       const restored = everOpenedRef.current || reconnectAttemptsRef.current > 0 || pageHiddenRef.current;
@@ -772,31 +764,32 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
     // mouse reporting, so we drop SGR mouse reports entirely instead of
     // forwarding them into Hermes. Keyboard input, paste, and resize still
     // behave normally.
-    // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
-    const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
-    const onDataDisposable = term.onData((data) => {
-      if (ws.readyState !== WebSocket.OPEN) return;
+      // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
+      const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
+      onDataDisposable = term.onData((data) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
 
-      if (SGR_MOUSE_RE.test(data)) {
-        return;
-      }
+        if (SGR_MOUSE_RE.test(data)) {
+          return;
+        }
 
-      ws.send(data);
-    });
+        ws.send(data);
+      });
 
-    const onResizeDisposable = term.onResize(({ cols, rows }) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(`\x1b[RESIZE:${cols};${rows}]`);
-      }
-    });
+      onResizeDisposable = term.onResize(({ cols, rows }) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(`\x1b[RESIZE:${cols};${rows}]`);
+        }
+      });
+    })();
 
     term.focus();
 
     return () => {
       unmounting = true;
       syncMetricsRef.current = null;
-      onDataDisposable.dispose();
-      onResizeDisposable.dispose();
+      onDataDisposable?.dispose();
+      onResizeDisposable?.dispose();
       if (metricsDebounce) clearTimeout(metricsDebounce);
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
@@ -811,7 +804,12 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
       if (hostSyncRaf) cancelAnimationFrame(hostSyncRaf);
       if (settleRaf1) cancelAnimationFrame(settleRaf1);
       if (settleRaf2) cancelAnimationFrame(settleRaf2);
-      ws.close();
+      // Phase 5.3: ``ws`` is local to the IIFE that opens it (the gated-mode
+      // ticket fetch makes the open async). The cleanup runs at the outer
+      // effect's top level so it can't reach into that scope — close via
+      // the ref instead. ``?.`` covers the race where unmount fires before
+      // the ticket fetch resolves and ``wsRef.current`` was never assigned.
+      wsRef.current?.close();
       wsRef.current = null;
       term.dispose();
       termRef.current = null;
@@ -879,9 +877,6 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
   //     model badge, tool-call list, model picker. Best-effort: if the
   //     sidecar fails to connect the terminal pane keeps working.
   //
-  // `normal-case` opts out of the dashboard's global `uppercase` rule on
-  // the root `<div>` in App.tsx — terminal output must preserve case.
-  //
   // Mobile model/tools sheet is portaled to `document.body` so it stacks
   // above the app sidebar (`z-50`) and mobile chrome (`z-40`).  The main
   // dashboard column uses `relative z-2`, which traps `position:fixed`
@@ -927,7 +922,8 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
             )}
           >
             <Typography
-              className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground"
+              mondwest
+              className="text-display font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground"
               style={{ mixBlendMode: "plus-lighter" }}
             >
               {t.app.modelToolsSheetTitle}
@@ -940,7 +936,7 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
               size="icon"
               onClick={closeMobilePanel}
               aria-label={t.app.closeModelTools}
-              className="text-midground/70 hover:text-midground"
+              className="text-text-secondary hover:text-midground"
             >
               <X />
             </Button>
@@ -960,7 +956,6 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
     );
 
   return (
-    <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col gap-2 overflow-hidden normal-case" data-testid="chat-iphone-width-safe">
       <PluginSlot name="chat:top" />
       {mobileModelToolsPortal}
 
@@ -973,13 +968,6 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
           ptyRecoveryTone(ptyRecoveryState) === "work" && "border-sky-400/40 bg-sky-400/10 text-sky-100",
           ptyRecoveryTone(ptyRecoveryState) === "bad" && "border-warning/50 bg-warning/10 text-warning",
         )}
-      >
-        <span className="inline-flex min-w-0 items-center gap-2 break-words">
-          {ptyRecoveryTone(ptyRecoveryState) === "ok" ? <CheckCircle2 className="h-3.5 w-3.5" /> : null}
-          {ptyRecoveryTone(ptyRecoveryState) === "work" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-          {ptyRecoveryTone(ptyRecoveryState) === "bad" ? <WifiOff className="h-3.5 w-3.5" /> : null}
-          {ptyRecoveryLabel(ptyRecoveryState)}
-        </span>
         {(ptyRecoveryState === "failed" || ptyRecoveryState === "unavailable") && (
           <button
             type="button"
@@ -1060,11 +1048,12 @@ export default function ChatPage({ isActive = true, sessionQuotaRecommendation =
             aria-label="Copy last assistant response"
             className={cn(
               "absolute z-10",
+              "normal-case tracking-normal font-normal",
               "rounded border border-current/30",
               "bg-black/20 backdrop-blur-sm",
-              "opacity-60 hover:opacity-100 hover:border-current/60",
-              "transition-opacity duration-150 normal-case font-normal tracking-normal",
-              "bottom-2 right-2 px-2 py-1 text-[0.65rem] sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5 sm:text-xs",
+              "opacity-70 hover:opacity-100 hover:border-current/60",
+              "transition-opacity duration-150",
+              "bottom-2 right-2 px-2 py-1 text-xs sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5",
               "lg:bottom-4 lg:right-4",
             )}
             style={{ color: TERMINAL_THEME.foreground }}
