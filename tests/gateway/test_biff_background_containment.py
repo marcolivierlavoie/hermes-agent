@@ -132,7 +132,7 @@ class TestBusyQueueContainment:
         from typing import cast as typing_cast
 
         from gateway.config import GatewayConfig, Platform
-        from gateway.platforms.base import MessageEvent
+        from gateway.platforms.base import MessageEvent, MessageType
         from gateway.run import GatewayRunner
         from gateway.session import SessionSource
 
@@ -143,7 +143,7 @@ class TestBusyQueueContainment:
         adapter = SimpleNamespace(_pending_messages={}, _send_with_retry=AsyncMock())
         runner.adapters[Platform.DISCORD] = typing_cast(SimpleNamespace, adapter)
         source = SessionSource(platform=Platform.DISCORD, chat_id="current-chat", user_id="marco")
-        event = MessageEvent(text="follow-up", source=source, message_id="msg-1")
+        event = MessageEvent(text="follow-up", source=source, message_id="msg-1", message_type=MessageType.VOICE)
         session_key = runner._session_key_for_source(source)
         running_agent = SimpleNamespace(
             steered=[],

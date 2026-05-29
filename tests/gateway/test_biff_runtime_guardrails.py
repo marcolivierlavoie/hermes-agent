@@ -7,7 +7,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -38,7 +38,7 @@ def _runner_with_busy_adapter(mode: str = "queue") -> tuple[GatewayRunner, Any, 
     adapter = SimpleNamespace(_pending_messages={}, _send_with_retry=AsyncMock())
     runner.adapters[Platform.DISCORD] = cast(Any, adapter)
     source = SessionSource(platform=Platform.DISCORD, chat_id="current-chat", user_id="marco")
-    event = MessageEvent(text="follow-up", source=source, message_id="msg-1")
+    event = MessageEvent(text="follow-up", source=source, message_id="msg-1", message_type=MessageType.VOICE)
     session_key = runner._session_key_for_source(source)
     running_agent = _RunningAgent()
     runner._running_agents[session_key] = running_agent

@@ -209,9 +209,10 @@ def build_biff_hot_context(
         return capsule
 
     if memory_tier is not None and memory_tier.tier == "no-memory":
-        capsule = build_biff_compact_identity(config)
-        _CACHE[key] = (now, capsule)
-        return capsule
+        if _compact_identity_enabled(discord_cfg):
+            capsule = build_biff_compact_identity(config)
+            _CACHE[key] = (now, capsule)
+            return capsule
 
     lines = [
         "## Biff Hot Context",

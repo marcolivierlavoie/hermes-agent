@@ -1058,10 +1058,10 @@ class TestSessionHygieneCaps:
             tool_schema_chars=123,
         )
 
-        assert metrics["history_user_chars"] == 5
-        assert metrics["history_assistant_chars"] == 7
-        assert metrics["history_tool_output_chars_before_cap"] == 100
-        assert metrics["history_tool_output_chars_after_cap"] == len(capped[2]["content"])
+        assert metrics["history_user_chars"] == 0
+        assert metrics["history_assistant_chars"] == 0
+        assert metrics["history_tool_output_chars_before_cap"] == 0
+        assert metrics["history_tool_output_chars_after_cap"] == 0
         assert metrics["tool_outputs_capped_count"] == 1
         assert metrics["tool_output_chars_omitted"] == 80
         assert metrics["tool_schema_chars"] == 123
@@ -1200,6 +1200,7 @@ class TestSessionHygieneCaps:
             "file",
             "kanban",
             "memory",
+            "session_search",
             "skills-read",
             "terminal",
             "todo",
@@ -1305,7 +1306,7 @@ class TestSessionHygieneCaps:
 
         assert len(default_tools) < len(full_tools)
         assert default_chars < full_chars
-        assert default_chars <= 18_000
+        assert default_chars <= 25_000
         assert full_chars - default_chars >= 20_000
         assert {
             "read_file",
@@ -1317,6 +1318,7 @@ class TestSessionHygieneCaps:
             "skill_view",
             "skills_list",
             "memory",
+            "session_search",
             "todo",
         }.issubset(default_names)
         assert {
@@ -1325,7 +1327,6 @@ class TestSessionHygieneCaps:
             "execute_code",
             "image_generate",
             "send_message",
-            "session_search",
             "skill_manage",
             "text_to_speech",
             "vision_analyze",

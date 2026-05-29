@@ -102,6 +102,8 @@ async def test_specialist_direct_timeout_progress_does_not_send_to_hermes_but_co
 
     monkeypatch.setattr(runner, "_run_in_executor_with_context", fake_executor)
     monkeypatch.setattr(gateway_run.asyncio, "wait_for", fake_wait_for)
+    fake_exists = lambda p: True if str(p).endswith("biff_role_invoke.py") else Path(str(p)).exists()
+    monkeypatch.setattr(Path, "exists", fake_exists)
 
     await runner._run_specialist_direct_background_task("forge", "do work", source, "forge_123")
 
@@ -137,6 +139,8 @@ async def test_specialist_direct_completion_falls_back_to_non_json_stdout(monkey
         )
 
     monkeypatch.setattr(runner, "_run_in_executor_with_context", fake_executor)
+    fake_exists = lambda p: True if str(p).endswith("biff_role_invoke.py") else Path(str(p)).exists()
+    monkeypatch.setattr(Path, "exists", fake_exists)
 
     await runner._run_specialist_direct_background_task("forge", "do work", source, "forge_plain")
 
@@ -178,6 +182,8 @@ async def test_specialist_direct_completion_falls_back_to_role_session_when_stdo
         )
 
     monkeypatch.setattr(runner, "_run_in_executor_with_context", fake_executor)
+    fake_exists = lambda p: True if str(p).endswith("biff_role_invoke.py") else Path(str(p)).exists()
+    monkeypatch.setattr(Path, "exists", fake_exists)
 
     await runner._run_specialist_direct_background_task("forge", "do work", source, "forge_empty")
 
@@ -220,6 +226,8 @@ async def test_specialist_direct_completion_falls_back_to_role_state_db_when_jso
         )
 
     monkeypatch.setattr(runner, "_run_in_executor_with_context", fake_executor)
+    fake_exists = lambda p: True if str(p).endswith("biff_role_invoke.py") else Path(str(p)).exists()
+    monkeypatch.setattr(Path, "exists", fake_exists)
 
     await runner._run_specialist_direct_background_task("vex", "verify work", source, "vex_db_only")
 
@@ -400,6 +408,8 @@ async def test_specialist_direct_internal_exception_relays_blocked_outcome(monke
         raise RuntimeError("synthetic worker crash")
 
     monkeypatch.setattr(runner, "_run_in_executor_with_context", fake_executor)
+    fake_exists = lambda p: True if str(p).endswith("biff_role_invoke.py") else Path(str(p)).exists()
+    monkeypatch.setattr(Path, "exists", fake_exists)
 
     await runner._run_specialist_direct_background_task("forge", "do work", source, "forge_456")
 

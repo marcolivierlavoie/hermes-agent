@@ -547,6 +547,7 @@ _V3_BIFF_TOOLSETS: frozenset[str] = frozenset(
         "terminal",
         "file",
         "memory",
+        "session_search",
         "skills-read",
         "todo",
         "kanban",

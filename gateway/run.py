@@ -19753,7 +19753,7 @@ class GatewayRunner:
             #      that may include tool_calls, tool_call_id, reasoning, etc.
             #      - These must be passed through intact so the API sees valid
             #        assistant→tool sequences (dropping tool_calls causes 500 errors)
-# Biff: build agent_history with tool output capping, prompt budget, and metrics
+            # Biff: build agent_history with tool output capping, prompt budget, and metrics
             agent_history = []
             for _transcript_message_index, msg in enumerate(history):
                 role = msg.get("role")
@@ -19878,7 +19878,7 @@ class GatewayRunner:
                         "prompt_budget_kept_chars": 0,
                     }
                 )
-# prompt_prepared diagnostic removed per Biff optimization:
+            # prompt_prepared diagnostic removed per Biff optimization:
             # turn_start diagnostic provides the same observability without
             # a second sync file write per turn. Token source metrics collection
             # was also de-hotpatched (see collect_token_source_metrics stub).
