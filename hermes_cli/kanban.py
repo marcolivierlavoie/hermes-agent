@@ -2019,10 +2019,6 @@ def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
-    def _cmd_block(args: argparse.Namespace) -> int:
-    reason = " ".join(args.reason).strip() if args.reason else None
-    author = _profile_author()
-    ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
     with kb.connect_closing() as conn:
         resolved_ids, missing = _resolve_task_refs(conn, ids)
@@ -2043,23 +2039,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
             else:
                 print(f"Blocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
-                conn,
-                tid,
-                reason=reason,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
-                failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
-            else:
-                print(f"Blocked {tid}" + (f": {reason}" if reason else ""))
-    return 0 if not failed else 1
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
-    reason = " ".join(args.reason).strip() if args.reason else None
-    author = _profile_author()
-    ids = [args.task_id] + list(getattr(args, "ids", None) or [])
-    def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
