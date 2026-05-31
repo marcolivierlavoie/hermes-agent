@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import sys
@@ -969,6 +970,227 @@ def test_profile_violation_no_false_positive_rc0_with_complete(
         ).fetchone()
         assert row["cnt"] == 0, (
             f"expected 0 violations for clean complete, got {row['cnt']}"
+        )
+
+
+def test_protocol_violation_sub_kind_prompt_compliance_failure(
+    kanban_home, monkeypatch,
+):
+    """A protocol violation with short elapsed runtime is classified as
+    ``prompt_compliance_failure`` — the agent exited quickly without tool
+    calls (≤3 turns, 0 tool calls).
+    """
+    import hermes_cli.kanban_db as _kb
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    _kb._record_worker_exit(92001, 0)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="pv-pcf", assignee="alice")
+        # Create a proper run + task state as a running worker would have.
+        # NOTE: tasks.started_at must stay NULL (create_task leaves it NULL)
+        # so the crash-detection grace period check is skipped — same
+        # approach as the existing protocol_violation tests.
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, "
+            "claim_expires=?, worker_pid=? "
+            "WHERE id=?",
+            (f"{host}:w1", now + 3600, 92001, tid),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, "
+            "claim_lock, claim_expires, worker_pid, started_at) "
+            "VALUES (?, 'alice', 'running', ?, ?, ?, ?)",
+            (tid, f"{host}:w1", now + 3600, 92001, now),
+        )
+        rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET current_run_id=? WHERE id=?",
+            (rid, tid),
+        )
+        conn.commit()
+
+        kb.detect_crashed_workers(conn)
+
+        # 1) Profile-violations row has sub_kind = prompt_compliance_failure
+        pv_row = conn.execute(
+            "SELECT sub_kind FROM profile_violations "
+            "WHERE profile = 'alice' AND task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert pv_row is not None, "expected a profile_violations row"
+        assert pv_row["sub_kind"] == "prompt_compliance_failure", (
+            f"expected prompt_compliance_failure, got {pv_row['sub_kind']!r}"
+        )
+
+        # 2) Event payload has sub_kind = prompt_compliance_failure
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'protocol_violation' "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert ev is not None, "expected a protocol_violation event"
+        payload = json.loads(ev["payload"])
+        assert payload.get("sub_kind") == "prompt_compliance_failure", (
+            f"expected prompt_compliance_failure in event payload, "
+            f"got {payload.get('sub_kind')!r}"
+        )
+
+        # 3) Run metadata has sub_kind = prompt_compliance_failure
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        run_meta = run.metadata if run.metadata else {}
+        assert run_meta.get("sub_kind") == "prompt_compliance_failure", (
+            f"expected prompt_compliance_failure in run metadata, "
+            f"got {run_meta.get('sub_kind')!r}"
+        )
+
+
+def test_protocol_violation_sub_kind_iteration_exhaustion(
+    kanban_home, monkeypatch,
+):
+    """A protocol violation with long elapsed runtime is classified as
+    ``iteration_exhaustion`` — the agent ran long enough to have made
+    tool calls (>3 turns) but forgot to complete/block.
+    """
+    import hermes_cli.kanban_db as _kb
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    _kb._record_worker_exit(92002, 0)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="pv-ie", assignee="alice")
+        # Create a run row with a backdated started_at.
+        old_time = int(time.time()) - 120  # 2 minutes ago
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, "
+            "claim_expires=?, worker_pid=?, started_at=COALESCE(started_at, ?) "
+            "WHERE id=?",
+            (f"{host}:w2", old_time + 3600, 92002, old_time, tid),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, "
+            "claim_lock, claim_expires, worker_pid, started_at) "
+            "VALUES (?, 'alice', 'running', ?, ?, ?, ?)",
+            (tid, f"{host}:w2", old_time + 3600, 92002, old_time),
+        )
+        rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET current_run_id=? WHERE id=?",
+            (rid, tid),
+        )
+        conn.commit()
+
+        kb.detect_crashed_workers(conn)
+
+        # 1) Profile-violations row has sub_kind = iteration_exhaustion
+        pv_row = conn.execute(
+            "SELECT sub_kind FROM profile_violations "
+            "WHERE profile = 'alice' AND task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert pv_row is not None, "expected a profile_violations row"
+        assert pv_row["sub_kind"] == "iteration_exhaustion", (
+            f"expected iteration_exhaustion, got {pv_row['sub_kind']!r}"
+        )
+
+        # 2) Event payload has sub_kind = iteration_exhaustion
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'protocol_violation' "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert ev is not None, "expected a protocol_violation event"
+        payload = json.loads(ev["payload"])
+        assert payload.get("sub_kind") == "iteration_exhaustion", (
+            f"expected iteration_exhaustion in event payload, "
+            f"got {payload.get('sub_kind')!r}"
+        )
+
+        # 3) Run metadata has sub_kind = iteration_exhaustion
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        run_meta = run.metadata if run.metadata else {}
+        assert run_meta.get("sub_kind") == "iteration_exhaustion", (
+            f"expected iteration_exhaustion in run metadata, "
+            f"got {run_meta.get('sub_kind')!r}"
+        )
+
+
+def test_protocol_violation_sub_kind_not_set_on_non_protocol(
+    kanban_home, monkeypatch,
+):
+    """A non-protocol crash (nonzero exit) does NOT set sub_kind in
+    events or create a profile_violations row.
+    """
+    import hermes_cli.kanban_db as _kb
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb, "_classify_worker_exit",
+        lambda _pid: ("nonzero_exit", 1),
+    )
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="np-test", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, "
+            "claim_expires=?, worker_pid=? "
+            "WHERE id=?",
+            (f"{host}:w3", now + 3600, 92003, tid),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, "
+            "claim_lock, claim_expires, worker_pid, started_at) "
+            "VALUES (?, 'alice', 'running', ?, ?, ?, ?)",
+            (tid, f"{host}:w3", now + 3600, 92003, now),
+        )
+        rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET current_run_id=? WHERE id=?",
+            (rid, tid),
+        )
+        conn.commit()
+
+        kb.detect_crashed_workers(conn)
+
+        # No protocol_violation event at all
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'protocol_violation'",
+            (tid,),
+        ).fetchone()
+        assert ev is None, (
+            "should not have a protocol_violation event for nonzero exit"
+        )
+
+        # No profile_violations row
+        pv_row = conn.execute(
+            "SELECT sub_kind FROM profile_violations "
+            "WHERE profile = 'alice' AND task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert pv_row is None, (
+            "should not have a profile_violations row for nonzero exit"
+        )
+
+        # The crashed event has no sub_kind
+        cr_ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'crashed' "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert cr_ev is not None, "expected a crashed event"
+        payload = json.loads(cr_ev["payload"])
+        assert "sub_kind" not in payload, (
+            f"crashed event should not have sub_kind, got {payload}"
         )
 
 

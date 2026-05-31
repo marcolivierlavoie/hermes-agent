@@ -1015,6 +1015,7 @@ CREATE TABLE IF NOT EXISTS profile_violations (
     profile    TEXT NOT NULL,
     task_id    TEXT NOT NULL,
     run_id     INTEGER,
+    sub_kind   TEXT,
     created_at INTEGER NOT NULL
 );
 
@@ -1738,6 +1739,13 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
         raise
     except Exception:
         pass  # I/O errors during check are non-fatal; let normal ops continue
+
+    # profile_violations table: additive columns introduced after v1.
+    pv_cols = {row["name"] for row in conn.execute("PRAGMA table_info(profile_violations)")}
+    if "sub_kind" not in pv_cols:
+        _add_column_if_missing(
+            conn, "profile_violations", "sub_kind", "sub_kind TEXT"
+        )
 
 
 @contextlib.contextmanager
@@ -5181,6 +5189,16 @@ def _error_fingerprint(error_text: str) -> str:
 # last 24 hours are blocked from further dispatch (see dispatch_once).
 _PROFILE_VIOLATION_LIMIT = 3
 _PROFILE_VIOLATION_WINDOW_SECONDS = 86_400  # 24 hours
+# Elapsed-time threshold for sub-kind classification in protocol violations.
+# Workers that exit cleanly (rc=0) without terminal transition within this
+# many seconds of their run start are classified as *prompt_compliance_failure*
+# (agent answered conversationally without tool calls). Workers running longer
+# are classified as *iteration_exhaustion* (agent used tools but forgot to
+# complete/block). The threshold is a heuristic: exact turn/tool-call data is
+# unavailable to the dispatcher's crash detector.
+# 60 seconds = ~1-3 LLM turns with low latency, well below a real tool-using
+# session that spans minutes.
+_SUB_KIND_ELAPSED_THRESHOLD = 60.0
 
 
 def _increment_profile_violation(
@@ -5188,17 +5206,22 @@ def _increment_profile_violation(
     profile: str,
     task_id: str,
     run_id: Optional[int] = None,
+    sub_kind: Optional[str] = None,
 ) -> None:
     """Record a protocol violation for a profile.
 
     Called when detect_crashed_workers finds a clean-exit-without-terminal-
     transition outcome. Inserts a row into profile_violations so the
     rolling threshold check can find it.
+
+    ``sub_kind`` distinguishes *prompt_compliance_failure* (agent answered
+    conversationally without ever calling tools) from *iteration_exhaustion*
+    (agent used tools but forgot to complete/block).
     """
     conn.execute(
-        "INSERT INTO profile_violations (profile, task_id, run_id, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (profile, task_id, run_id, int(time.time())),
+        "INSERT INTO profile_violations (profile, task_id, run_id, sub_kind, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (profile, task_id, run_id, sub_kind, int(time.time())),
     )
 
 
@@ -5277,6 +5300,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            sub_kind: Optional[str] = None
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -5288,11 +5312,39 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "kanban_complete or kanban_block — protocol violation"
                 )
                 event_kind = "protocol_violation"
+
+                # Classify sub-kind using elapsed runtime as a heuristic
+                # proxy for turn/tool-call count (exact data unavailable).
+                run_row = conn.execute(
+                    "SELECT started_at FROM task_runs "
+                    "WHERE task_id = ? AND ended_at IS NULL "
+                    "ORDER BY id DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                if run_row:
+                    run_started = run_row["started_at"]
+                else:
+                    # Fall back to tasks.started_at when no run row
+                    # exists (unclaimed-task detection path).
+                    # Note: ``row`` is sqlite3.Row (no .get()).
+                    run_started = row["started_at"]
+                if run_started is not None:
+                    elapsed = time.time() - run_started
+                    sub_kind = (
+                        "prompt_compliance_failure"
+                        if elapsed < _SUB_KIND_ELAPSED_THRESHOLD
+                        else "iteration_exhaustion"
+                    )
+                else:
+                    sub_kind = None
+
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+                if sub_kind:
+                    event_payload["sub_kind"] = sub_kind
                 profile = row["assignee"] or "unknown"
                 run_id_for_violation = None  # resolved after _end_run below
             else:
@@ -5339,6 +5391,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if protocol_violation and profile:
                     _increment_profile_violation(
                         conn, profile, row["id"], run_id=run_id,
+                        sub_kind=sub_kind,
                     )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
