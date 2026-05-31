@@ -48,7 +48,8 @@ def test_init_creates_expected_tables(kanban_home):
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
     names = {r["name"] for r in rows}
-    assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+    assert {"tasks", "task_links", "task_comments", "task_events",
+            "profile_violations"} <= names
 
 
 def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
@@ -788,6 +789,186 @@ def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
         result = _kb._resolve_crash_grace_seconds()
         assert result == _kb.DEFAULT_CRASH_GRACE_SECONDS, (
             f"expected default for {bad_val!r}, got {result}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Profile violation counter + threshold (Slice 1, BIF-1669)
+# ---------------------------------------------------------------------------
+
+
+def test_profile_violation_counter_increments_on_protocol_violation(
+    kanban_home, monkeypatch,
+):
+    """A clean-exit-without-terminal-transition increments the counter."""
+    import hermes_cli.kanban_db as _kb
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    # Populate the reap registry so _classify_worker_exit returns clean_exit.
+    _kb._record_worker_exit(91001, 0)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="pv-test", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, "
+            "claim_lock=? WHERE id=?",
+            (91001, f"{host}:w1", tid),
+        )
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed, "protocol violation should be detected"
+
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM profile_violations "
+            "WHERE profile = 'alice'"
+        ).fetchone()
+        assert row["cnt"] == 1, (
+            f"expected 1 violation for alice, got {row['cnt']}"
+        )
+
+
+def test_profile_violation_threshold_blocks_dispatch(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """3+ protocol violations in 24h blocks dispatch to that profile."""
+    import hermes_cli.kanban_db as _kb
+
+    # Backdate time to avoid 24h window issues.
+    base_time = 1_000_000.0
+    monkeypatch.setattr(_kb.time, "time", lambda: base_time)
+
+    with kb.connect() as conn:
+        # Directly insert 3 violations for profile "bob".
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO profile_violations "
+                "(profile, task_id, run_id, created_at) "
+                "VALUES (?, ?, NULL, ?)",
+                ("bob", f"old-task-{i}", int(base_time)),
+            )
+        conn.commit()
+
+        # Create a ready task for bob and check dispatch skips it.
+        tid = kb.create_task(conn, title="blocked-test", assignee="bob")
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda *a, **kw: 99999,
+            max_spawn=10, dry_run=False,
+        )
+
+    # Should be in profile_violation_blocked bucket.
+    blocked_ids = [x[0] for x in result.profile_violation_blocked]
+    assert tid in blocked_ids, (
+        f"task {tid} should be profile-violation-blocked, "
+        f"got buckets: spawned={result.spawned}, "
+        f"pv_blocked={result.profile_violation_blocked}"
+    )
+
+
+def test_profile_violation_window_expiry(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """Violations older than 24h don't count toward the threshold."""
+    import hermes_cli.kanban_db as _kb
+
+    # Current time at a known base.
+    base_time = 1_000_000.0
+    # Violation 25h ago (older than the 24h window).
+    old_violation_time = int(base_time) - 86_400 - 3600  # 25 hours ago
+
+    with kb.connect() as conn:
+        # 3 old violations — outside the window.
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO profile_violations "
+                "(profile, task_id, run_id, created_at) "
+                "VALUES (?, ?, NULL, ?)",
+                ("carol", f"old-{i}", old_violation_time),
+            )
+        conn.commit()
+
+        # Move time to base_time (so check counts only violations at
+        # >= base_time - 86400 = old_violation_time + 3600, which
+        # excludes the old ones).
+        monkeypatch.setattr(_kb.time, "time", lambda: base_time)
+
+        tid = kb.create_task(conn, title="expiry-test", assignee="carol")
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda *a, **kw: 99999,
+            max_spawn=10, dry_run=False,
+        )
+
+    # Should be spawned (not blocked) because old violations expired.
+    spawned_ids = [x[0] for x in result.spawned]
+    blocked_ids = [x[0] for x in result.profile_violation_blocked]
+    assert tid in spawned_ids, (
+        f"task {tid} should be spawned (window expired), "
+        f"but was profile_violation_blocked={blocked_ids}"
+    )
+
+
+def test_profile_violation_no_false_positive_nonzero_exit(
+    kanban_home, monkeypatch,
+):
+    """Crashed worker with nonzero exit does not increment counter."""
+    import hermes_cli.kanban_db as _kb
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    # Force the reap registry to classify the exit as nonzero.
+    monkeypatch.setattr(
+        _kb, "_classify_worker_exit",
+        lambda _pid: ("nonzero_exit", 1),
+    )
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nonzero-test", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, "
+            "claim_lock=? WHERE id=?",
+            (91002, f"{host}:w2", tid),
+        )
+        conn.commit()
+
+        kb.detect_crashed_workers(conn)
+
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM profile_violations "
+            "WHERE profile = 'alice'"
+        ).fetchone()
+        assert row["cnt"] == 0, (
+            f"expected 0 violations for nonzero exit, got {row['cnt']}"
+        )
+
+
+def test_profile_violation_no_false_positive_rc0_with_complete(
+    kanban_home, monkeypatch,
+):
+    """Clean exit with kanban_complete does NOT increment counter."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="complete-test", assignee="alice")
+        # Simulate a successful completion: status done, run closed.
+        kb.claim_task(conn, tid)
+        run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        run_id = run["id"] if run else None
+        kb.complete_task(conn, tid, summary="all good", expected_run_id=run_id)
+
+        # The DB should have zero profile_violations.
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM profile_violations "
+            "WHERE profile = 'alice'"
+        ).fetchone()
+        assert row["cnt"] == 0, (
+            f"expected 0 violations for clean complete, got {row['cnt']}"
         )
 
 

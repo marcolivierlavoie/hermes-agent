@@ -424,6 +424,28 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+def _derive_display_prefix(slug: str) -> str:
+    """Derive a display-ID prefix from a board slug.
+
+    Takes the first 3 uppercase alphabetic characters.  ``default`` → ``DEF``,
+    ``atm10-server`` → ``ATM``, ``biff-os`` → ``BIF``.  Falls back to ``PRJ``
+    for slugs with no alpha characters.
+    """
+    cleaned = "".join(c for c in slug.upper() if c.isalpha())
+    return (cleaned + "PRJ")[:3]
+
+
+def _display_id_prefix(conn: sqlite3.Connection, board: Optional[str] = None) -> str:
+    """Return the display-ID prefix for the active (or ``board``) board.
+
+    Checks the board's metadata for an explicit ``display_prefix``
+    (settable via ``board.json``), falling back to the slug-derived default.
+    """
+    slug = _normalize_board_slug(board) or get_current_board() or DEFAULT_BOARD
+    meta = read_board_metadata(slug)
+    return str(meta.get("display_prefix", _derive_display_prefix(slug)))
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -442,6 +464,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "default_workdir": None,
         "created_at": None,
         "archived": False,
+        "display_prefix": _derive_display_prefix(slug),
     }
     try:
         p = board_metadata_path(slug)
@@ -981,6 +1004,22 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Profile-level protocol-violation tracking. A new row is inserted each
+-- time a worker exits cleanly (rc=0) without calling kanban_complete or
+-- kanban_block. The dispatcher checks the rolling 24h count before
+-- dispatching; profiles with 3+ violations in that window are blocked
+-- with an actionable reason instead of retrying.
+CREATE TABLE IF NOT EXISTS profile_violations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile    TEXT NOT NULL,
+    task_id    TEXT NOT NULL,
+    run_id     INTEGER,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_violations_profile_time
+    ON profile_violations(profile, created_at);
 """
 
 
@@ -1644,6 +1683,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "UPDATE task_events SET kind = ? WHERE kind = ?",
             (new, old),
         )
+
+    # Profile-level protocol-violation table (Slice 1, BIF-1669).
+    # CREATE TABLE IF NOT EXISTS is idempotent so re-running is safe.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS profile_violations (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile    TEXT NOT NULL,
+            task_id    TEXT NOT NULL,
+            run_id     INTEGER,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_violations_profile_time
+            ON profile_violations(profile, created_at);
+        """
+    )
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
@@ -4583,6 +4638,11 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    profile_violation_blocked: list[tuple[str, str, int]] = field(default_factory=list)
+    """Tasks skipped this tick because their assignee profile has 3+ protocol
+    violations in the rolling 24h window. Each entry is
+    ``(task_id, profile, violation_count)``. A Ranger/Specifier
+    follow-up task should be created to diagnose the underlying cause."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -5116,6 +5176,56 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+# Rolling 24h threshold for profile-level protocol violations.
+# Profiles with this many clean-exit-without-transition outcomes in the
+# last 24 hours are blocked from further dispatch (see dispatch_once).
+_PROFILE_VIOLATION_LIMIT = 3
+_PROFILE_VIOLATION_WINDOW_SECONDS = 86_400  # 24 hours
+
+
+def _increment_profile_violation(
+    conn: sqlite3.Connection,
+    profile: str,
+    task_id: str,
+    run_id: Optional[int] = None,
+) -> None:
+    """Record a protocol violation for a profile.
+
+    Called when detect_crashed_workers finds a clean-exit-without-terminal-
+    transition outcome. Inserts a row into profile_violations so the
+    rolling threshold check can find it.
+    """
+    conn.execute(
+        "INSERT INTO profile_violations (profile, task_id, run_id, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (profile, task_id, run_id, int(time.time())),
+    )
+
+
+def _check_profile_violation_threshold(
+    conn: sqlite3.Connection,
+    profile: str,
+) -> tuple[bool, int]:
+    """Check if *profile* has exceeded the protocol-violation threshold.
+
+    Returns ``(blocked, count)`` where:
+    - ``blocked`` is True when *count >= _PROFILE_VIOLATION_LIMIT*.
+    - ``count`` is the number of violations in the rolling 24h window.
+
+    Only counts violations from the past ``_PROFILE_VIOLATION_WINDOW_SECONDS``
+    seconds, so an old batch of violations does not permanently block a
+    profile after it has been fixed.
+    """
+    cutoff = int(time.time()) - _PROFILE_VIOLATION_WINDOW_SECONDS
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM profile_violations "
+        "WHERE profile = ? AND created_at >= ?",
+        (profile, cutoff),
+    ).fetchone()
+    count = int(row["cnt"]) if row else 0
+    return (count >= _PROFILE_VIOLATION_LIMIT, count)
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -5141,11 +5251,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case so we can trip the breaker
     # immediately instead of incrementing by 1.
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, str, bool, str]] = []
+    # (task_id, pid, profile, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -5183,6 +5293,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+                profile = row["assignee"] or "unknown"
+                run_id_for_violation = None  # resolved after _end_run below
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -5196,6 +5308,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+                profile = ""
+                run_id_for_violation = None
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -5217,9 +5331,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 )
                 crashed.append(row["id"])
                 crash_details.append(
-                    (row["id"], pid, row["claim_lock"],
+                    (row["id"], pid, profile, row["claim_lock"],
                      protocol_violation, error_text)
                 )
+                # Record profile-level protocol violation for threshold
+                # tracking, but only on clean-exit-without-transition cases.
+                if protocol_violation and profile:
+                    _increment_profile_violation(
+                        conn, profile, row["id"], run_id=run_id,
+                    )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
     # ready → blocked with a ``gave_up`` event on top of the ``crashed``
@@ -5234,10 +5354,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, _, err_text in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, _profile, claimer, protocol_violation, error_text in crash_details:
             fp = _error_fingerprint(error_text)
             is_systemic = (
                 not protocol_violation
@@ -5334,25 +5454,61 @@ def _record_task_failure(
 
         if failures >= effective_limit:
             # Trip the breaker.
+            # Check total lifetime gave_up events — if this is the 2nd+
+            # circuit-breaker trip, send to triage with a comment so the
+            # user must review and re-approve before retry.
+            past_trips = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM task_events "
+                    "WHERE task_id = ? AND kind = 'gave_up'",
+                    (task_id,),
+                ).fetchone()["cnt"] or 0
+            )
+            is_repeat = past_trips >= 1
+            new_status = "triage" if is_repeat else "blocked"
+
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (new_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
-                # counter fields.
+                # with claim cleared; just flip status + update counter.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
+                    "UPDATE tasks SET status = ?, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (new_status, failures, error[:500], task_id),
                 )
+
+            if is_repeat:
+                # Inline comment insert — nested write_txn would deadlock
+                # on BEGIN IMMEDIATE.
+                now = int(time.time())
+                comment_body = (
+                    f"Circuit breaker tripped again "
+                    f"(cumulative trip #{past_trips + 1}, "
+                    f"consecutive failures: {failures}). "
+                    f"Last error: {error[:200]}. "
+                    f"Card moved to triage — review and re-approve "
+                    f"before retry."
+                )
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (task_id, "biff-circuit-breaker", comment_body, now),
+                )
+                _append_event(
+                    conn, task_id, "commented",
+                    {"author": "biff-circuit-breaker", "len": len(comment_body)},
+                )
+
             run_id = None
             if end_run:
                 # Only the spawn path has an open run to close.
@@ -5365,6 +5521,7 @@ def _record_task_failure(
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
+                        "promoted_to_triage": is_repeat,
                     },
                 )
             payload = {
@@ -5373,6 +5530,7 @@ def _record_task_failure(
                 "limit_source": limit_source,
                 "error": error[:500],
                 "trigger_outcome": outcome,
+                "promoted_to_triage": is_repeat,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
@@ -5820,6 +5978,31 @@ def dispatch_once(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        # Profile violation threshold: profiles with 3+ protocol violations
+        # (clean exit without complete/block) in the last 24h are blocked
+        # from receiving new work. The intention is to surface the
+        # recurring pattern to a human (Ranger/Specifier) instead of
+        # looping indefinitely. Running a task against a blocked profile
+        # would just generate another protocol violation.
+        blocked, vcount = _check_profile_violation_threshold(
+            conn, row_assignee,
+        )
+        if blocked:
+            result.profile_violation_blocked.append(
+                (row["id"], row_assignee, vcount)
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "profile_violation_blocked",
+                        {
+                            "profile": row_assignee,
+                            "violations": vcount,
+                            "limit": _PROFILE_VIOLATION_LIMIT,
+                            "window_seconds": _PROFILE_VIOLATION_WINDOW_SECONDS,
+                        },
+                    )
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
