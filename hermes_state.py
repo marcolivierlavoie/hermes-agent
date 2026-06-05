@@ -16,6 +16,7 @@ Key design decisions:
 
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -24,7 +25,7 @@ import time
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_hermes_state_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,17 @@ _last_init_error_lock = threading.Lock()
 # filesystem-incompat warning on every connection, filling errors.log.
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
+
+
+def get_default_db_path() -> Path:
+    """Return the default session DB path, honoring HERMES_STATE_HOME.
+
+    Keep DEFAULT_DB_PATH as the legacy fallback so tests and callers that
+    monkeypatch it continue to work unless a state-home override is explicit.
+    """
+    if os.environ.get("HERMES_STATE_HOME", "").strip():
+        return get_hermes_state_home() / "state.db"
+    return DEFAULT_DB_PATH
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -367,7 +379,7 @@ class SessionDB:
     _CHECKPOINT_EVERY_N_WRITES = 50
 
     def __init__(self, db_path: Path = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or get_default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.Lock()
@@ -3311,4 +3323,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-

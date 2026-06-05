@@ -101,6 +101,20 @@ def get_hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
+def get_hermes_state_home() -> Path:
+    """Return the Hermes runtime-state directory.
+
+    HERMES_HOME points at the profile/config home.  HERMES_STATE_HOME can
+    override only mutable runtime artifacts, letting unattended workers keep
+    state.db / gateway status files inside a task workspace while still using
+    their profile-scoped config.
+    """
+    val = os.environ.get("HERMES_STATE_HOME", "").strip()
+    if val:
+        return Path(val)
+    return get_hermes_home()
+
+
 def get_default_hermes_root() -> Path:
     """Return the root Hermes directory for profile-level operations.
 

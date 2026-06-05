@@ -6535,6 +6535,13 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Worker runtime state is intentionally workspace-scoped, not source-tree
+    # scoped: the profile's HERMES_HOME still supplies config/skills/secrets,
+    # while HERMES_STATE_HOME keeps mutable session/gateway state under the
+    # scratch workspace. TERMINAL_CWD mirrors that decision so terminal sessions
+    # start in the same managed workspace that completion/GC may later clean.
+    env["TERMINAL_CWD"] = workspace
+    env["HERMES_STATE_HOME"] = str(Path(workspace) / ".hermes-sandbox")
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:

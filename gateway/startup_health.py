@@ -15,9 +15,11 @@ Design:
   restart loops (N crashes without a clean exit in M minutes).
 
 Marker path:
+  ``{HERMES_STATE_HOME}/.gateway-health-marker`` when set, otherwise
   ``{HERMES_HOME}/.gateway-health-marker``
 
 State file (persistent, survives across runs):
+  ``{HERMES_STATE_HOME}/gateway_state.json`` when set, otherwise
   ``{HERMES_HOME}/gateway_state.json``
 """
 
@@ -33,6 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_constants import get_hermes_state_home
+
 logger = logging.getLogger(__name__)
 
 _MARKER_FILENAME = ".gateway-health-marker"
@@ -45,10 +49,8 @@ _STATE_FILENAME = "gateway_state.json"
 
 
 def _get_hermes_home() -> Path:
-    """Return HERMES_HOME path (env var override or ~/.hermes)."""
-    return Path(
-        os.getenv("HERMES_HOME") or str(Path.home() / ".hermes")
-    ).expanduser().resolve()
+    """Return the runtime-state home path."""
+    return get_hermes_state_home().expanduser().resolve()
 
 
 def _get_marker_path(hermes_home: Optional[Path] = None) -> Path:

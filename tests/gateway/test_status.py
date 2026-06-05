@@ -20,6 +20,22 @@ class TestGatewayPidState:
         assert isinstance(payload["argv"], list)
         assert payload["argv"]
 
+    def test_state_home_routes_pid_lock_and_runtime_status(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "profile"
+        state_home = tmp_path / "state"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_STATE_HOME", str(state_home))
+
+        status.write_pid_file()
+        assert (state_home / "gateway.pid").exists()
+        assert not (hermes_home / "gateway.pid").exists()
+
+        status.write_runtime_status(gateway_state="running")
+        assert (state_home / "gateway_state.json").exists()
+        assert not (hermes_home / "gateway_state.json").exists()
+
+        assert status._get_gateway_lock_path() == state_home / "gateway.lock"
+
     def test_write_pid_file_is_atomic_against_concurrent_writers(self, tmp_path, monkeypatch):
         """Regression: two concurrent --replace invocations must not both win.
 
