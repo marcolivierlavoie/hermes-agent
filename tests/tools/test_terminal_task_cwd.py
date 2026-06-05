@@ -72,3 +72,70 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
 
     assert result["exit_code"] == 0
     assert calls == [{"timeout": 60, "cwd": "/explicit/workdir"}]
+
+
+def test_get_env_config_falls_back_when_process_cwd_deleted(monkeypatch, tmp_path):
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(fallback))
+
+    def missing_cwd():
+        raise FileNotFoundError("cwd vanished")
+
+    monkeypatch.setattr(terminal_tool.os, "getcwd", missing_cwd)
+
+    config = terminal_tool._get_env_config()
+
+    assert config["cwd"] == str(fallback)
+
+
+def test_get_env_config_keeps_explicit_terminal_cwd_when_process_cwd_deleted(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", "/definitely/missing/hermes-cwd")
+
+    def missing_cwd():
+        raise FileNotFoundError("cwd vanished")
+
+    monkeypatch.setattr(terminal_tool.os, "getcwd", missing_cwd)
+
+    config = terminal_tool._get_env_config()
+
+    # The deleted process cwd guard chooses a safe default, but an explicit
+    # TERMINAL_CWD still remains the user/config override. LocalEnvironment has
+    # the per-command ancestor recovery guard for stale explicit cwd values.
+    assert config["cwd"] == "/definitely/missing/hermes-cwd"
+
+
+def test_get_env_config_uses_home_when_process_cwd_deleted_without_terminal_cwd(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+    def missing_cwd():
+        raise FileNotFoundError("cwd vanished")
+
+    monkeypatch.setattr(terminal_tool.os, "getcwd", missing_cwd)
+
+    config = terminal_tool._get_env_config()
+
+    assert config["cwd"] == terminal_tool.os.path.expanduser("~")
+
+
+def test_docker_mount_cwd_falls_back_when_process_cwd_deleted(monkeypatch, tmp_path):
+    fallback = tmp_path / "docker-host-cwd"
+    fallback.mkdir()
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+    monkeypatch.setenv("TERMINAL_CWD", str(fallback))
+
+    def missing_cwd():
+        raise FileNotFoundError("cwd vanished")
+
+    monkeypatch.setattr(terminal_tool.os, "getcwd", missing_cwd)
+
+    config = terminal_tool._get_env_config()
+
+    assert config["cwd"] == "/workspace"
+    assert config["host_cwd"] == str(fallback)
