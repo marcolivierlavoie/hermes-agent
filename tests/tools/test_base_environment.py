@@ -4,10 +4,16 @@ Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
 init_session() failure handling, and the CWD marker contract.
 """
 
+import os
+import subprocess
 import uuid
 from unittest.mock import MagicMock
 
-from tools.environments.base import BaseEnvironment, _cwd_marker
+from tools.environments.base import (
+    BaseEnvironment,
+    _EXPORT_ENV_SNAPSHOT_CMD,
+    _cwd_marker,
+)
 
 
 class _TestableEnv(BaseEnvironment):
@@ -33,7 +39,8 @@ class TestWrapCommand:
         assert "cd -- /tmp" in wrapped or "cd -- '/tmp'" in wrapped
         assert "eval 'echo hello'" in wrapped
         assert "__hermes_ec=$?" in wrapped
-        assert "export -p >" in wrapped
+        assert _EXPORT_ENV_SNAPSHOT_CMD in wrapped
+        assert "export -p >" not in wrapped
         assert "pwd -P >" in wrapped
         assert env._cwd_marker in wrapped
         assert "exit $__hermes_ec" in wrapped
@@ -89,6 +96,35 @@ class TestWrapCommand:
         wrapped = env._wrap_command("ls", "/nonexistent")
 
         assert "exit 126" in wrapped
+
+
+class TestEnvSnapshotExportFilter:
+    def test_filter_drops_invalid_list_append_env_names(self):
+        env = os.environ.copy()
+        env["command_allowlist[+]"] = "terminal"
+        env["HERMES_VALID_SNAPSHOT_TEST"] = "kept"
+
+        proc = subprocess.run(
+            ["/bin/bash", "-c", _EXPORT_ENV_SNAPSHOT_CMD],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        assert proc.returncode == 0
+        assert "command_allowlist" not in proc.stdout
+        assert 'declare -x HERMES_VALID_SNAPSHOT_TEST="kept"' in proc.stdout
+
+    def test_wrapped_command_refresh_uses_filtered_snapshot_export(self):
+        env = _TestableEnv()
+        env._snapshot_ready = True
+
+        wrapped = env._wrap_command("echo hello", "/tmp")
+
+        assert f"{_EXPORT_ENV_SNAPSHOT_CMD} >" in wrapped
+        assert "export -p >" not in wrapped
 
 
 class TestExtractCwdFromOutput:

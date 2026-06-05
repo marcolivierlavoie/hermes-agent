@@ -25,6 +25,16 @@ from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 
+# Bash can import environment variables with names that are legal in execve(2)
+# but invalid as shell identifiers, e.g. ``command_allowlist[+]`` from a YAML
+# list-append override. ``export -p`` prints those as ``declare -x name[...]=``;
+# sourcing that snapshot later fails with ``not a valid identifier`` and can
+# corrupt the persistent terminal session. Keep only plain shell identifiers in
+# snapshots while preserving all normal exported variables.
+_EXPORT_ENV_SNAPSHOT_CMD = (
+    r"export -p | grep -vE '^declare -x [A-Za-z_][A-Za-z0-9_]*\['"
+)
+
 # Opt-in debug tracing for the interrupt/activity/poll machinery.  Set
 # HERMES_DEBUG_INTERRUPT=1 to log loop entry/exit, periodic heartbeats, and
 # every is_interrupted() state change from _wait_for_process.  Off by default
@@ -370,7 +380,7 @@ class BaseEnvironment(ABC):
         _quoted_snap = shlex.quote(self._snapshot_path)
         _quoted_cwd_file = shlex.quote(self._cwd_file)
         bootstrap = (
-            f"export -p > {_quoted_snap}\n"
+            f"{_EXPORT_ENV_SNAPSHOT_CMD} > {_quoted_snap}\n"
             f"declare -f | grep -vE '^_[^_]' >> {_quoted_snap}\n"
             f"alias -p >> {_quoted_snap}\n"
             f"echo 'shopt -s expand_aliases' >> {_quoted_snap}\n"
@@ -451,7 +461,9 @@ class BaseEnvironment(ABC):
 
         # Re-dump env vars to snapshot (last-writer-wins for concurrent calls)
         if self._snapshot_ready:
-            parts.append(f"export -p > {_quoted_snap} 2>/dev/null || true")
+            parts.append(
+                f"{_EXPORT_ENV_SNAPSHOT_CMD} > {_quoted_snap} 2>/dev/null || true"
+            )
 
         # Write CWD to file (local reads this) and stdout marker (remote parses this)
         parts.append(f"pwd -P > {_quoted_cwd_file} 2>/dev/null || true")
@@ -851,4 +863,3 @@ class BaseEnvironment(ABC):
         from tools.terminal_tool import _transform_sudo_command
 
         return _transform_sudo_command(command)
-
