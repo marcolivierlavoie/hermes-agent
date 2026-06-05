@@ -16,6 +16,20 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
 
+
+def _safe_setsid() -> None:
+    """Create a new session. Gracefully handle already-session-leader case.
+
+    The gateway dispatcher may already run workers with os.setsid (see
+    kanban_db._spawn_worker).  When that happens the terminal subprocess is
+    already a session leader and os.setsid raises OSError(EACCES).  Catch it
+    so the bash subprocess can start normally instead of dying with exit 1.
+    """
+    try:
+        os.setsid()
+    except OSError:
+        pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -527,7 +541,7 @@ class LocalEnvironment(BaseEnvironment):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
+            preexec_fn=None if _IS_WINDOWS else _safe_setsid,
             cwd=_popen_cwd,
             **_popen_kwargs,
         )
