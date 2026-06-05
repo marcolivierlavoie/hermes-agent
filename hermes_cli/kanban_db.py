@@ -2165,6 +2165,12 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                     },
                 )
+                if task_status == "blocked":
+                    # ``initial_status='blocked'`` is an explicit human/operator
+                    # gate, not a circuit-breaker state. Emit the same event as
+                    # block_task() so recompute_ready treats the card as sticky
+                    # until unblock_task() records an "unblocked" event.
+                    _append_event(conn, task_id, "blocked", {"reason": None})
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

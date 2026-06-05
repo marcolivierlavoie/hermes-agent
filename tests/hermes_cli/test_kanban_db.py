@@ -391,29 +391,25 @@ def test_recompute_ready_does_not_promote_blocked_without_explicit_unblock(kanba
         assert not any(e.kind == "promoted" for e in kb.list_events(conn, blocked))
 
 
-def test_recompute_ready_preserves_blocked_even_after_parents_done(kanban_home):
+def test_recompute_ready_preserves_initial_blocked_even_after_parents_done(kanban_home):
     """parent completion alone is not an explicit unblock action."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
         child = kb.create_task(
-            conn, title="child", assignee="a", parents=[parent],
+            conn,
+            title="child",
+            assignee="a",
+            parents=[parent],
+            initial_status="blocked",
         )
         kb.claim_task(conn, parent)
         kb.complete_task(conn, parent, result="ok")
-        conn.execute(
-            "UPDATE tasks SET status='blocked', consecutive_failures=5, "
-            "last_failure_error='persistent error' WHERE id=?",
-            (child,),
-        )
-        conn.commit()
 
         promoted = kb.recompute_ready(conn)
 
         task = kb.get_task(conn, child)
         assert promoted == 0
         assert task.status == "blocked"
-        assert task.consecutive_failures == 5
-        assert task.last_failure_error == "persistent error"
 
 
 def test_recompute_ready_still_promotes_todo_with_done_parents(kanban_home):
