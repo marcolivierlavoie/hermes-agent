@@ -357,7 +357,7 @@ def strip_pattern_and_format(tools: list[dict]) -> tuple[list[dict], int]:
     for tool in tools:
         if not isinstance(tool, dict):
             continue
-        
+
         # OpenAI-format: {"function": {"parameters": {...}}}
         fn = tool.get("function")
         if isinstance(fn, dict):
@@ -365,7 +365,7 @@ def strip_pattern_and_format(tools: list[dict]) -> tuple[list[dict], int]:
             if isinstance(params, dict):
                 _walk(params)
                 continue
-        
+
         # Responses-format: {"name": "...", "parameters": {...}}
         # (used by codex_responses API mode — xAI, OpenAI Codex, etc.)
         params = tool.get("parameters")

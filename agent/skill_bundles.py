@@ -61,6 +61,56 @@ _BUNDLE_MULTI_HYPHEN = re.compile(r"-{2,}")
 
 _bundles_cache: Dict[str, Dict[str, Any]] = {}
 _bundles_cache_mtime: Optional[float] = None
+_DEFAULT_SUMMARY_MAX_CHARS = 1200
+
+# Runtime-level deprecation map for Marco/Biff bundle names that existed as
+# broad category proposals before the canonical narrow /biff-* workflow set.
+# These are aliases only when the canonical target bundle exists in the active
+# HERMES_HOME, so generic installations do not get phantom commands.
+DEPRECATED_BIFF_BUNDLE_ALIASES: Dict[str, Dict[str, str]] = {
+    "biff-core-ops": {
+        "target": "biff-issue-execution",
+        "reason": (
+            "biff-core-ops was too broad; use a canonical workflow bundle "
+            "such as /biff-issue-execution, /biff-meeting-followup, or "
+            "/biff-memory-knowledge-governance instead."
+        ),
+    },
+    "biff-build-verify": {
+        "target": "biff-hermes-runtime-change",
+        "reason": (
+            "biff-build-verify is superseded; Forge/Vex are role routing, "
+            "while Hermes/Biff runtime changes use /biff-hermes-runtime-change."
+        ),
+    },
+    "biff-docs-briefs": {
+        "target": "biff-research-to-decision",
+        "reason": (
+            "biff-docs-briefs was category-like; use a concrete workflow "
+            "bundle such as /biff-research-to-decision."
+        ),
+    },
+    "biff-automation-integrations": {
+        "target": "biff-automation-ownership",
+        "reason": "biff-automation-integrations is superseded by /biff-automation-ownership.",
+    },
+    "biff-meetings-mail": {
+        "target": "biff-meeting-followup",
+        "reason": "biff-meetings-mail is superseded by /biff-meeting-followup.",
+    },
+    "biff-personal-home": {
+        "target": "biff-personal-logistics",
+        "reason": (
+            "biff-personal-home was too broad; personal errands/capture use "
+            "/biff-personal-logistics, while smart-home work should load "
+            "homeassistant or openhue directly."
+        ),
+    },
+    "biff-research-synthesis": {
+        "target": "biff-research-to-decision",
+        "reason": "biff-research-synthesis is superseded by /biff-research-to-decision.",
+    },
+}
 
 
 def _bundles_dir() -> Path:
@@ -80,6 +130,30 @@ def _slugify(name: str) -> str:
     cmd = _BUNDLE_INVALID_CHARS.sub("", cmd)
     cmd = _BUNDLE_MULTI_HYPHEN.sub("-", cmd).strip("-")
     return cmd
+
+
+def get_deprecated_bundle_alias(command: str) -> Optional[Dict[str, str]]:
+    """Return deprecation metadata for a Biff bundle alias, if active.
+
+    Alias activation is deliberately existing-bundles-only: the canonical
+    target must be installed in the current HERMES_HOME before the old name
+    resolves. That preserves generic Hermes behavior while giving Marco/Biff
+    a runtime bridge away from broad historical names.
+    """
+    slug = _slugify((command or "").lstrip("/"))
+    alias = DEPRECATED_BIFF_BUNDLE_ALIASES.get(slug)
+    if not alias:
+        return None
+    target_key = f"/{alias['target']}"
+    if target_key not in get_skill_bundles():
+        return None
+    return {
+        "alias": slug,
+        "alias_key": f"/{slug}",
+        "target": alias["target"],
+        "target_key": target_key,
+        "reason": alias["reason"],
+    }
 
 
 def _iter_bundle_files() -> List[Path]:
@@ -113,6 +187,88 @@ def _max_mtime(files: List[Path]) -> float:
     return max(mtimes) if mtimes else 0.0
 
 
+def _normalize_skill_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a bundle skill entry while preserving string defaults.
+
+    Historical bundle YAML used plain string entries such as ``skills: [test-driven-development, ...]``. BIF-630 adds an
+    opt-in mapping form for bounded prompt loading without changing the old
+    behavior for plain strings.
+    """
+    if isinstance(entry, str):
+        name = entry.strip()
+        if not name:
+            return None
+        return {"name": name, "mode": "full"}
+
+    if not isinstance(entry, dict):
+        return None
+
+    name = str(entry.get("name") or entry.get("skill") or "").strip()
+    if not name:
+        return None
+
+    mode = str(entry.get("mode") or "full").strip().lower()
+    if mode not in {"full", "summary"}:
+        mode = "full"
+
+    normalized: Dict[str, Any] = {"name": name, "mode": mode}
+    if "max_chars" in entry:
+        try:
+            normalized["max_chars"] = max(1, int(entry["max_chars"]))
+        except (TypeError, ValueError):
+            pass
+    return normalized
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    """Return a bounded text prefix with a small truncation marker."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    marker = "\n\n[Truncated for bundle summary mode.]"
+    budget = max(1, max_chars - len(marker))
+    return text[:budget].rstrip() + marker
+
+
+def _skill_summary_content(loaded_skill: Dict[str, Any]) -> str:
+    """Extract summary-mode content, preferring body text over frontmatter."""
+    content = str(loaded_skill.get("content") or "").strip()
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) == 3:
+            content = parts[2].strip()
+    lines = content.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and lines[0].lstrip().startswith("#"):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _build_summary_skill_message(
+    loaded_skill: Dict[str, Any],
+    skill_name: str,
+    activation_note: str,
+    max_chars: int,
+) -> str:
+    """Format a compact bundle skill payload with an explicit escalation path."""
+    content = _truncate_text(_skill_summary_content(loaded_skill), max_chars)
+    description = str(loaded_skill.get("description") or "").strip()
+    parts = [
+        activation_note,
+        f"[Summary-loaded skill: {skill_name}. This bundle intentionally loaded a bounded excerpt to reduce Discord-turn latency and token cost.]",
+        (
+            f'If the task depends on details not present here, call skill_view(name="{skill_name}") '
+            "before acting."
+        ),
+    ]
+    if description:
+        parts.append(f"Description: {description}")
+    if content:
+        parts.extend(["", content])
+    return "\n".join(parts)
+
+
 def _load_bundle_file(path: Path) -> Optional[Dict[str, Any]]:
     """Parse a single bundle YAML file. Returns ``None`` on any error.
 
@@ -138,12 +294,15 @@ def _load_bundle_file(path: Path) -> Optional[Dict[str, Any]]:
         logger.warning("Bundle %s has no name; skipping", path)
         return None
 
-    skills = data.get("skills") or []
-    if not isinstance(skills, list) or not skills:
+    raw_skills = data.get("skills") or []
+    if not isinstance(raw_skills, list) or not raw_skills:
         logger.warning("Bundle %s has no skills list; skipping", path)
         return None
-    skills = [str(s).strip() for s in skills if str(s).strip()]
-    if not skills:
+    skill_entries = [
+        entry for entry in (_normalize_skill_entry(s) for s in raw_skills) if entry
+    ]
+    skills = [entry["name"] for entry in skill_entries]
+    if not skill_entries:
         logger.warning("Bundle %s has empty skills list; skipping", path)
         return None
 
@@ -160,6 +319,7 @@ def _load_bundle_file(path: Path) -> Optional[Dict[str, Any]]:
         "slug": slug,
         "description": description or f"Load {len(skills)} skills as a bundle",
         "skills": skills,
+        "skill_entries": skill_entries,
         "instruction": instruction,
         "path": str(path),
     }
@@ -210,12 +370,19 @@ def resolve_bundle_command_key(command: str) -> Optional[str]:
 
     Hyphens and underscores are treated interchangeably to mirror the
     skill-command behavior (Telegram converts hyphens to underscores in
-    bot command names).
+    bot command names). Deprecated Biff bundle aliases resolve to their
+    canonical targets only when those targets exist in the active bundle set.
     """
     if not command:
         return None
-    cmd_key = f"/{command.replace('_', '-')}"
-    return cmd_key if cmd_key in get_skill_bundles() else None
+    slug = _slugify(command.lstrip("/"))
+    if not slug:
+        return None
+    cmd_key = f"/{slug}"
+    if cmd_key in get_skill_bundles():
+        return cmd_key
+    alias = get_deprecated_bundle_alias(slug)
+    return alias["target_key"] if alias else None
 
 
 def reload_bundles() -> Dict[str, Any]:
@@ -254,6 +421,7 @@ def build_bundle_invocation_message(
     cmd_key: str,
     user_instruction: str = "",
     task_id: str | None = None,
+    invoked_key: str | None = None,
 ) -> Optional[Tuple[str, List[str], List[str]]]:
     """Build the user message content for a bundle slash command invocation.
 
@@ -266,7 +434,13 @@ def build_bundle_invocation_message(
     ``-s`` CLI preloading.
     """
     bundles = get_skill_bundles()
-    info = bundles.get(cmd_key)
+    deprecation = get_deprecated_bundle_alias(invoked_key or cmd_key)
+    canonical_key = deprecation["target_key"] if deprecation else cmd_key
+    info = bundles.get(canonical_key)
+    if not info:
+        resolved_key = resolve_bundle_command_key(canonical_key)
+        info = bundles.get(resolved_key or "")
+        canonical_key = resolved_key or canonical_key
     if not info:
         return None
 
@@ -280,11 +454,15 @@ def build_bundle_invocation_message(
     seen: set[str] = set()
 
     bundle_name = info["name"]
-    skills = info["skills"]
+    skill_entries = info.get("skill_entries") or [
+        {"name": str(skill_id).strip(), "mode": "full"}
+        for skill_id in info.get("skills", [])
+        if str(skill_id).strip()
+    ]
     extra_instruction = info.get("instruction") or ""
 
-    for skill_id in skills:
-        identifier = (skill_id or "").strip()
+    for skill_entry in skill_entries:
+        identifier = str(skill_entry.get("name") or "").strip()
         if not identifier or identifier in seen:
             continue
         seen.add(identifier)
@@ -304,14 +482,25 @@ def build_bundle_invocation_message(
         activation_note = (
             f'[Loaded as part of the "{bundle_name}" skill bundle.]'
         )
-        skill_blocks.append(
-            _build_skill_message(
-                loaded_skill,
-                skill_dir,
-                activation_note,
-                session_id=task_id,
+        if skill_entry.get("mode") == "summary":
+            max_chars = int(skill_entry.get("max_chars") or _DEFAULT_SUMMARY_MAX_CHARS)
+            skill_blocks.append(
+                _build_summary_skill_message(
+                    loaded_skill,
+                    skill_name,
+                    activation_note,
+                    max_chars=max_chars,
+                )
             )
-        )
+        else:
+            skill_blocks.append(
+                _build_skill_message(
+                    loaded_skill,
+                    skill_dir,
+                    activation_note,
+                    session_id=task_id,
+                )
+            )
         loaded_names.append(skill_name)
 
     if not skill_blocks:
@@ -327,6 +516,16 @@ def build_bundle_invocation_message(
         f"Bundle: {bundle_name}",
         f"Skills loaded: {', '.join(loaded_names)}",
     ]
+    if deprecation:
+        header_lines.extend([
+            "",
+            (
+                f"Deprecated bundle alias: {deprecation['alias_key']} → "
+                f"{deprecation['target_key']}. Use {deprecation['target_key']} "
+                "for new invocations."
+            ),
+            f"Deprecation reason: {deprecation['reason']}",
+        ])
     if missing:
         header_lines.append(f"Skills missing (skipped): {', '.join(missing)}")
     if extra_instruction:
@@ -405,6 +604,6 @@ def delete_bundle(name: str) -> Path:
 
 
 def get_bundle(name: str) -> Optional[Dict[str, Any]]:
-    """Look up a bundle by name (slug-normalized)."""
-    slug = _slugify(name)
-    return get_skill_bundles().get(f"/{slug}")
+    """Look up a bundle by name (slug-normalized), including active aliases."""
+    key = resolve_bundle_command_key(name)
+    return get_skill_bundles().get(key or "")

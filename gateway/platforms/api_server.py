@@ -34,6 +34,8 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+import html
+import ipaddress
 import json
 import logging
 import os
@@ -69,6 +71,8 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+_TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -106,6 +110,33 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _coerce_config_bool(value: Any, default: bool = False) -> bool:
+    """Normalize bool-ish config/env values without treating arbitrary strings as true."""
+    return _coerce_request_bool(value, default=default)
+
+
+def _parse_ip_networks(value: Any) -> tuple[Any, ...]:
+    """Parse comma/list IPs or CIDRs; invalid entries are ignored fail-closed by callers."""
+    if not value:
+        return ()
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        items = [value]
+    networks = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(text, strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid API server IP/CIDR entry: %s", text)
+    return tuple(networks)
 
 
 def _normalize_chat_content(
@@ -705,7 +736,31 @@ class APIServerAdapter(BasePlatformAdapter):
         if raw_port is None:
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
-        self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        # Fast Biff's user-facing/browser auth is named ``biff_api_key`` so it
+        # does not look like a model-provider/OpenRouter credential.  Keep the
+        # legacy ``key`` / ``API_SERVER_KEY`` fallbacks for existing generic API
+        # server clients and deployments.
+        self._api_key: str = str(
+            extra.get("biff_api_key")
+            or extra.get("key")
+            or os.getenv("BIFF_API_KEY")
+            or os.getenv("API_SERVER_KEY", "")
+        )
+        self._fast_biff_enabled: bool = _coerce_config_bool(
+            extra.get("fast_biff_enabled", os.getenv("API_SERVER_FAST_BIFF_ENABLED")),
+            default=False,
+        )
+        self._fast_biff_tailnet_only: bool = _coerce_config_bool(
+            extra.get("fast_biff_tailnet_only", os.getenv("API_SERVER_FAST_BIFF_TAILNET_ONLY")),
+            default=True,
+        )
+        self._fast_biff_trusted_proxies = _parse_ip_networks(
+            extra.get("fast_biff_trusted_proxies", os.getenv("API_SERVER_FAST_BIFF_TRUSTED_PROXIES", ""))
+        )
+        self._fast_biff_session_prefix: str = str(
+            extra.get("fast_biff_session_prefix", os.getenv("API_SERVER_FAST_BIFF_SESSION_PREFIX", "fast-biff"))
+            or "fast-biff"
+        ).strip()
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -849,6 +904,275 @@ class APIServerAdapter(BasePlatformAdapter):
         return origin
 
     # ------------------------------------------------------------------
+    # Fast Biff tailnet helper
+    # ------------------------------------------------------------------
+
+    def _request_peer_ip(self, request: "web.Request") -> Optional[Any]:
+        transport = getattr(request, "transport", None)
+        if transport is None:
+            return None
+        peername = transport.get_extra_info("peername")
+        if isinstance(peername, tuple) and peername:
+            try:
+                return ipaddress.ip_address(str(peername[0]))
+            except ValueError:
+                return None
+        return None
+
+    def _request_client_ip(self, request: "web.Request") -> Optional[Any]:
+        peer_ip = self._request_peer_ip(request)
+        forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        if forwarded_for and peer_ip is not None:
+            trusted_proxy = peer_ip.is_loopback or any(peer_ip in network for network in self._fast_biff_trusted_proxies)
+            if trusted_proxy:
+                try:
+                    return ipaddress.ip_address(forwarded_for)
+                except ValueError:
+                    return None
+        return peer_ip
+
+    @staticmethod
+    def _ip_allowed_for_fast_biff(client_ip: Optional[Any]) -> bool:
+        if client_ip is None:
+            return False
+        return client_ip.is_loopback or client_ip in _TAILSCALE_CGNAT
+
+    @staticmethod
+    def _audit_ip_hash(client_ip: Optional[Any]) -> str:
+        if client_ip is None:
+            return "unknown"
+        return hashlib.sha256(str(client_ip).encode()).hexdigest()[:12]
+
+    @staticmethod
+    def _audit_session_hash(session_id: str) -> str:
+        if not session_id:
+            return "-"
+        return hashlib.sha256(session_id.encode()).hexdigest()[:12]
+
+    def _audit_fast_biff(self, event: str, request: "web.Request", *, status: int, session_id: str = "") -> None:
+        client_ip = self._request_client_ip(request)
+        logger.info(
+            "fast_biff.audit event=%s status=%s client_ip_hash=%s session_hash=%s path=%s",
+            event,
+            status,
+            self._audit_ip_hash(client_ip),
+            self._audit_session_hash(session_id),
+            request.path,
+        )
+
+    def _check_fast_biff_gate(self, request: "web.Request") -> Optional["web.Response"]:
+        if not self._fast_biff_enabled:
+            self._audit_fast_biff("disabled", request, status=503)
+            return web.json_response(
+                _openai_error("Fast Biff API is disabled by configuration.", code="fast_biff_disabled"),
+                status=503,
+            )
+        if not self._api_key:
+            self._audit_fast_biff("auth_missing", request, status=401)
+            return web.json_response(
+                _openai_error("Fast Biff API requires biff_api_key bearer authentication.", code="fast_biff_auth_required"),
+                status=401,
+            )
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            self._audit_fast_biff("auth_denied", request, status=401)
+            return auth_err
+        if self._fast_biff_tailnet_only:
+            client_ip = self._request_client_ip(request)
+            if not self._ip_allowed_for_fast_biff(client_ip):
+                self._audit_fast_biff("tailnet_denied", request, status=403)
+                return web.json_response(
+                    _openai_error(
+                        "Fast Biff API accepts only loopback or Tailscale 100.64.0.0/10 clients.",
+                        code="fast_biff_tailnet_required",
+                    ),
+                    status=403,
+                )
+        return None
+
+    def _check_fast_biff_ui_gate(self, request: "web.Request") -> Optional["web.Response"]:
+        """Gate the beta browser shell without requiring the bearer token to fetch HTML."""
+        if not self._fast_biff_enabled:
+            self._audit_fast_biff("ui_disabled", request, status=503)
+            return web.Response(text="Fast Biff beta UI is disabled.", status=503, content_type="text/plain")
+        if self._fast_biff_tailnet_only:
+            client_ip = self._request_client_ip(request)
+            if not self._ip_allowed_for_fast_biff(client_ip):
+                self._audit_fast_biff("ui_tailnet_denied", request, status=403)
+                return web.Response(
+                    text="Fast Biff beta UI accepts only loopback or Tailscale clients.",
+                    status=403,
+                    content_type="text/plain",
+                )
+        return None
+
+    def _fast_biff_session_id(self, request: "web.Request", body: Dict[str, Any]) -> tuple[Optional[str], Optional["web.Response"]]:
+        raw = str(
+            body.get("session_id")
+            or request.headers.get("X-Hermes-Session-Id", "")
+            or ""
+        ).strip()
+        if raw:
+            if re.search(r'[\r\n\x00]', raw) or len(raw) > self._MAX_SESSION_HEADER_LEN:
+                return None, web.json_response(_openai_error("Invalid session ID"), status=400)
+            return raw, None
+        client_ip = self._request_client_ip(request)
+        key = f"{self._fast_biff_session_prefix}:{self._audit_ip_hash(client_ip)}"
+        return key[: self._MAX_SESSION_HEADER_LEN], None
+
+    async def _handle_fast_biff_ui(self, request: "web.Request") -> "web.Response":
+        """GET / — tiny iOS-friendly beta chat UI for the tailnet Fast Biff API."""
+        gate_err = self._check_fast_biff_ui_gate(request)
+        if gate_err is not None:
+            return gate_err
+
+        session_prefix = html.escape(self._fast_biff_session_prefix or "fast-biff", quote=True)
+        nonce = uuid.uuid4().hex
+        page = f'''<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Fast Biff Beta</title>
+  <style nonce="{nonce}">
+    :root {{ color-scheme: dark; --bg:#080b12; --panel:#111827; --line:#263044; --text:#f7f7fb; --muted:#a9b2c7; --accent:#8bd3ff; --bad:#ff9d9d; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; min-height:100dvh; font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:linear-gradient(180deg,#080b12,#101827); color:var(--text); }}
+    main {{ max-width:820px; margin:0 auto; min-height:100dvh; display:flex; flex-direction:column; padding:16px max(14px,env(safe-area-inset-right)) calc(14px + env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left)); gap:12px; }}
+    header {{ padding:8px 2px 2px; }} h1 {{ font-size:1.35rem; margin:.1rem 0; }} p {{ color:var(--muted); margin:.25rem 0 0; }}
+    #log {{ flex:1; overflow:auto; border:1px solid var(--line); border-radius:18px; background:rgba(17,24,39,.76); padding:12px; display:flex; flex-direction:column; gap:10px; }}
+    .msg {{ white-space:pre-wrap; padding:10px 12px; border-radius:14px; max-width:94%; }} .me {{ align-self:flex-end; background:#1d4f70; }} .biff {{ align-self:flex-start; background:#182236; }} .sys {{ align-self:center; color:var(--muted); font-size:.9rem; }} .err {{ color:var(--bad); }}
+    form {{ display:grid; grid-template-columns:1fr auto; gap:8px; }} textarea,input,button {{ font:inherit; border-radius:14px; border:1px solid var(--line); }} textarea,input {{ width:100%; background:#0f1726; color:var(--text); padding:11px; }} textarea {{ min-height:68px; resize:vertical; }}
+    .row {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }} .auth-row {{ grid-template-columns:1fr auto auto; }} button {{ background:var(--accent); color:#031421; font-weight:700; padding:0 16px; min-height:48px; }} button:disabled {{ opacity:.55; }}
+    small {{ color:var(--muted); }} @media (max-width:640px) {{ .row, form {{ grid-template-columns:1fr; }} button {{ width:100%; }} }}
+  </style>
+</head>
+<body>
+<main>
+  <header><h1>Fast Biff Beta</h1><p>Tailnet-only Safari chat shell. Biff key stays in this browser; Discord remains the fallback.</p></header>
+  <form id="auth" class="row auth-row" autocomplete="off">
+    <input id="token" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="biff_api_key" aria-label="Biff API key" type="password">
+    <button id="saveToken" type="submit">Save Biff key</button>
+    <button id="clearToken" type="button">Clear</button>
+  </form>
+  <div class="row">
+    <input id="session" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Session ID, optional" value="{session_prefix}:ios-beta">
+    <small id="authStatus" role="status">Biff key not saved yet.</small>
+  </div>
+  <div id="log" aria-live="polite"><div class="sys">Ready. Paste biff_api_key once, press Enter or Save Biff key, then ask Biff. Keep the same Session ID to continue after a gateway restart.</div></div>
+  <form id="chat"><textarea id="message" placeholder="Ask Biff…" required></textarea><button id="send" type="submit">Send</button></form>
+  <small>Beta: one-at-a-time requests, no attachments yet, no Biff key is embedded in this page. Restart continuity: if the gateway reloads mid-request, wait for it to come back and resend with the same Session ID.</small>
+</main>
+<script nonce="{nonce}">
+const $ = (id) => document.getElementById(id);
+const log = $('log');
+const token = $('token');
+const session = $('session');
+const message = $('message');
+const send = $('send');
+const authStatus = $('authStatus');
+const saveToken = $('saveToken');
+const clearToken = $('clearToken');
+const tokenStorageKey = 'biff_api_key';
+const legacyTokenStorageKey = 'fastBiffToken';
+const sessionStorageKey = 'fastBiffSession';
+const legacyToken = localStorage.getItem(legacyTokenStorageKey) || '';
+if (!localStorage.getItem(tokenStorageKey) && legacyToken) {{ localStorage.setItem(tokenStorageKey, legacyToken); localStorage.removeItem(legacyTokenStorageKey); }}
+let savedToken = localStorage.getItem(tokenStorageKey) || '';
+token.value = savedToken;
+session.value = localStorage.getItem(sessionStorageKey) || session.value;
+function add(kind, text) {{ const el = document.createElement('div'); el.className = 'msg ' + kind; el.textContent = text; log.appendChild(el); log.scrollTop = log.scrollHeight; }}
+function setAuthStatus(text, isError) {{ authStatus.textContent = text; authStatus.className = isError ? 'err' : ''; }}
+function refreshAuthState() {{ savedToken = localStorage.getItem(tokenStorageKey) || ''; setAuthStatus(savedToken ? 'Biff key saved in this browser.' : 'Biff key not saved yet.', !savedToken); }}
+function saveAuthToken(showMessage = true) {{
+  const apiToken = token.value.trim();
+  const sessionId = session.value.trim();
+  if (!apiToken) {{ setAuthStatus('Paste biff_api_key, then press Enter or Save Biff key.', true); token.focus(); return false; }}
+  localStorage.setItem(tokenStorageKey, apiToken);
+  localStorage.setItem(sessionStorageKey, sessionId);
+  savedToken = apiToken;
+  setAuthStatus('Biff key saved in this browser.', false);
+  if (showMessage) add('sys', 'Biff key saved for this browser.');
+  message.focus();
+  return true;
+}}
+refreshAuthState();
+$('auth').addEventListener('submit', (event) => {{ event.preventDefault(); saveAuthToken(true); }});
+clearToken.addEventListener('click', () => {{
+  localStorage.removeItem(tokenStorageKey);
+  savedToken = '';
+  token.value = '';
+  refreshAuthState();
+  localStorage.removeItem(legacyTokenStorageKey);
+  add('sys', 'Biff key cleared from this browser.');
+  token.focus();
+}});
+token.addEventListener('keydown', (event) => {{
+  if (event.key === 'Enter') {{ event.preventDefault(); saveAuthToken(true); }}
+}});
+token.addEventListener('input', () => {{
+  if (token.value.trim() !== savedToken) setAuthStatus('Unsaved Biff key — press Enter or Save Biff key.', true);
+  else refreshAuthState();
+}});
+session.addEventListener('keydown', (event) => {{
+  if (event.key === 'Enter') {{ event.preventDefault(); localStorage.setItem(sessionStorageKey, session.value.trim()); message.focus(); }}
+}});
+session.addEventListener('change', () => localStorage.setItem(sessionStorageKey, session.value.trim()));
+$('chat').addEventListener('submit', async (event) => {{
+  event.preventDefault();
+  const text = message.value.trim(); const sessionId = session.value.trim();
+  if (!text) return;
+  let apiToken = savedToken || localStorage.getItem(tokenStorageKey) || '';
+  if (!apiToken) {{
+    if (!saveAuthToken(false)) {{ add('sys err', 'No biff_api_key saved. Paste it at the top and press Enter or Save Biff key.'); return; }}
+    apiToken = savedToken;
+  }}
+  if (token.value.trim() && token.value.trim() !== apiToken) {{
+    if (!saveAuthToken(false)) return;
+    apiToken = savedToken;
+  }}
+  localStorage.setItem(sessionStorageKey, sessionId);
+  add('me', text); message.value = ''; send.disabled = true; saveToken.disabled = true; clearToken.disabled = true; send.textContent = 'Thinking…';
+  setAuthStatus('Request running…', false);
+  try {{
+    const resp = await fetch('/biff/v1/chat', {{ method:'POST', headers: {{ 'Authorization':'Bearer ' + apiToken, 'Content-Type':'application/json', 'X-Hermes-Session-Key': sessionId || 'fast-biff:web-beta' }}, body: JSON.stringify({{ message: text, session_id: sessionId || undefined }}) }});
+    const data = await resp.json().catch(() => ({{ error: {{ message: 'Non-JSON response from server' }} }}));
+    if (!resp.ok) {{
+      if (resp.status === 401) {{ localStorage.removeItem(tokenStorageKey); localStorage.removeItem(legacyTokenStorageKey); savedToken = ''; refreshAuthState(); setAuthStatus('Invalid biff_api_key. Paste the current Biff key and Save again.', true); }}
+      else setAuthStatus('Server error: HTTP ' + resp.status, true);
+      throw new Error(data?.error?.message || ('HTTP ' + resp.status));
+    }}
+    if (data.session_id) {{ session.value = data.session_id; localStorage.setItem(sessionStorageKey, data.session_id); }}
+    refreshAuthState();
+    add('biff', data.message || '(empty response)');
+  }} catch (err) {{
+    const msg = String(err?.message || err || '');
+    if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('Load failed')) {{
+      setAuthStatus('Gateway unavailable or restarting. Wait a moment, then resend with the same Session ID.', true);
+      add('sys err', 'Gateway unavailable or restarting. Your Biff key and Session ID are still saved here; wait a moment, then resend to continue.');
+    }} else {{
+      add('sys err', 'Error: ' + (err?.message || err));
+    }}
+  }}
+  finally {{ send.disabled = false; saveToken.disabled = false; clearToken.disabled = false; send.textContent = 'Send'; message.focus(); }}
+}});
+</script>
+</body>
+</html>'''
+        self._audit_fast_biff("ui_served", request, status=200)
+        csp = (
+            "default-src 'none'; "
+            f"script-src 'nonce-{nonce}'; "
+            f"style-src 'nonce-{nonce}'; "
+            "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+        )
+        return web.Response(
+            text=page,
+            content_type="text/html",
+            headers={"Cache-Control": "no-store", "Content-Security-Policy": csp},
+        )
+
+    # ------------------------------------------------------------------
     # Auth helper
     # ------------------------------------------------------------------
 
@@ -974,6 +1298,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        biff_operating_mode_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -992,6 +1317,11 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
+        from gateway.session_hygiene import (
+            biff_operating_mode_prompt,
+            filter_biff_mode_enabled_toolsets,
+            resolve_biff_operating_mode,
+        )
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
@@ -999,9 +1329,35 @@ class APIServerAdapter(BasePlatformAdapter):
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        biff_mode = resolve_biff_operating_mode(user_config, "api_server")
+        if biff_operating_mode_override:
+            # Request/proxy-provided mode may only tighten the configured
+            # posture, never relax it. A direct API caller must not be able to
+            # downgrade configured evidence-only into normal and regain
+            # mutating toolsets.
+            _biff_cfg = user_config.get("biff") if isinstance(user_config.get("biff"), dict) else {}
+            requested_mode = resolve_biff_operating_mode(
+                {**user_config, "biff": {**_biff_cfg, "operating_mode": biff_operating_mode_override}},
+                "api_server",
+            )
+            _mode_rank = {"normal": 0, "economy": 1, "emergency": 2, "evidence-only": 3}
+            if _mode_rank.get(requested_mode.name, 0) > _mode_rank.get(biff_mode.name, 0):
+                biff_mode = requested_mode
+        enabled_toolsets = filter_biff_mode_enabled_toolsets(
+            biff_mode,
+            sorted(_get_platform_tools(user_config, "api_server")),
+        )
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+        if biff_mode.max_iterations is not None:
+            max_iterations = min(max_iterations, int(biff_mode.max_iterations))
+        mode_prompt = biff_operating_mode_prompt(biff_mode)
+        if mode_prompt:
+            ephemeral_system_prompt = (
+                ((ephemeral_system_prompt or "") + "\n\n" + mode_prompt).strip()
+                if ephemeral_system_prompt
+                else mode_prompt
+            )
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -1056,6 +1412,93 @@ class APIServerAdapter(BasePlatformAdapter):
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
         })
+
+    async def _handle_fast_biff_chat(self, request: "web.Request") -> "web.Response":
+        """POST /biff/v1/chat — small direct Biff chat surface for tailnet clients."""
+        gate_err = self._check_fast_biff_gate(request)
+        if gate_err is not None:
+            return gate_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            self._audit_fast_biff("bad_json", request, status=400)
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+        if not isinstance(body, dict):
+            self._audit_fast_biff("bad_request", request, status=400)
+            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+
+        message = body.get("message") or body.get("input")
+        if not isinstance(message, str) or not message.strip():
+            self._audit_fast_biff("bad_request", request, status=400)
+            return web.json_response(_openai_error("Missing non-empty 'message' field"), status=400)
+
+        session_id, session_err = self._fast_biff_session_id(request, body)
+        if session_err is not None:
+            self._audit_fast_biff("bad_session", request, status=400)
+            return session_err
+
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            self._audit_fast_biff("bad_session_key", request, status=403, session_id=session_id or "")
+            return key_err
+
+        instructions = body.get("instructions")
+        if instructions is not None and not isinstance(instructions, str):
+            self._audit_fast_biff("bad_request", request, status=400, session_id=session_id or "")
+            return web.json_response(_openai_error("'instructions' must be a string when provided"), status=400)
+
+        prompt = (
+            "Fast Biff direct tailnet API turn. Treat this as Marco talking to Biff from a trusted tailnet device. "
+            "Keep Discord as the fallback for notifications and locked-down/non-tailnet contexts."
+        )
+        if instructions:
+            prompt = f"{prompt}\n\nCaller instructions:\n{instructions.strip()}"
+
+        self._audit_fast_biff("accepted", request, status=202, session_id=session_id or "")
+        try:
+            result, usage = await self._run_agent(
+                user_message=message.strip(),
+                conversation_history=[],
+                ephemeral_system_prompt=prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+        except Exception as e:
+            logger.error("Error running Fast Biff chat: %s", e, exc_info=True)
+            self._audit_fast_biff("failed", request, status=500, session_id=session_id or "")
+            return web.json_response(_openai_error(f"Internal server error: {e}", err_type="server_error"), status=500)
+
+        completed = bool(result.get("completed", True))
+        failed = bool(result.get("failed"))
+        partial = bool(result.get("partial"))
+        status = 200 if completed and not failed else 502
+        self._audit_fast_biff("completed" if status == 200 else "incomplete", request, status=status, session_id=session_id or "")
+        response_session_id = result.get("session_id", session_id)
+        response_headers = {"X-Hermes-Session-Id": response_session_id or ""}
+        if gateway_session_key:
+            response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        return web.json_response(
+            {
+                "id": f"biffchat-{uuid.uuid4().hex[:24]}",
+                "object": "biff.chat.completion",
+                "created": int(time.time()),
+                "session_id": response_session_id,
+                "message": result.get("final_response") or "",
+                "usage": usage,
+                "hermes": {"completed": completed, "failed": failed, "partial": partial, "error": result.get("error")},
+                "continuity": {
+                    "session_id": response_session_id,
+                    "session_key": gateway_session_key or None,
+                    "restart_semantics": (
+                        "Reuse this session_id after a gateway restart. Completed turns are persisted; "
+                        "if a restart interrupts an in-flight request, retry the user message with the same session_id."
+                    ),
+                },
+            },
+            status=status,
+            headers=response_headers,
+        )
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
@@ -1117,6 +1560,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "fast_biff_chat": self._fast_biff_enabled,
+                "fast_biff_tailnet_only": self._fast_biff_tailnet_only,
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
@@ -1138,6 +1583,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
+                "fast_biff_chat": {"method": "POST", "path": "/biff/v1/chat"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
@@ -1700,6 +2146,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        biff_operating_mode_override = body.get("hermes_biff_operating_mode")
+        if biff_operating_mode_override is not None:
+            biff_operating_mode_override = str(biff_operating_mode_override)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -1880,6 +2329,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                biff_operating_mode_override=biff_operating_mode_override,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1899,6 +2349,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                biff_operating_mode_override=biff_operating_mode_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2071,9 +2522,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_running_loop()
+            poll_timeout = min(0.5, max(0.001, float(CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)))
             while True:
                 try:
-                    delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
+                    delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=poll_timeout))
                 except _q.Empty:
                     if agent_task.done():
                         # Drain any remaining items
@@ -3447,6 +3899,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        biff_operating_mode_override: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3470,6 +3923,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
+                biff_operating_mode_override=biff_operating_mode_override,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -4106,6 +4560,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/", self._handle_fast_biff_ui)
+            self._app.router.add_get("/biff", self._handle_fast_biff_ui)
+            self._app.router.add_post("/biff/v1/chat", self._handle_fast_biff_chat)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)

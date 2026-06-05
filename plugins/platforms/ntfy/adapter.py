@@ -157,6 +157,20 @@ class NtfyAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    # Characters that constitute "silent" content — content matching ONLY
+    # these characters (under SILENT_MAX_LENGTH) is dropped without posting.
+    _SILENT_CHARS: set = set(".·—–_-⋯… ")
+    _SILENT_MAX_LENGTH: int = 3
+
+    @staticmethod
+    def _is_silent_content(content: str) -> bool:
+        """Return True if content is trivially small noise that shouldn't be posted."""
+        if len(content) > NtfyAdapter._SILENT_MAX_LENGTH:
+            return False
+        stripped = content.strip()
+        if not stripped:
+            return True
+        return all(c in NtfyAdapter._SILENT_CHARS for c in stripped)
 
     def __init__(self, config: PlatformConfig):
         platform = Platform("ntfy")
@@ -388,6 +402,11 @@ class NtfyAdapter(BasePlatformAdapter):
         """Publish a message to the configured publish topic."""
         metadata = metadata or {}
         publish_topic = metadata.get("publish_topic") or self._publish_topic or chat_id
+
+        # Drop silent/noise content without posting to ntfy
+        if self._is_silent_content(content):
+            logger.debug("[%s] Dropping silent content (len=%d): %r", self.name, len(content), content)
+            return SendResult(success=True, message_id="__silent_dropped__")
 
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")

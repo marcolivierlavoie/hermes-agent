@@ -13,7 +13,9 @@ Tests cover:
 """
 
 import asyncio
+import ipaddress
 import json
+import logging
 import os
 import stat
 import time
@@ -301,6 +303,61 @@ class TestAdapterInit:
         adapter = APIServerAdapter(config)
         assert adapter._port == 8642
 
+    def test_biff_api_key_preferred_over_generic_api_server_key(self, monkeypatch):
+        monkeypatch.setenv("API_SERVER_KEY", "generic-server-token")
+        monkeypatch.setenv("BIFF_API_KEY", "biff-env-token")
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"biff_api_key": "biff-config-token", "key": "legacy-config-token"},
+            )
+        )
+
+        assert adapter._api_key == "biff-config-token"
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_ui_has_explicit_key_save_and_chat_auth_flow(self, monkeypatch):
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"fast_biff_enabled": True, "key": "sk-test"},
+            )
+        )
+        monkeypatch.setattr(adapter, "_check_fast_biff_ui_gate", lambda request: None)
+        monkeypatch.setattr(adapter, "_audit_fast_biff", lambda *args, **kwargs: None)
+
+        request = MagicMock()
+        request.path = "/biff"
+        response = await adapter._handle_fast_biff_ui(request)
+        html_text = response.text
+
+        assert response.status == 200
+        assert response.content_type == "text/html"
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "<form id=\"auth\"" in html_text
+        assert "placeholder=\"biff_api_key\"" in html_text
+        assert "aria-label=\"Biff API key\"" in html_text
+        assert "<button id=\"saveToken\" type=\"submit\">Save Biff key</button>" in html_text
+        assert "<button id=\"clearToken\" type=\"button\">Clear</button>" in html_text
+        assert "clearToken.addEventListener('click'" in html_text
+        assert "token.addEventListener('keydown'" in html_text
+        assert "event.key === 'Enter'" in html_text
+        assert "const tokenStorageKey = 'biff_api_key';" in html_text
+        assert "const legacyTokenStorageKey = 'fastBiffToken';" in html_text
+        assert "localStorage.setItem(tokenStorageKey, apiToken)" in html_text
+        assert "No biff_api_key saved. Paste it at the top and press Enter or Save Biff key." in html_text
+        assert "'Authorization':'Bearer ' + apiToken" in html_text
+        assert "fetch('/biff/v1/chat'" in html_text
+        assert "localStorage.removeItem(tokenStorageKey)" in html_text
+        assert "Invalid biff_api_key. Paste the current Biff key and Save again." in html_text
+        assert "Server error: HTTP " in html_text
+        assert "Request running…" in html_text
+        assert "Keep the same Session ID to continue after a gateway restart." in html_text
+        assert "Gateway unavailable or restarting. Your Biff key and Session ID are still saved here" in html_text
+        assert "API_SERVER_KEY" not in html_text
+        assert "OpenRouter" not in html_text
+        assert "sk-test" not in html_text
+
     def test_create_agent_forwards_config_reasoning_effort(self, monkeypatch):
         captured = {}
 
@@ -336,6 +393,74 @@ class TestAdapterInit:
 
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+
+    def test_create_agent_applies_biff_evidence_only_mode(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.delenv("HERMES_BIFF_MODE", raising=False)
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {"provider": "test"})
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "test-model")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"biff": {"operating_mode": "normal"}})
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda: None))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_: {"terminal", "file", "browser", "search", "web", "session_search", "vision"},
+        )
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(
+            session_id="api-session",
+            ephemeral_system_prompt="caller system",
+            biff_operating_mode_override="evidence-only",
+        )
+
+        assert isinstance(agent, FakeAgent)
+        assert captured["max_iterations"] == 8
+        assert captured["enabled_toolsets"] == ["search", "session_search", "vision", "web"]
+        assert "caller system" in captured["ephemeral_system_prompt"]
+        assert "Active Biff operating mode is Evidence-only" in captured["ephemeral_system_prompt"]
+        assert "terminal" not in captured["enabled_toolsets"]
+
+    def test_create_agent_biff_mode_override_cannot_relax_config(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.delenv("HERMES_BIFF_MODE", raising=False)
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {"provider": "test"})
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "test-model")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"biff": {"operating_mode": "evidence-only"}})
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda: None))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_: {"terminal", "file", "search", "web"},
+        )
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        adapter._create_agent(
+            session_id="api-session",
+            biff_operating_mode_override="normal",
+        )
+
+        assert captured["max_iterations"] == 8
+        assert captured["enabled_toolsets"] == ["search", "web"]
+        assert "Active Biff operating mode is Evidence-only" in captured["ephemeral_system_prompt"]
+        assert "terminal" not in captured["enabled_toolsets"]
+        assert "file" not in captured["enabled_toolsets"]
 
 
 # ---------------------------------------------------------------------------
@@ -391,9 +516,9 @@ class TestAuth:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
+def _make_adapter(api_key: str = "", cors_origins=None, extra_overrides=None) -> APIServerAdapter:
     """Create an adapter with optional API key."""
-    extra = {}
+    extra = dict(extra_overrides or {})
     if api_key:
         extra["key"] = api_key
     if cors_origins is not None:
@@ -412,6 +537,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_get("/", adapter._handle_fast_biff_ui)
+    app.router.add_get("/biff", adapter._handle_fast_biff_ui)
+    app.router.add_post("/biff/v1/chat", adapter._handle_fast_biff_chat)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -429,6 +557,202 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+# ---------------------------------------------------------------------------
+# Fast Biff direct tailnet endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestFastBiffEndpoint:
+    @pytest.mark.asyncio
+    async def test_fast_biff_ui_disabled_by_default(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": False})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/")
+            text = await resp.text()
+        assert resp.status == 503
+        assert "disabled" in text.lower()
+        assert "fast_biff.audit event=ui_disabled" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_ui_serves_mobile_shell_without_embedding_secret(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/biff")
+            text = await resp.text()
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("text/html")
+        assert resp.headers["Cache-Control"] == "no-store"
+        csp = resp.headers["Content-Security-Policy"]
+        assert "default-src 'none'" in csp
+        assert "connect-src 'self'" in csp
+        assert "script-src 'nonce-" in csp
+        assert "style-src 'nonce-" in csp
+        assert "Fast Biff Beta" in text
+        assert "viewport-fit=cover" in text
+        assert "<script nonce=" in text
+        assert "<style nonce=" in text
+        assert "fetch('/biff/v1/chat'" in text
+        assert "Bearer " in text
+        assert "Restart continuity: if the gateway reloads mid-request" in text
+        assert "same Session ID" in text
+        assert "sk-secret" not in text
+        assert "fast_biff.audit event=ui_served" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_ui_tailnet_gate_rejects_untrusted_forwarded_client(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/", headers={"X-Forwarded-For": "8.8.8.8"})
+            text = await resp.text()
+        assert resp.status == 403
+        assert "Tailscale" in text
+        assert "fast_biff.audit event=ui_tailnet_denied" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_default_is_kill_switch(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": False})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/biff/v1/chat",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"message": "ping"},
+            )
+            body = await resp.json()
+        assert resp.status == 503
+        assert body["error"]["code"] == "fast_biff_disabled"
+        assert "fast_biff.audit event=disabled" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_requires_bearer_auth_even_on_loopback(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/biff/v1/chat", json={"message": "ping"})
+            body = await resp.json()
+        assert resp.status == 401
+        assert body["error"]["code"] == "invalid_api_key"
+        assert "fast_biff.audit event=auth_denied" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_tailnet_guard_rejects_untrusted_forwarded_client(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/biff/v1/chat",
+                headers={"Authorization": "Bearer sk-secret", "X-Forwarded-For": "8.8.8.8"},
+                json={"message": "ping"},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["error"]["code"] == "fast_biff_tailnet_required"
+        assert "fast_biff.audit event=tailnet_denied" in caplog.text
+
+    def test_fast_biff_honors_xff_only_from_configured_trusted_proxy(self):
+        adapter = _make_adapter(
+            api_key="sk-secret",
+            extra_overrides={"fast_biff_enabled": True, "fast_biff_trusted_proxies": "10.0.0.0/24"},
+        )
+        request = MagicMock()
+        request.headers = {"X-Forwarded-For": "100.90.78.109"}
+        request.transport.get_extra_info.return_value = ("10.0.0.5", 12345)
+
+        client_ip = adapter._request_client_ip(request)
+
+        assert client_ip == ipaddress.ip_address("100.90.78.109")
+        assert adapter._ip_allowed_for_fast_biff(client_ip) is True
+
+    def test_fast_biff_ignores_xff_from_untrusted_direct_peer(self):
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        request = MagicMock()
+        request.headers = {"X-Forwarded-For": "100.90.78.109"}
+        request.transport.get_extra_info.return_value = ("8.8.8.8", 12345)
+
+        client_ip = adapter._request_client_ip(request)
+
+        assert client_ip == ipaddress.ip_address("8.8.8.8")
+        assert adapter._ip_allowed_for_fast_biff(client_ip) is False
+
+    def test_fast_biff_audit_hashes_client_ip_and_session_id(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        request = MagicMock()
+        request.path = "/biff/v1/chat"
+        request.headers = {}
+        request.transport.get_extra_info.return_value = ("100.90.78.109", 12345)
+
+        adapter._audit_fast_biff("completed", request, status=200, session_id="phone-session")
+
+        assert "client_ip_hash=" in caplog.text
+        assert "session_hash=" in caplog.text
+        assert "100.90.78.109" not in caplog.text
+        assert "phone-session" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_rejects_non_object_json_body(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/biff/v1/chat",
+                headers={"Authorization": "Bearer sk-secret"},
+                json=["ping"],
+            )
+            body = await resp.json()
+        assert resp.status == 400
+        assert body["error"]["message"] == "Request body must be a JSON object"
+        assert "fast_biff.audit event=bad_request" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fast_biff_routes_to_agent_and_audits_success(self, caplog):
+        caplog.set_level(logging.INFO)
+        adapter = _make_adapter(api_key="sk-secret", extra_overrides={"fast_biff_enabled": True})
+        app = _create_app(adapter)
+        captured = {}
+
+        async def fake_run_agent(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "pong", "completed": True, "session_id": kwargs["session_id"]}, {"total_tokens": 3}
+
+        with patch.object(adapter, "_run_agent", side_effect=fake_run_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/biff/v1/chat",
+                    headers={"Authorization": "Bearer sk-secret", "X-Hermes-Session-Key": "fast-biff:phone"},
+                    json={"message": " ping ", "session_id": "phone-session"},
+                )
+                body = await resp.json()
+        assert resp.status == 200
+        assert body["object"] == "biff.chat.completion"
+        assert body["message"] == "pong"
+        assert body["session_id"] == "phone-session"
+        assert body["continuity"]["session_id"] == "phone-session"
+        assert body["continuity"]["session_key"] == "fast-biff:phone"
+        assert "Reuse this session_id after a gateway restart" in body["continuity"]["restart_semantics"]
+        assert resp.headers["X-Hermes-Session-Id"] == "phone-session"
+        assert resp.headers["X-Hermes-Session-Key"] == "fast-biff:phone"
+        assert captured["user_message"] == "ping"
+        assert captured["conversation_history"] == []
+        assert captured["session_id"] == "phone-session"
+        assert captured["gateway_session_key"] == "fast-biff:phone"
+        assert "Fast Biff direct tailnet API turn" in captured["ephemeral_system_prompt"]
+        assert "fast_biff.audit event=accepted" in caplog.text
+        assert "fast_biff.audit event=completed" in caplog.text
+        assert "session_hash=" in caplog.text
+        assert "phone-session" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

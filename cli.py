@@ -2988,6 +2988,24 @@ def build_bundle_invocation_message(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+def resolve_bundle_command_key(command: str) -> Optional[str]:
+    from agent.skill_bundles import resolve_bundle_command_key as _impl
+
+    return _impl(command)
+
+
+def get_deprecated_bundle_alias(command: str) -> Optional[dict]:
+    from agent.skill_bundles import get_deprecated_bundle_alias as _impl
+
+    return _impl(command)
+
+
+def get_deprecated_biff_bundle_aliases() -> dict:
+    from agent.skill_bundles import DEPRECATED_BIFF_BUNDLE_ALIASES
+
+    return DEPRECATED_BIFF_BUNDLE_ALIASES
+
+
 def _get_plugin_cmd_handler_names() -> set:
     """Return plugin command names (without slash prefix) for dispatch matching."""
     try:
@@ -9173,14 +9191,20 @@ class HermesCLI:
                         _cprint(f"\033[1;31mPlugin command error: {e}{_RST}")
             # Skill bundles take precedence over individual skills — /<bundle>
             # loads multiple skills at once. Rescans cheaply when files change.
-            elif base_cmd in skill_bundles:
+            elif (bundle_key := resolve_bundle_command_key(base_cmd)):
                 user_instruction = cmd_original[len(base_cmd):].strip()
                 bundle_result = build_bundle_invocation_message(
-                    base_cmd, user_instruction, task_id=self.session_id
+                    bundle_key, user_instruction, task_id=self.session_id, invoked_key=base_cmd
                 )
                 if bundle_result:
                     msg, loaded_names, missing = bundle_result
-                    bundle_info = skill_bundles[base_cmd]
+                    bundle_info = get_skill_bundles()[bundle_key]
+                    alias_info = get_deprecated_bundle_alias(base_cmd)
+                    if alias_info:
+                        print(
+                            f"\n⚠️  Bundle {alias_info['alias_key']} is deprecated; "
+                            f"loading {alias_info['target_key']} instead."
+                        )
                     print(
                         f"\n⚡ Loading bundle: {bundle_info['name']} "
                         f"({len(loaded_names)} skills)"
@@ -9214,7 +9238,17 @@ class HermesCLI:
                 # that execution-time resolution agrees with tab-completion.
                 from hermes_cli.commands import COMMANDS
                 typed_base = cmd_lower.split()[0]
-                all_known = set(COMMANDS) | set(skill_commands) | set(skill_bundles)
+                deprecated_bundle_aliases = {
+                    f"/{slug}"
+                    for slug in get_deprecated_biff_bundle_aliases()
+                    if get_deprecated_bundle_alias(slug)
+                }
+                all_known = (
+                    set(COMMANDS)
+                    | set(_skill_commands)
+                    | set(get_skill_bundles())
+                    | deprecated_bundle_aliases
+                )
                 matches = [c for c in all_known if c.startswith(typed_base)]
                 if len(matches) > 1:
                     # Prefer an exact match (typed the full command name)
@@ -10046,7 +10080,7 @@ class HermesCLI:
             _cprint("  Failed to save runtime_footer setting to config.yaml")
 
     def _toggle_verbose(self):
-        """Cycle tool progress mode: off → new → all → verbose → off.
+        """Cycle tool progress mode: off → status → new → all → verbose → off.
 
         Tool-progress display (full args / results / think blocks at the
         ``verbose`` step) is INDEPENDENT of global DEBUG logging.  Cycling
@@ -10055,7 +10089,7 @@ class HermesCLI:
         explicit ``-v``/``--verbose`` flag and the ``/verbose-logging``
         toggle.  See PR #6a1aa420e for the history that decoupled them.
         """
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "status", "new", "all", "verbose"]
         try:
             idx = cycle.index(self.tool_progress_mode)
         except ValueError:
@@ -10072,6 +10106,7 @@ class HermesCLI:
         from hermes_cli.colors import Colors as _Colors
         labels = {
             "off": f"{_Colors.DIM}Tool progress: OFF{_Colors.RESET} — silent mode, just the final response.",
+            "status": f"{_Colors.BLUE}Tool progress: STATUS{_Colors.RESET} — generic working indicator, no tool names or args.",
             "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
             "all": f"{_Colors.GREEN}Tool progress: ALL{_Colors.RESET} — show every tool call.",
             "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — full args, results, and think blocks.",
@@ -11184,20 +11219,25 @@ class HermesCLI:
         if event_type != "tool.started":
             return
         if function_name and not function_name.startswith("_"):
-            from agent.display import get_tool_emoji
-            emoji = get_tool_emoji(function_name)
-            label = preview or function_name
-            from agent.display import get_tool_preview_max_len
-            _pl = get_tool_preview_max_len()
-            if _pl > 0 and len(label) > _pl:
-                label = label[:_pl - 3] + "..."
-            self._spinner_text = f"{emoji} {label}"
-            self._tool_start_time = time.monotonic()
-            # Store args for stacked scrollback line on completion
-            self._pending_tool_info.setdefault(function_name, []).append(
-                function_args if function_args is not None else {}
-            )
-            self._invalidate()
+            if self.tool_progress_mode == "status":
+                self._spinner_text = "Working…"
+                self._tool_start_time = time.monotonic()
+                self._invalidate()
+            else:
+                from agent.display import get_tool_emoji
+                emoji = get_tool_emoji(function_name)
+                label = preview or function_name
+                from agent.display import get_tool_preview_max_len
+                _pl = get_tool_preview_max_len()
+                if _pl > 0 and len(label) > _pl:
+                    label = label[:_pl - 3] + "..."
+                self._spinner_text = f"{emoji} {label}"
+                self._tool_start_time = time.monotonic()
+                # Store args for stacked scrollback line on completion
+                self._pending_tool_info.setdefault(function_name, []).append(
+                    function_args if function_args is not None else {}
+                )
+                self._invalidate()
 
     def _on_tool_start(self, tool_call_id: str, function_name: str, function_args: dict):
         """Capture local before-state for write-capable tools."""

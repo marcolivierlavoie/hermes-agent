@@ -1,0 +1,28 @@
+edge_cases:
+  - id: patio_couch_vs_cover
+    classifier: patio_exposed_furniture
+    positive_definition: visible outdoor couch/chair/cushion surface exposed to rain
+    exclusions:
+      - orange parasol fabric or umbrella canopy
+      - BBQ tarp/grill cover
+      - folded furniture cover on table
+      - shadows/reflections from wet patio
+    action_threshold: require high confidence or second evidence source before alerting
+  - id: bbq_tarp_not_person
+    classifier: person_or_pet_on_patio
+    positive_definition: human or pet shape with face/body/limb evidence in patio zone
+    exclusions:
+      - BBQ tarp contours
+      - patio furniture silhouettes
+      - parasol pole and cover folds
+      - plants moving in wind
+    action_threshold: never escalate as safety event from single low-confidence frame
+  - id: orange_parasol_not_fire
+    classifier: smoke_fire_or_flame
+    positive_definition: visible flame, smoke plume, or active burn source with temporal persistence
+    exclusions:
+      - orange parasol/canopy
+      - warm sunset reflection
+      - grill cover color patches
+      - motion blur/light bloom
+    action_threshold: ask for another frame or sensor corroboration unless obvious emergency

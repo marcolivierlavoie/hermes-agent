@@ -66,6 +66,49 @@ Shared sessions can be useful for a collaborative room, but they also mean:
 - one person's long tool-heavy task can bloat everyone else's context
 - one person's in-flight run can interrupt another person's follow-up in the same room
 
+### Operator Checklist Progress Pattern
+
+Discord defaults to quiet raw tool progress: Hermes shows typing/reactions and the final answer, but does not post a visible message for every tool call. To show only a generic reassurance bubble without exposing tool names, configure:
+
+```yaml
+display:
+  platforms:
+    discord:
+      tool_progress: "status" # options: off, status, new, all, verbose
+```
+
+Use `new`, `all`, or `verbose` only when you explicitly want raw per-tool progress for debugging.
+
+For non-trivial operator tasks, Discord-facing agents should use the compact checklist pattern instead of pasting raw tool logs or posting a message for every tool call. The reusable formatter lives at `gateway.discord_operator_checklist.format_discord_operator_checklist()` and Discord adapters expose it as `format_operator_checklist()`.
+
+Use it when:
+
+- the task will take multiple visible steps or several minutes
+- the operator benefits from knowing the current milestone
+- a blocker or decision point appears
+- the final result should show what was changed and verified
+
+Stay silent when:
+
+- the next update would only repeat that work is still running
+- a typing indicator or reaction already conveys activity
+- the content is raw command/tool output, stack traces, or logs
+- the run is short enough that a final answer is clearer
+
+Template:
+
+```text
+**OPS-123 — Discord compact operator checklist progress pattern**
+2/4 complete · active
+✅ inspect current gateway/display helpers
+🔄 define reusable Discord checklist format
+☐ document when to post vs stay silent
+☐ run focused tests/checks
+_quiet between milestones; no raw tool logs_
+```
+
+Keep checklist updates sparse: post at start for long work, edit or replace only at meaningful milestones, and prefer one final concise handoff over a stream of incremental messages.
+
 ### Interrupts and Concurrency
 
 Hermes tracks running agents by session key.
@@ -500,16 +543,17 @@ See the [Session Model](#session-model-in-discord) section above for the full im
 
 #### `display.tool_progress`
 
-**Type:** string — **Default:** `"all"` — **Values:** `off`, `new`, `all`, `verbose`
+**Type:** string — **Global default:** `"all"` — **Discord platform default:** `"off"` — **Values:** `off`, `status`, `new`, `all`, `verbose`
 
-Controls whether the bot sends progress messages in the chat while processing (e.g., "Reading file...", "Running terminal command..."). This is a global gateway setting that applies to all platforms.
+Controls whether the bot sends progress messages in the chat while processing (e.g., "Reading file...", "Running terminal command..."). Discord intentionally ignores the global raw-progress default and stays quiet unless `display.platforms.discord.tool_progress` explicitly opts in.
 
 ```yaml
 display:
-  tool_progress: "all"    # off | new | all | verbose
+  tool_progress: "all"    # off | status | new | all | verbose
 ```
 
 - `off` — no progress messages
+- `status` — one generic working indicator without tool names or arguments
 - `new` — only show the first tool call per turn
 - `all` — show all tool calls (truncated to 40 characters in gateway messages)
 - `verbose` — show full tool call details (can produce long messages)
@@ -518,7 +562,7 @@ display:
 
 **Type:** boolean — **Default:** `false`
 
-When enabled, makes the `/verbose` slash command available in the gateway, letting you cycle through tool progress modes (`off → new → all → verbose → off`) without editing config.yaml.
+When enabled, makes the `/verbose` slash command available in the gateway, letting you cycle through tool progress modes (`off → status → new → all → verbose → off`) without editing config.yaml.
 
 ```yaml
 display:

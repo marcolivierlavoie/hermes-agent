@@ -169,7 +169,7 @@ Registered when the agent is either (a) spawned by the kanban dispatcher (`HERME
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
 | `process` | Manage background processes started with terminal(background=true). Actions: 'list' (show all), 'poll' (check status + new output), 'log' (full output with pagination), 'wait' (block until done or timeout), 'kill' (terminate), 'write' (sen… | — |
-| `terminal` | Execute shell commands on a Linux environment. Filesystem persists between calls. Set `background=true` for long-running servers. Set `notify_on_complete=true` (with `background=true`) to get an automatic notification when the process finishes — no polling needed. Do NOT use cat/head/tail — use read_file. Do NOT use grep/rg/find — use search_files. | — |
+| `terminal` | Execute shell commands on a Linux environment. Filesystem persists between calls. Set `background=true` for long-running servers or commands that must outlive one tool call. For routine tests/builds, prefer foreground with a generous timeout; if background is necessary, inspect with the `process` tool and summarize instead of auto-delivering raw completion output. Do NOT use cat/head/tail — use read_file. Do NOT use grep/rg/find — use search_files. | — |
 
 ## `todo` toolset
 

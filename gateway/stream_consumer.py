@@ -26,7 +26,6 @@ from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
-from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -164,6 +163,11 @@ class GatewayStreamConsumer:
         self._adapter_requires_finalize: bool = (
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
+        # Per-response one-shot gate for Discord's New session button.  Streaming
+        # can fan one assistant reply out into several adapter.send() calls
+        # (overflow chunks, fallback continuations, commentary).  Preserve the
+        # button on the first eligible final/content bubble only.
+        self._discord_new_session_button_consumed = False
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -242,6 +246,10 @@ class GatewayStreamConsumer:
         if text:
             self._queue.put((_COMMENTARY, text))
 
+    def _adapter_supports_discord_new_session_button(self) -> bool:
+        """True when the adapter can consume Discord New-session metadata."""
+        return getattr(self.adapter, "SUPPORTS_DISCORD_NEW_SESSION_BUTTON", False) is True
+
     def _notify_new_message(self) -> None:
         """Fire the on_new_message callback, swallowing any errors."""
         cb = self._on_new_message
@@ -252,6 +260,25 @@ class GatewayStreamConsumer:
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
 
+    def _send_metadata(self, *, allow_new_session_button: bool = False) -> dict:
+        """Return per-send metadata with Discord button gating normalized.
+
+        ``GatewayStreamConsumer`` may call ``adapter.send`` multiple times for
+        one assistant response: streaming previews, tool-boundary segments,
+        commentary, overflow chunks, and fallback continuations.  The Discord
+        adapter attaches the New session button per adapter send, so streaming
+        only forwards the positive gate on sends known to carry the final
+        primary answer.  Interim/tool-boundary bubbles must not consume it.
+        """
+        meta = dict(self.metadata) if self.metadata else {}
+        if not meta.get("discord_new_session_button"):
+            return meta
+        if allow_new_session_button and not self._discord_new_session_button_consumed:
+            self._discord_new_session_button_consumed = True
+            return meta
+        meta.pop("discord_new_session_button", None)
+        return meta
+
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
@@ -261,12 +288,6 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
-        # #29346: a tool/segment boundary means what we delivered was an interim
-        # preamble, not the final answer — clear the flags so a premature setter
-        # can't fool the gateway. Safe: got_done returns before any reset, and
-        # run.py reads these only after the consumer task exits.
-        self._final_response_sent = False
-        self._final_content_delivered = False
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -495,7 +516,11 @@ class GatewayStreamConsumer:
                         chunks_delivered = False
                         reply_to = self._message_id or self._initial_reply_to_id
                         for chunk in chunks:
-                            new_id = await self._send_new_chunk(chunk, reply_to)
+                            new_id = await self._send_new_chunk(
+                                chunk,
+                                reply_to,
+                                allow_new_session_button=got_done,
+                            )
                             if new_id is not None and new_id != reply_to:
                                 chunks_delivered = True
                         self._accumulated = ""
@@ -530,19 +555,7 @@ class GatewayStreamConsumer:
                         if split_at < _safe_limit // 2:
                             split_at = _safe_limit
                         chunk = self._accumulated[:split_at]
-                        # finalize=True so the adapter applies platform-specific
-                        # rich-text markup (e.g. Telegram MarkdownV2). This
-                        # sealed chunk will never be edited again — _message_id
-                        # is reset to None right below — so it must receive its
-                        # final formatting pass now, or early split messages
-                        # render raw markdown while only the last chunk renders.
-                        # is_turn_final=False: this is the first of several split
-                        # messages, NOT the turn-final answer, so the fresh-final
-                        # path (opt-in fresh_final_after_seconds) must not mark
-                        # the turn delivered on it (#29346 semantics).
-                        ok = await self._send_or_edit(
-                            chunk, finalize=True, is_turn_final=False,
-                        )
+                        ok = await self._send_or_edit(chunk)
                         if self._fallback_final_send or not ok:
                             # Edit failed (or backed off due to flood control)
                             # while attempting to split an oversized message.
@@ -567,9 +580,7 @@ class GatewayStreamConsumer:
                     current_update_visible = await self._send_or_edit(
                         display_text,
                         finalize=(got_done or got_segment_break),
-                        # A segment-break finalize closes a preamble, not the
-                        # turn-final answer — only got_done marks delivered (#29346).
-                        is_turn_final=got_done,
+                        allow_new_session_button=got_done,
                     )
                     self._last_edit_time = time.monotonic()
 
@@ -596,12 +607,17 @@ class GatewayStreamConsumer:
                             # visible update this tick) OR the adapter needs
                             # explicit finalize=True to close the stream.
                             self._final_response_sent = await self._send_or_edit(
-                                self._accumulated, finalize=True,
+                                self._accumulated,
+                                finalize=True,
+                                allow_new_session_button=True,
                             )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(
+                                self._accumulated,
+                                allow_new_session_button=True,
+                            )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                     return
@@ -667,13 +683,10 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
 
-    # Strip MEDIA:<path> tags before display. Uses the shared anchored
-    # MEDIA_TAG_CLEANUP_RE from gateway/platforms/base.py — only tags whose
-    # path ends in a deliverable extension are removed, so an unknown-extension
-    # path stays visible instead of being silently dropped (issue #34517).
-    # Streaming and non-streaming paths share the same regex, so a tag is
-    # treated identically whichever path delivered the text.
-    _MEDIA_RE = MEDIA_TAG_CLEANUP_RE
+    # Pattern to strip MEDIA:<path> tags (including optional surrounding quotes).
+    # Matches the simple cleanup regex used by the non-streaming path in
+    # gateway/platforms/base.py for post-processing.
+    _MEDIA_RE = re.compile(r'''[`"']?MEDIA:\s*\S+[`"']?''')
 
     @staticmethod
     def _clean_for_display(text: str) -> str:
@@ -695,7 +708,13 @@ class GatewayStreamConsumer:
         # Strip trailing whitespace/newlines but preserve leading content
         return cleaned.rstrip()
 
-    async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
+    async def _send_new_chunk(
+        self,
+        text: str,
+        reply_to_id: Optional[str],
+        *,
+        allow_new_session_button: bool = False,
+    ) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.
 
         Returns the message_id so callers can thread subsequent chunks.
@@ -704,12 +723,13 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
-            meta = dict(self.metadata) if self.metadata else {}
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
-                metadata=meta,
+                metadata=self._send_metadata(
+                    allow_new_session_button=allow_new_session_button,
+                ),
             )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
@@ -820,6 +840,7 @@ class GatewayStreamConsumer:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
+        allow_button_on_next_chunk = True
         for chunk in chunks:
             # Try sending with one retry on flood-control errors.
             result = None
@@ -827,7 +848,9 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self.metadata,
+                    metadata=self._send_metadata(
+                        allow_new_session_button=allow_button_on_next_chunk,
+                    ),
                 )
                 if result.success:
                     break
@@ -860,6 +883,7 @@ class GatewayStreamConsumer:
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
+            allow_button_on_next_chunk = False
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
             # Each fallback chunk is a fresh platform message — notify
@@ -1004,7 +1028,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=self._send_metadata(),
             )
             if result.success:
                 self._already_sent = True
@@ -1040,7 +1064,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._send_metadata(allow_new_session_button=False),
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1079,16 +1103,11 @@ class GatewayStreamConsumer:
         age = time.monotonic() - self._message_created_ts
         return age >= threshold
 
-    async def _try_fresh_final(self, text: str, *, is_turn_final: bool = True) -> bool:
+    async def _try_fresh_final(self, text: str) -> bool:
         """Send ``text`` as a brand-new message (best-effort delete the old
         preview) so the platform's visible timestamp reflects completion
         time.  Returns True on successful delivery, False on any failure so
         the caller falls back to the normal edit path.
-
-        ``is_turn_final`` is False when finalizing an interim segment at a tool
-        boundary (a preamble) rather than the turn-final answer; the
-        final-delivery flag is then left unset so the gateway still delivers the
-        real answer from the next API call (#29346).
 
         Ported from openclaw/openclaw#72038.
         """
@@ -1097,7 +1116,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._send_metadata(allow_new_session_button=True),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -1134,12 +1153,15 @@ class GatewayStreamConsumer:
             self._message_created_ts = None
         self._already_sent = True
         self._last_sent_text = text
-        if is_turn_final:
-            self._final_response_sent = True
+        self._final_response_sent = True
         return True
 
     async def _send_or_edit(
-        self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
+        self,
+        text: str,
+        *,
+        finalize: bool = False,
+        allow_new_session_button: bool = False,
     ) -> bool:
         """Send or edit the streaming message.
 
@@ -1217,8 +1239,17 @@ class GatewayStreamConsumer:
                     # finalize=True edit even when content is unchanged, so
                     # their streaming UI can transition out of the in-
                     # progress state.  Everyone else short-circuits.
+                    needs_discord_button_edit = (
+                        finalize
+                        and allow_new_session_button
+                        and self._adapter_supports_discord_new_session_button()
+                        and self.metadata
+                        and self.metadata.get("discord_new_session_button")
+                        and not self._discord_new_session_button_consumed
+                    )
                     if text == self._last_sent_text and not (
-                        finalize and self._adapter_requires_finalize
+                        (finalize and self._adapter_requires_finalize)
+                        or needs_discord_button_edit
                     ):
                         return True
                     # Fresh-final for long-lived previews: when finalizing
@@ -1234,17 +1265,27 @@ class GatewayStreamConsumer:
                     if (
                         finalize
                         and self._should_send_fresh_final()
-                        and await self._try_fresh_final(
-                            text, is_turn_final=is_turn_final,
-                        )
+                        and await self._try_fresh_final(text)
                     ):
                         return True
-                    # Edit existing message
-                    result = await self._edit_message(
-                        message_id=self._message_id,
-                        content=text,
-                        finalize=finalize,
-                    )
+                    # Edit existing message.  Discord can attach the New session
+                    # component on the final edit; do not consume the gate until
+                    # the final primary answer is actually being finalized.
+                    edit_metadata = None
+                    if (
+                        allow_new_session_button
+                        and self._adapter_supports_discord_new_session_button()
+                    ):
+                        edit_metadata = self._send_metadata(allow_new_session_button=True)
+                    edit_kwargs = {
+                        "chat_id": self.chat_id,
+                        "message_id": self._message_id,
+                        "content": text,
+                        "finalize": finalize,
+                    }
+                    if edit_metadata and edit_metadata.get("discord_new_session_button"):
+                        edit_kwargs["metadata"] = edit_metadata
+                    result = await self.adapter.edit_message(**edit_kwargs)
                     if result.success:
                         self._already_sent = True
                         # Adapter may have split-and-delivered an oversized
@@ -1323,7 +1364,9 @@ class GatewayStreamConsumer:
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,
-                    metadata=self.metadata,
+                    metadata=self._send_metadata(
+                        allow_new_session_button=allow_new_session_button,
+                    ),
                 )
                 if result.success:
                     if result.message_id:

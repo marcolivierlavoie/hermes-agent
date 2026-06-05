@@ -1998,12 +1998,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
-        # Run the dispatcher inside the gateway process. On by default —
-        # the cost is ~300µs every `dispatch_interval_seconds` when idle,
-        # and gateway is the supervisor users already have. Set to false
-        # only if you run the dispatcher as a separate systemd unit or
-        # don't want the gateway to spawn workers.
-        "dispatch_in_gateway": True,
+        # Run the dispatcher inside the gateway process. Off by default;
+        # opt in only when the gateway should spawn Kanban workers. One
+        # dispatcher per profile is sufficient, so keep this false when
+        # running the dispatcher as a separate unit/process.
+        "dispatch_in_gateway": False,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
@@ -3477,7 +3476,7 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
     # HERMES_TOOL_PROGRESS and HERMES_TOOL_PROGRESS_MODE are deprecated —
-    # now configured via display.tool_progress in config.yaml (off|new|all|verbose).
+    # now configured via display.tool_progress in config.yaml (off|status|new|all|verbose).
     # Gateway falls back to these env vars for backward compatibility.
     "HERMES_TOOL_PROGRESS": {
         "description": "(deprecated) Use display.tool_progress in config.yaml instead",

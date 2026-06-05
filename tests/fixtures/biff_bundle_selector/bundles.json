@@ -1,0 +1,10 @@
+{
+  "/biff-issue-execution": {"name": "biff-issue-execution", "slug": "biff-issue-execution"},
+  "/biff-hermes-runtime-change": {"name": "biff-hermes-runtime-change", "slug": "biff-hermes-runtime-change"},
+  "/biff-automation-ownership": {"name": "biff-automation-ownership", "slug": "biff-automation-ownership"},
+  "/biff-research-to-decision": {"name": "biff-research-to-decision", "slug": "biff-research-to-decision"},
+  "/biff-meeting-followup": {"name": "biff-meeting-followup", "slug": "biff-meeting-followup"},
+  "/biff-memory-knowledge-governance": {"name": "biff-memory-knowledge-governance", "slug": "biff-memory-knowledge-governance"},
+  "/biff-personal-logistics": {"name": "biff-personal-logistics", "slug": "biff-personal-logistics"},
+  "/not-biff": {"name": "not-biff", "slug": "not-biff"}
+}

@@ -132,6 +132,12 @@ DEFAULT_FALLBACK_CONTEXT = CONTEXT_PROBE_TIERS[0]
 # Sessions, model switches, and cron jobs should reject models below this.
 MINIMUM_CONTEXT_LENGTH = 64_000
 
+# Safety ceiling: context lengths above this are almost certainly a
+# resolution bug (bytes treated as tokens, unit-conversion errors, etc.).
+# No production model exceeds ~2M tokens; 10M gives 5× headroom for
+# future models while catching absurd values like ~1T (251B at 25%).
+MAXIMUM_SANE_CONTEXT_LENGTH = 10_000_000
+
 # Thin fallback defaults — only broad model family patterns.
 # These fire only when provider is unknown AND models.dev/OpenRouter/Anthropic
 # all miss. Replaced the previous 80+ entry dict.

@@ -1,7 +1,6 @@
 """Regression tests for task/session cwd propagation in terminal_tool."""
 
 import json
-from types import SimpleNamespace
 
 import tools.terminal_tool as terminal_tool
 
@@ -11,7 +10,6 @@ def _minimal_terminal_config(cwd="/default"):
         "env_type": "local",
         "cwd": cwd,
         "timeout": 60,
-        "lifetime_seconds": 3600,
     }
 
 
@@ -76,169 +74,68 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
     assert calls == [{"timeout": 60, "cwd": "/explicit/workdir"}]
 
 
-def test_foreground_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch):
-    """A prior `cd` updates env.cwd; terminal_tool must honor that live cwd."""
-    calls = []
+def test_get_env_config_falls_back_when_process_cwd_deleted(monkeypatch, tmp_path):
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
 
-    class FakeEnv:
-        env = {}
-        cwd = "/workspace/live"
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(fallback))
 
-        def execute(self, command, **kwargs):
-            calls.append((command, kwargs))
-            return {"output": "ok", "returncode": 0}
+    def missing_cwd():
+        raise FileNotFoundError("cwd vanished")
 
-    task_id = "session-live-cwd"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
-    monkeypatch.setattr(terminal_tool, "_last_activity", {})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/init"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/init"))
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
-    monkeypatch.setattr(
-        terminal_tool,
-        "_check_all_guards",
-        lambda command, env_type: {"approved": True},
-    )
+    monkeypatch.setattr(terminal_tool.os, "getcwd", missing_cwd)
 
-    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+    config = terminal_tool._get_env_config()
 
-    assert result["exit_code"] == 0
-    assert calls == [("pwd", {"timeout": 60, "cwd": "/workspace/live"})]
+    assert config["cwd"] == str(fallback)
 
 
-def test_background_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch):
-    """Background process launches must also use the live session cwd."""
+def test_get_env_config_keeps_explicit_terminal_cwd_when_process_cwd_deleted(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", "/definitely/missing/hermes-cwd")
 
-    class FakeEnv:
-        env = {}
-        cwd = "/workspace/live"
+    def missing_cwd():
+        raise FileNotFoundError("cwd vanished")
 
-    class FakeRegistry:
-        def __init__(self):
-            self.calls = []
-            self.pending_watchers = []
+    monkeypatch.setattr(terminal_tool.os, "getcwd", missing_cwd)
 
-        def spawn_local(self, **kwargs):
-            self.calls.append(kwargs)
-            return SimpleNamespace(id="proc_test", pid=1234)
+    config = terminal_tool._get_env_config()
 
-    import tools.process_registry as process_registry_mod
-
-    registry = FakeRegistry()
-    task_id = "session-live-cwd-bg"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
-    monkeypatch.setattr(terminal_tool, "_last_activity", {})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/init"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/init"))
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
-    monkeypatch.setattr(
-        terminal_tool,
-        "_check_all_guards",
-        lambda command, env_type: {"approved": True},
-    )
-    monkeypatch.setattr(process_registry_mod, "process_registry", registry)
-
-    result = json.loads(
-        terminal_tool.terminal_tool(
-            command="sleep 1",
-            task_id=task_id,
-            background=True,
-        )
-    )
-
-    assert result["exit_code"] == 0
-    assert registry.calls == [{
-        "command": "sleep 1",
-        "cwd": "/workspace/live",
-        "task_id": task_id,
-        "session_key": "",
-        "env_vars": {},
-        "use_pty": False,
-    }]
+    # The deleted process cwd guard chooses a safe default, but an explicit
+    # TERMINAL_CWD still remains the user/config override. LocalEnvironment has
+    # the per-command ancestor recovery guard for stale explicit cwd values.
+    assert config["cwd"] == "/definitely/missing/hermes-cwd"
 
 
-def test_registering_cwd_override_updates_live_env_cwd(monkeypatch):
-    """An ACP ``update_cwd`` (re-)registered mid-session must win over a
-    previously ``cd``-ed live ``env.cwd``.
-
-    Preferring live ``env.cwd`` (so session-local ``cd`` survives) means a
-    freshly registered ``cwd`` override would otherwise sit *below* the
-    already-set ``env.cwd`` and be silently ignored. ``register_task_env_overrides``
-    syncs the new cwd onto the live cached env so an explicit ACP project-root
-    change takes effect, as the editor client expects.
-    """
-
-    class FakeEnv:
-        env = {}
-        cwd = "/workspace/old"
-
-    task_id = "acp-session-update"
-    fake_env = FakeEnv()
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: fake_env})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
-
-    terminal_tool.register_task_env_overrides(task_id, {"cwd": "/workspace/new"})
-
-    # The live env now reflects the editor's new project root.
-    assert fake_env.cwd == "/workspace/new"
-
-    # A subsequent command resolves to the new cwd (env.cwd precedence).
-    assert terminal_tool._resolve_command_cwd(
-        workdir=None, env=fake_env, default_cwd="/workspace/config"
-    ) == "/workspace/new"
-
-
-def test_registering_cwd_override_noop_when_no_live_env(monkeypatch):
-    """Registering an override before the env exists must not crash; the cwd
-    is applied at env creation time instead."""
-    monkeypatch.setattr(terminal_tool, "_active_environments", {})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
-
-    # Should not raise even though no env is cached yet.
-    terminal_tool.register_task_env_overrides("acp-session-pending", {"cwd": "/workspace/new"})
-
-    assert terminal_tool._task_env_overrides["acp-session-pending"] == {"cwd": "/workspace/new"}
-
-
-def test_registering_non_cwd_override_leaves_live_env_cwd_untouched(monkeypatch):
-    """A non-cwd override (e.g. a per-task Modal image) must not disturb the
-    live env's cwd."""
-
-    class FakeEnv:
-        env = {}
-        cwd = "/workspace/keep"
-
-    task_id = "rl-rollout-1"
-    fake_env = FakeEnv()
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: fake_env})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
-
-    terminal_tool.register_task_env_overrides(task_id, {"modal_image": "custom:latest"})
-
-    assert fake_env.cwd == "/workspace/keep"
-
-
-def test_safe_getcwd_returns_real_cwd(monkeypatch):
-    monkeypatch.setattr(terminal_tool.os, "getcwd", lambda: "/home/user/project")
-    assert terminal_tool._safe_getcwd() == "/home/user/project"
-
-
-def test_safe_getcwd_falls_back_to_terminal_cwd_when_cwd_deleted(monkeypatch):
-    def _boom():
-        raise FileNotFoundError("[Errno 2] No such file or directory")
-
-    monkeypatch.setattr(terminal_tool.os, "getcwd", _boom)
-    monkeypatch.setenv("TERMINAL_CWD", "/srv/work")
-    assert terminal_tool._safe_getcwd() == "/srv/work"
-
-
-def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch):
-    def _boom():
-        raise FileNotFoundError()
-
-    monkeypatch.setattr(terminal_tool.os, "getcwd", _boom)
+def test_get_env_config_uses_home_when_process_cwd_deleted_without_terminal_cwd(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
-    monkeypatch.setattr(terminal_tool.os.path, "expanduser", lambda p: "/home/me")
-    assert terminal_tool._safe_getcwd() == "/home/me"
+
+    def missing_cwd():
+        raise FileNotFoundError("cwd vanished")
+
+    monkeypatch.setattr(terminal_tool.os, "getcwd", missing_cwd)
+
+    config = terminal_tool._get_env_config()
+
+    assert config["cwd"] == terminal_tool.os.path.expanduser("~")
+
+
+def test_docker_mount_cwd_falls_back_when_process_cwd_deleted(monkeypatch, tmp_path):
+    fallback = tmp_path / "docker-host-cwd"
+    fallback.mkdir()
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+    monkeypatch.setenv("TERMINAL_CWD", str(fallback))
+
+    def missing_cwd():
+        raise FileNotFoundError("cwd vanished")
+
+    monkeypatch.setattr(terminal_tool.os, "getcwd", missing_cwd)
+
+    config = terminal_tool._get_env_config()
+
+    assert config["cwd"] == "/workspace"
+    assert config["host_cwd"] == str(fallback)

@@ -59,6 +59,7 @@ cli-config.yaml
 # Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
 skills/.hub/
 ignored/
+.sandbox/
 .worktrees/
 environments/benchmarks/evals/
 

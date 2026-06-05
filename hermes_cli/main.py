@@ -11335,23 +11335,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         launchd_restart,
                         get_launchd_label,
                         get_launchd_plist_path,
+                        _launchd_print_loaded,
                     )
 
                     plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
-                        check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-                        if check.returncode == 0:
-                            try:
-                                launchd_restart()
-                                restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
+                    if plist_path.exists() and _launchd_print_loaded(timeout=5):
+                        try:
+                            launchd_restart()
+                            restarted_services.append(get_launchd_label())
+                        except subprocess.CalledProcessError as e:
+                            stderr = (getattr(e, "stderr", "") or "").strip()
+                            print(f"  ⚠ Gateway restart failed: {stderr}")
                 except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
                     pass
 
@@ -13112,9 +13106,6 @@ def main():
         help="Target the Linux system-level gateway service",
     )
 
-    # gateway list
-    gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
-
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
@@ -13821,6 +13812,16 @@ def main():
             "advisory will no longer trigger startup banners. Run `hermes "
             "doctor` first to see active advisories and their IDs."
         ),
+    )
+    doctor_parser.add_argument(
+        "--gateway-runtime",
+        action="store_true",
+        help="Check Biff gateway cwd/venv/import policy and return non-zero on split-brain runtime drift",
+    )
+    doctor_parser.add_argument(
+        "--biff-runtime",
+        action="store_true",
+        help="Run Biff reliability preflight checks for runtime, config, Kanban, credentials, and recovery wiring",
     )
     doctor_parser.set_defaults(func=cmd_doctor)
 

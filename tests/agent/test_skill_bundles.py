@@ -182,6 +182,31 @@ class TestResolveBundleCommandKey:
     def test_empty(self, bundles_env):
         assert resolve_bundle_command_key("") is None
 
+    def test_deprecated_biff_bundle_alias_resolves_to_canonical_target(self, bundles_env):
+        bundles_dir, _ = bundles_env
+        _make_bundle_yaml(bundles_dir, "biff-hermes-runtime-change", ["s1"])
+        scan_bundles()
+
+        assert (
+            resolve_bundle_command_key("biff-build-verify")
+            == "/biff-hermes-runtime-change"
+        )
+
+    def test_deprecated_biff_bundle_alias_is_existing_bundles_only(self, bundles_env):
+        scan_bundles()
+
+        assert resolve_bundle_command_key("biff-build-verify") is None
+
+    def test_get_bundle_resolves_deprecated_biff_alias(self, bundles_env):
+        bundles_dir, _ = bundles_env
+        _make_bundle_yaml(bundles_dir, "biff-hermes-runtime-change", ["s1"])
+        scan_bundles()
+
+        info = get_bundle("biff-build-verify")
+
+        assert info is not None
+        assert info["slug"] == "biff-hermes-runtime-change"
+
 
 class TestBuildBundleInvocationMessage:
     def test_loads_all_skills(self, bundles_env):
@@ -248,6 +273,66 @@ class TestBuildBundleInvocationMessage:
         assert result is not None
         msg, _, _ = result
         assert "Always check tests first." in msg
+
+    def test_deprecated_biff_alias_loads_target_with_deprecation_notice(self, bundles_env):
+        bundles_dir, skills_dir = bundles_env
+        _make_skill(skills_dir, "skill-a")
+        _make_bundle_yaml(bundles_dir, "biff-hermes-runtime-change", ["skill-a"])
+        scan_bundles()
+
+        result = build_bundle_invocation_message(
+            "/biff-hermes-runtime-change",
+            invoked_key="/biff-build-verify",
+        )
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["skill-a"]
+        assert missing == []
+        assert "Deprecated bundle alias: /biff-build-verify" in msg
+        assert "Use /biff-hermes-runtime-change" in msg
+
+    def test_summary_mode_loads_bounded_skill_payload(self, bundles_env):
+        bundles_dir, skills_dir = bundles_env
+        long_body = "Visible start.\n" + ("too much detail\n" * 200) + "Invisible tail."
+        _make_skill(skills_dir, "long-skill", body=long_body)
+        (bundles_dir / "summary-combo.yaml").parent.mkdir(parents=True, exist_ok=True)
+        (bundles_dir / "summary-combo.yaml").write_text(
+            "name: summary-combo\n"
+            "skills:\n"
+            "  - name: long-skill\n"
+            "    mode: summary\n"
+            "    max_chars: 80\n"
+        )
+        scan_bundles()
+
+        result = build_bundle_invocation_message("/summary-combo")
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["long-skill"]
+        assert missing == []
+        assert "Visible start." in msg
+        assert "Invisible tail." not in msg
+        assert "Summary-loaded skill" in msg
+        assert 'skill_view(name="long-skill")' in msg
+        assert len(msg) < 2500
+
+    def test_plain_string_skill_entry_still_loads_full_payload(self, bundles_env):
+        bundles_dir, skills_dir = bundles_env
+        _make_skill(skills_dir, "full-skill", body="Visible start.\nInvisible tail.")
+        _make_bundle_yaml(bundles_dir, "full-combo", ["full-skill"])
+        scan_bundles()
+
+        result = build_bundle_invocation_message("/full-combo")
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["full-skill"]
+        assert missing == []
+        assert "Visible start." in msg
+        assert "Invisible tail." in msg
+        assert "Summary-loaded skill" not in msg
 
     def test_dedupes_skills(self, bundles_env):
         bundles_dir, skills_dir = bundles_env

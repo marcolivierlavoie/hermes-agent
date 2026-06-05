@@ -1554,6 +1554,15 @@ class SendResult:
     continuation_message_ids: tuple = ()
 
 
+class GatewayResponse(str):
+    """Text response carrying adapter metadata for the final platform send."""
+
+    def __new__(cls, content: str, *, metadata: Optional[Dict[str, Any]] = None):
+        obj = str.__new__(cls, content)
+        obj.metadata = dict(metadata or {})
+        return obj
+
+
 class EphemeralReply(str):
     """System-notice reply that auto-deletes after a TTL.
 
@@ -3992,6 +4001,62 @@ class BasePlatformAdapter(ABC):
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
         self._start_session_processing(event, session_key)
+
+    async def handle_internal_message_now(
+        self,
+        event: MessageEvent,
+        *,
+        reason: str = "internal",
+        correlation_id: Optional[str] = None,
+    ) -> None:
+        """Process a trusted synthetic event without the user-message HOL guard.
+
+        ``handle_message`` intentionally serializes user turns by session: a
+        follow-up in the same chat is queued/merged behind the active adapter
+        task (or routed through the busy handler).  System-generated events such
+        as ``terminal(background=True, notify_on_complete=True)`` completions are
+        different: they are already rate/noise-controlled at the process watcher
+        layer and should not wait behind an unrelated active user turn in the
+        same Discord/Slack/Telegram session.
+
+        Use a namespaced adapter guard key so the normal response delivery
+        pipeline (typing hooks, media extraction, retries, post-delivery hooks)
+        is reused, while the synthetic event does not contend with or release
+        the real user-session guard.  The gateway runner still derives the
+        transcript/agent session from ``event.source``, so the notification is
+        delivered to the intended conversation context.
+        """
+        if not self._message_handler:
+            return
+        if not bool(getattr(event, "internal", False)):
+            logger.warning(
+                "[%s] Refusing immediate dispatch for non-internal event (reason=%s)",
+                self.name,
+                reason,
+            )
+            await self.handle_message(event)
+            return
+
+        base_session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        safe_reason = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", str(reason or "internal"))[:48]
+        safe_correlation = re.sub(
+            r"[^a-zA-Z0-9_.:-]+",
+            "-",
+            str(correlation_id or getattr(event, "message_id", None) or uuid.uuid4().hex),
+        )[:96]
+        synthetic_session_key = f"{base_session_key}:__internal__:{safe_reason}:{safe_correlation}"
+        logger.info(
+            "[%s] Immediate internal dispatch for %s (base_session=%s synthetic_session=%s)",
+            self.name,
+            safe_reason,
+            base_session_key,
+            synthetic_session_key,
+        )
+        self._start_session_processing(event, synthetic_session_key)
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -4072,6 +4137,7 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+            _response_metadata = dict(getattr(response, "metadata", {}) or {})
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -4223,11 +4289,26 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata["notify"] = True
                     else:
                         _thread_metadata = {"notify": True}
+                    # Handler-returned GatewayResponse metadata is the explicit
+                    # path for quota-only controls such as Discord's New session
+                    # button. Do not infer controls from response text; normal
+                    # replies may legitimately discuss quota wording.
+                    _thread_metadata.update(_response_metadata)
+                    _send_started_at = time.monotonic()
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
                         metadata=_thread_metadata,
+                    )
+                    _send_elapsed = time.monotonic() - _send_started_at
+                    logger.info(
+                        "delivery_metrics: platform=%s chat=%s send_time=%.3fs success=%s response_chars=%d",
+                        self.platform.value,
+                        event.source.chat_id,
+                        _send_elapsed,
+                        bool(getattr(result, "success", False)),
+                        len(text_content),
                     )
                     _record_delivery(result)
 

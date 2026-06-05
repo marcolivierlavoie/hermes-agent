@@ -1,12 +1,12 @@
 ---
 sidebar_position: 4
 title: "Memory Providers"
-description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, Supermemory"
+description: "External memory provider plugins — Mnemosyne, Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, Supermemory"
 ---
 
 # Memory Providers
 
-Hermes Agent ships with 8 external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
+Hermes Agent ships with 9 memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
 
 ## Quick Start
 
@@ -22,12 +22,12 @@ Or set manually in `~/.hermes/config.yaml`:
 
 ```yaml
 memory:
-  provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory
+  provider: mnemosyne   # or honcho, openviking, mem0, hindsight, holographic, retaindb, byterover, supermemory
 ```
 
 ## How It Works
 
-When a memory provider is active, Hermes automatically:
+When a memory provider is active, Hermes usually:
 
 1. **Injects provider context** into the system prompt (what the provider knows)
 2. **Prefetches relevant memories** before each turn (background, non-blocking)
@@ -36,9 +36,66 @@ When a memory provider is active, Hermes automatically:
 5. **Mirrors built-in memory writes** to the external provider
 6. **Adds provider-specific tools** so the agent can search, store, and manage memories
 
+Provider behavior is configurable and provider-specific. For example, Mnemosyne is intentionally trust-gated: it exposes explicit auditable recall/hygiene tools, but does not automatically sync turns, write memories, or broadly prefetch memory content by default.
+
 The built-in memory (MEMORY.md / USER.md) continues to work exactly as before. The external provider is additive.
 
 ## Available Providers
+
+### Mnemosyne
+
+Local-only trusted explicit recall for auditable facts. Mnemosyne is designed for high-trust workflows where the agent should not silently infer, write, or inject broad memory context.
+
+| | |
+|---|---|
+| **Best for** | Explicitly approved memories, audit trails, Biff-style memory hygiene, stale/conflict suppression |
+| **Requires** | No external service |
+| **Data storage** | `$HERMES_HOME/mnemosyne/isolated-pilot/` |
+| **Cost** | Free/local |
+
+**Tool:** `mnemosyne_memory` with `candidate`/`add_candidate`, `list_candidates`, `approve_candidate`, `reject_candidate`, `add`, `recall`, `inspect`, `list`, `hygiene_report`, `prefetch_trace`, `contract`, `seed_source`, `suppress`, and `unsuppress`.
+
+**Level 3 product contract:**
+
+- Local/profile-scoped only; no external services and no production-provider mutation.
+- No bulk imports. `seed_source` is capped and creates candidates only; approvals are explicit.
+- No secrets. Candidate/writeback and seeding paths reject obvious secret-bearing content; explicit adds remain audited and secret/sensitive memories are excluded from selective prefetch.
+- Writeback queue first: proposed memories can be staged, listed, approved, or rejected before becoming active memories.
+- `add` requires `source`, `context`, and `rationale` audit metadata.
+- Memories can carry supersession/conflict metadata: `topic`, `conflict_group`, `conflict_status`, `supersedes`, `superseded_by`, `valid_from`, `valid_until`.
+- `recall` and `list` return active, unsuppressed memories by default.
+- `suppress` is non-destructive; `unsuppress` rolls back the suppression record.
+- `hygiene_report` is report-only: it flags duplicate-like, stale, supersession, and possible conflict candidates without mutating memory.
+- `prefetch()` returns no broad automatic memory content by default; use explicit recall for memory/history questions.
+- Optional selective prefetch is gated by `$HERMES_HOME/mnemosyne/config.json` with `selective_prefetch_enabled: true`, score/overlap/budget checks, stale/sensitive-term exclusion, and traceable memory IDs/sources. `prefetch_trace` exposes budgets, candidate skip reasons, conflict skip reasons, and injection decisions.
+- Normal conversation turns are not automatically written into Mnemosyne.
+
+**Boundary with built-in memory:** keep short always-needed facts in `MEMORY.md` / `USER.md`; use Mnemosyne for explicit, auditable facts that need source/rationale and suppress/rollback controls.
+
+**Config:**
+
+```yaml
+memory:
+  provider: mnemosyne
+```
+
+Optional `$HERMES_HOME/mnemosyne/config.json`:
+
+```json
+{
+  "selective_prefetch_enabled": false,
+  "max_prefetch_results": 3,
+  "max_prefetch_scan_results": 20,
+  "max_prefetch_context_chars": 1800,
+  "min_prefetch_score": 2,
+  "min_prefetch_token_overlap": 2,
+  "prefetch_trace_enabled": false,
+  "candidate_queue_enabled": true,
+  "max_seed_records": 10
+}
+```
+
+**Regression and follow-up:** trusted explicit recall should pass focused regression gates before expansion. The BIF-568/BIF-570 gates cover source-of-truth boundaries, stale/conflict exclusion, audit metadata, and selective high-confidence prefetch. Level 3 adds candidate writeback, supersession metadata, richer observability traces, capped source-aware seeding, and non-mutating hygiene support.
 
 ### Honcho
 
@@ -547,6 +604,7 @@ hermes memory setup
 
 | Provider | Storage | Cost | Tools | Dependencies | Unique Feature |
 |----------|---------|------|-------|-------------|----------------|
+| **Mnemosyne** | Local | Free | 1 | None | Auditable explicit recall + non-destructive hygiene/suppression |
 | **Honcho** | Cloud | Paid | 5 | `honcho-ai` | Dialectic user modeling + session-scoped context |
 | **OpenViking** | Self-hosted | Free | 5 | `openviking` + server | Filesystem hierarchy + tiered loading |
 | **Mem0** | Cloud | Paid | 3 | `mem0ai` | Server-side LLM extraction |
@@ -561,7 +619,7 @@ hermes memory setup
 
 Each provider's data is isolated per [profile](/user-guide/profiles):
 
-- **Local storage providers** (Holographic, ByteRover) use `$HERMES_HOME/` paths which differ per profile
+- **Local storage providers** (Mnemosyne, Holographic, ByteRover) use `$HERMES_HOME/` paths which differ per profile. Mnemosyne stores data under `$HERMES_HOME/mnemosyne/isolated-pilot/`.
 - **Config file providers** (Honcho, Mem0, Hindsight, Supermemory) store config in `$HERMES_HOME/` so each profile has its own credentials
 - **Cloud providers** (RetainDB) auto-derive profile-scoped project names
 - **Env var providers** (OpenViking) are configured via each profile's `.env` file

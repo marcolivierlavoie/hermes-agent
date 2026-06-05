@@ -238,7 +238,7 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
 
 
-def test_default_run_conversation_warns_without_guardrail_halt():
+def test_default_run_conversation_pauses_repeated_failure_loop():
     agent = _make_agent("web_search", max_iterations=10)
     same_args = {"query": "same"}
     responses = [
@@ -260,15 +260,15 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     ):
         result = agent.run_conversation("search repeatedly")
 
-    assert mock_hfc.call_count == 3
-    assert result["turn_exit_reason"].startswith("text_response")
-    assert "guardrail" not in result
-    assert result["final_response"] == "done"
+    assert mock_hfc.call_count == 2
+    assert result["turn_exit_reason"] == "long_turn_fallback_pause"
+    assert result["guardrail"]["code"] == "long_turn_repeated_failure_fallback"
+    assert result["long_turn"]["fallback_decision"]["reason"] == "repeated_failure_same_hypothesis"
     tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
-def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
+def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error(tmp_path):
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
     same_args = {"query": "same"}
     responses = [
@@ -283,6 +283,7 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
 
     with (
         patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
+        patch.object(agent, "_long_turn_persist_dir", return_value=tmp_path),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
@@ -290,14 +291,19 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
         result = agent.run_conversation("search repeatedly")
 
     assert mock_hfc.call_count == 2
-    assert result["api_calls"] == 3
+    assert result["api_calls"] == 2
     assert result["api_calls"] < agent.max_iterations
-    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["turn_exit_reason"] == "long_turn_fallback_pause"
     assert "error" not in result
     assert result["completed"] is True
     assert "stopped retrying" in result["final_response"]
-    assert result["guardrail"]["code"] == "repeated_exact_failure_block"
+    assert result["guardrail"]["code"] == "long_turn_repeated_failure_fallback"
     assert result["guardrail"]["tool_name"] == "web_search"
+    resume_path = result["long_turn"]["resume_packet_path"]
+    assert resume_path
+    packet = json.loads(open(resume_path).read())
+    assert packet["reason"] == "long_turn_fallback_pause"
+    assert packet["fallback_decision"] == result["long_turn"]["fallback_decision"]
 
     assistant_tool_calls = [m for m in result["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
     for assistant_msg in assistant_tool_calls:

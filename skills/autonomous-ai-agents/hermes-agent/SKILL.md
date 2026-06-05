@@ -270,7 +270,7 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 /model [name]        Show or change model
 /personality [name]  Set personality
 /reasoning [level]   Set reasoning (none|minimal|low|medium|high|xhigh|show|hide)
-/verbose             Cycle: off → new → all → verbose
+/verbose             Cycle: off → status → new → all → verbose
 /voice [on|off|tts]  Voice mode
 /yolo                Toggle approval bypass
 /busy [sub]          Control what Enter does while Hermes is working (CLI)
@@ -702,8 +702,8 @@ sessions still have zero `kanban_*` schema footprint unless configured.
   `kanban_link`; profiles that explicitly enable the `kanban` toolset
   outside a dispatcher-spawned task also get `kanban_list` and
   `kanban_unblock` for board routing.
-- **Dispatcher** runs inside the gateway by default
-  (`kanban.dispatch_in_gateway: true`) — reclaims stale claims,
+- **Dispatcher** can run inside the gateway when explicitly enabled
+  (`kanban.dispatch_in_gateway: true`; default is false) — reclaims stale claims,
   promotes ready tasks, atomically claims, spawns assigned profiles.
   Auto-blocks a task after `failure_limit` consecutive spawn failures
   (default 2; configurable via `kanban.failure_limit` or per-task

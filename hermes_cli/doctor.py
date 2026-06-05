@@ -8,6 +8,9 @@ import os
 import sys
 import subprocess
 import shutil
+import importlib.util
+import plistlib
+import re
 from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
@@ -204,60 +207,6 @@ def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None
     issues.append(fix)
 
 
-def _read_pyproject_version() -> str | None:
-    """Read the ``version = "..."`` from ``pyproject.toml`` at the project root.
-
-    Returns None when running from an installed wheel (no pyproject.toml ships
-    with the package) or when the file can't be parsed. Reads only the
-    ``[project]`` version, ignoring any version strings that appear in other
-    tables.
-    """
-    pyproject = PROJECT_ROOT / "pyproject.toml"
-    try:
-        text = pyproject.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    in_project = False
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith("[") and line.endswith("]"):
-            in_project = line == "[project]"
-            continue
-        if in_project and line.startswith("version") and "=" in line:
-            value = line.split("=", 1)[1]
-            value = value.split("#", 1)[0].strip().strip("\"'")
-            return value or None
-    return None
-
-
-def _check_version_consistency(issues: list[str]) -> None:
-    """Verify pyproject.toml version matches hermes_cli.__version__.
-
-    A git conflict resolution (reset/merge) can revert one file without the
-    other, leaving ``hermes --version`` reporting a stale version while
-    ``pyproject.toml`` is current. Detect that drift so users can re-sync.
-    Silent no-op for installed wheels where pyproject.toml isn't present.
-    """
-    try:
-        from hermes_cli import __version__ as init_version
-    except Exception:
-        return
-    pyproject_version = _read_pyproject_version()
-    if pyproject_version is None:
-        # Installed wheel or unreadable pyproject — nothing to cross-check.
-        return
-    if pyproject_version == init_version:
-        check_ok("Version files consistent", f"({init_version})")
-    else:
-        _fail_and_issue(
-            "Version mismatch between source files",
-            f"(pyproject.toml {pyproject_version} != hermes_cli/__init__.py {init_version})",
-            "Re-sync version files (e.g. run 'hermes update', or set "
-            "hermes_cli/__init__.py __version__ to match pyproject.toml)",
-            issues,
-        )
-
-
 def _check_s6_supervision(issues: list[str]) -> None:
     """Inside a container under our s6 /init, surface what s6 sees.
 
@@ -445,10 +394,284 @@ def _build_apikey_providers_list() -> list:
     return _static
 
 
+def _gateway_runtime_policy_result() -> tuple[list[str], dict]:
+    """Collect Biff gateway runtime policy diagnostics without printing."""
+    from gateway.runtime_policy import collect_gateway_runtime_diagnostics, gateway_runtime_policy_violations
+
+    diag = collect_gateway_runtime_diagnostics()
+    return gateway_runtime_policy_violations(diag), diag
+
+
+def _load_yaml_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        import yaml as _yaml
+
+        return _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _env_key_names(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    keys: list[str] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key:
+            keys.append(key)
+    return sorted(set(keys))
+
+
+_BIFF_PROVIDER_KEY_REQUIREMENTS = {
+    "openai-codex": ("OPENAI_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN"),
+    "zai": ("ZAI_API_KEY", "Z_AI_API_KEY", "GLM_API_KEY"),
+    "glm": ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"),
+    "kimi": ("KIMI_API_KEY",),
+    "gmi": ("GMI_API_KEY",),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+}
+
+
+def _configured_model_provider(cfg: dict) -> str:
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    if isinstance(model_cfg, dict):
+        return str(model_cfg.get("provider") or "").strip().lower()
+    return ""
+
+
+def _credential_alias_available(broker: Path, alias: str) -> tuple[bool, str]:
+    """Check a broker alias without retrieving or printing its secret value."""
+    try:
+        proc = subprocess.run(
+            [str(broker), "--check", alias],
+            text=True,
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    detail = (proc.stdout or proc.stderr or "").strip().splitlines()
+    return proc.returncode == 0, (detail[0] if detail else f"exit={proc.returncode}")
+
+
+def _check_provider_key_drift(cfg: dict, env_keys: list[str], broker: Path, issues: list[str]) -> None:
+    provider = _configured_model_provider(cfg)
+    if not provider:
+        check_warn("Configured model provider", "missing model.provider in ~/.hermes/config.yaml")
+        issues.append("Set model.provider in ~/.hermes/config.yaml so provider/key drift can be detected")
+        return
+
+    expected_keys = _BIFF_PROVIDER_KEY_REQUIREMENTS.get(provider)
+    if not expected_keys:
+        check_warn("Configured model provider", f"{provider!r} has no Biff doctor key-name rule yet")
+        return
+
+    present = [key for key in expected_keys if key in env_keys]
+    if present:
+        check_ok("Provider/API key name alignment", f"provider={provider}; key names={', '.join(present)}")
+    else:
+        expected = " or ".join(expected_keys)
+        check_fail("Provider/API key name alignment", f"provider={provider} expects {expected}; found no matching key name")
+        issues.append(f"Set {expected} for model.provider={provider}, or change model.provider to match the configured key")
+
+    if broker.exists() and os.access(broker, os.X_OK):
+        for key in expected_keys:
+            ok, detail = _credential_alias_available(broker, key)
+            if ok:
+                check_ok("Credential broker provider alias", f"{key}: available via --check")
+                return
+        check_fail("Credential broker provider alias", f"missing --check alias for provider={provider} ({' or '.join(expected_keys)})")
+        issues.append(f"Add or restore credential broker --check alias for {' or '.join(expected_keys)}")
+
+
+def _check_required_credential_aliases(broker: Path, aliases: list[str], issues: list[str]) -> None:
+    if not (broker.exists() and os.access(broker, os.X_OK)):
+        return
+    missing: list[str] = []
+    for alias in aliases:
+        ok, detail = _credential_alias_available(broker, alias)
+        if ok:
+            check_ok("Credential broker alias", f"{alias}: available via --check")
+        else:
+            check_fail("Credential broker alias", f"{alias}: unavailable via --check ({detail})")
+            missing.append(alias)
+    if missing:
+        issues.append(f"Restore credential broker aliases checked with --check only: {', '.join(missing)}")
+
+
+def _check_role_repo_pin(role_invoker: Path, issues: list[str]) -> None:
+    if not role_invoker.exists():
+        return
+    try:
+        text = role_invoker.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        check_fail("Direct role HERMES_REPO pin", f"could not read {role_invoker}: {exc}")
+        issues.append(f"Make direct role invoker readable and pinned to HERMES_REPO={PROJECT_ROOT}")
+        return
+    match = re.search(r"HERMES_REPO\"\s*,\s*\"([^\"]+)\"", text)
+    fallback = match.group(1) if match else ""
+    if fallback == str(PROJECT_ROOT):
+        check_ok("Direct role HERMES_REPO pin", f"default fallback={fallback}")
+    else:
+        detail = f"fallback={fallback or 'unknown'}; expected {PROJECT_ROOT}"
+        check_fail("Direct role HERMES_REPO pin", detail)
+        issues.append(f"Pin {role_invoker} default HERMES_REPO fallback to {PROJECT_ROOT}")
+
+
+def _check_launchd_gateway_plist(issues: list[str]) -> None:
+    plist_path = HERMES_HOME / "launchd/before-login/ai.hermes.gateway.plist"
+    if not plist_path.exists():
+        if sys.platform == "darwin":
+            check_warn("Gateway launchd plist", f"not found at {plist_path}")
+        return
+    try:
+        payload = plistlib.loads(plist_path.read_bytes())
+    except Exception as exc:
+        check_fail("Gateway launchd plist", f"could not parse {plist_path}: {exc}")
+        issues.append(f"Repair parseable launchd plist: {plist_path}")
+        return
+    env = payload.get("EnvironmentVariables") or {}
+    expected_runtime = str(PROJECT_ROOT)
+    expected_venv = str(PROJECT_ROOT / "venv")
+    mismatches: list[str] = []
+    if payload.get("WorkingDirectory") != expected_runtime:
+        mismatches.append(f"WorkingDirectory={payload.get('WorkingDirectory')!r}")
+    for key, expected in {
+        "HERMES_CANONICAL_RUNTIME_DIR": expected_runtime,
+        "HERMES_CANONICAL_VENV": expected_venv,
+        "VIRTUAL_ENV": expected_venv,
+    }.items():
+        if env.get(key) != expected:
+            mismatches.append(f"{key}={env.get(key)!r}")
+    if mismatches:
+        check_fail("Gateway launchd runtime path", "; ".join(mismatches))
+        issues.append(f"Update {plist_path} to point at runtime {expected_runtime} and venv {expected_venv}")
+    else:
+        check_ok("Gateway launchd runtime path", f"({plist_path})")
+
+
+def _run_gateway_runtime_doctor() -> None:
+    """Check Biff gateway cwd/venv/import policy and exit non-zero on drift."""
+    violations, diag = _gateway_runtime_policy_result()
+    _section("Biff Gateway Runtime")
+    check_info(f"canonical runtime: {diag.get('canonical_runtime_dir')}")
+    check_info(f"canonical venv: {diag.get('canonical_venv')}")
+    check_info(f"cwd: {diag.get('cwd')}")
+    check_info(f"python: {diag.get('sys_executable')}")
+    check_info(f"VIRTUAL_ENV: {diag.get('virtual_env')}")
+    for module_name, origin in (diag.get("module_origins") or {}).items():
+        check_info(f"{module_name}: {origin}")
+    if violations:
+        for violation in violations:
+            check_fail("Gateway runtime policy", violation)
+        sys.exit(1)
+    check_ok("Gateway runtime policy", "(cwd, venv, and Biff imports align)")
+
+
+def _run_biff_runtime_doctor() -> None:
+    """Run Biff-specific preflight checks without printing secrets."""
+    issues: list[str] = []
+    _section("Biff Runtime Preflight")
+
+    violations, diag = _gateway_runtime_policy_result()
+    if violations:
+        for violation in violations:
+            check_fail("Gateway runtime policy", violation)
+        issues.extend(violations)
+    else:
+        check_ok("Gateway runtime policy", "(cwd, venv, and Biff imports align)")
+    for module_name, origin in (diag.get("module_origins") or {}).items():
+        check_info(f"{module_name}: {origin}")
+
+    config_path = HERMES_HOME / "config.yaml"
+    cfg = _load_yaml_config(config_path)
+    if config_path.exists():
+        check_ok("Biff config file", f"({config_path})")
+    else:
+        check_warn("Biff config file missing", f"({config_path})")
+        issues.append(f"Create or restore {config_path}")
+
+    discord_toolsets = (((cfg.get("platform_toolsets") or {}).get("discord")) or []) if isinstance(cfg, dict) else []
+    if "kanban" in discord_toolsets:
+        check_ok("Discord platform Kanban toolset", "(platform_toolsets.discord includes kanban)")
+    else:
+        check_fail("Discord platform Kanban toolset", "Add 'kanban' to platform_toolsets.discord so Biff keeps Kanban visibility")
+        issues.append("Add 'kanban' to platform_toolsets.discord in ~/.hermes/config.yaml")
+
+    dispatch = ((cfg.get("kanban") or {}).get("dispatch_in_gateway")) if isinstance(cfg, dict) else None
+    check_info(f"kanban.dispatch_in_gateway: {dispatch!r}")
+
+    env_keys = _env_key_names(HERMES_HOME / ".env")
+    sensitive_keys = [k for k in env_keys if any(token in k for token in ("KEY", "TOKEN", "SECRET"))]
+    if env_keys:
+        check_ok("Environment key names loaded", ", ".join(sensitive_keys or env_keys[:8]))
+    else:
+        check_warn("No ~/.hermes/.env key names found")
+
+    broker = Path.home() / ".local/bin/get_credential.sh"
+    if broker.exists() and os.access(broker, os.X_OK):
+        check_ok("Credential broker", f"({broker}; use --check only)")
+        _check_provider_key_drift(cfg, env_keys, broker, issues)
+        required_aliases = ["discord_bot_token", "API_SERVER_KEY"]
+        if "OPENROUTER_API_KEY" in env_keys:
+            required_aliases.append("OPENROUTER_API_KEY")
+        _check_required_credential_aliases(broker, required_aliases, issues)
+    else:
+        check_fail("Credential broker", f"Missing or not executable: {broker}")
+        issues.append(f"Restore executable credential broker: {broker}")
+
+    board = HERMES_HOME / "kanban/boards/biff-os/kanban.db"
+    if board.exists():
+        check_ok("biff-os Kanban board", f"({board})")
+    else:
+        check_warn("biff-os Kanban board not found", f"({board})")
+        issues.append(f"Verify canonical Kanban board path: {board}")
+
+    role_invoker = HERMES_HOME / "scripts/biff_role_invoke.py"
+    if role_invoker.exists() and os.access(role_invoker, os.X_OK):
+        check_ok("Direct role invoker", f"({role_invoker})")
+        check_info(f"Runtime role work should set HERMES_REPO={PROJECT_ROOT}")
+        _check_role_repo_pin(role_invoker, issues)
+    else:
+        check_warn("Direct role invoker missing or not executable", f"({role_invoker})")
+        issues.append(f"Restore direct role invoker: {role_invoker}")
+
+    _check_launchd_gateway_plist(issues)
+
+    restart_script = PROJECT_ROOT / "scripts/restart-hermes-gateway.sh"
+    if restart_script.exists():
+        check_ok("Gateway restart wrapper", f"({restart_script})")
+    else:
+        check_warn("Gateway restart wrapper missing", f"({restart_script})")
+
+    if issues:
+        check_fail("Biff runtime preflight", f"{len(issues)} issue(s) need attention")
+        for issue in issues[:8]:
+            check_info(f"Fix: {issue}")
+        sys.exit(1)
+    check_ok("Biff runtime preflight passed", "(no secret values printed)")
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
     ack_target = getattr(args, 'ack', None)
+
+    if getattr(args, "gateway_runtime", False):
+        _run_gateway_runtime_doctor()
+        return
+    if getattr(args, "biff_runtime", False):
+        _run_biff_runtime_doctor()
+        return
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability
     # checks (like cronjob management) should see the same context as `hermes`.
@@ -563,10 +786,6 @@ def run_doctor(args):
         check_ok("Virtual environment active")
     else:
         check_warn("Not in virtual environment", "(recommended)")
-
-    # Detect drift between pyproject.toml and hermes_cli/__init__.py versions
-    # (a git conflict resolution can silently revert one but not the other).
-    _check_version_consistency(issues)
     
     _section("Required Packages")
     required_packages = [
@@ -888,63 +1107,6 @@ def run_doctor(args):
                     fixed_count += 1
                 else:
                     issues.append("Stale root-level provider/base_url in config.yaml — run 'hermes doctor --fix'")
-        except Exception:
-            pass
-
-        # Detect stale HERMES_MAX_ITERATIONS ghost in .env shadowing
-        # agent.max_turns in config.yaml (issue #17534). The setup wizard
-        # used to dual-write the iteration budget to both stores; users who
-        # later edit only config.yaml are left with a .env ghost. The gateway
-        # bridge normally derives HERMES_MAX_ITERATIONS from agent.max_turns
-        # at startup, but if that bridge bails (any earlier config-parse
-        # error), the stale .env value silently wins and the agent runs at the
-        # wrong budget — e.g. config says 400 but the activity line reads N/90.
-        # Read the .env FILE directly (load_env), not get_env_value/os.environ,
-        # which the startup bridge may already have overridden.
-        try:
-            import yaml
-            from hermes_cli.config import load_env, remove_env_value
-            with open(config_path, encoding="utf-8") as f:
-                raw_config = yaml.safe_load(f) or {}
-            agent_cfg = raw_config.get("agent")
-            cfg_max_turns = (
-                agent_cfg.get("max_turns")
-                if isinstance(agent_cfg, dict)
-                else None
-            )
-            # Legacy root-level key counts too.
-            if cfg_max_turns is None:
-                cfg_max_turns = raw_config.get("max_turns")
-            env_ghost = load_env().get("HERMES_MAX_ITERATIONS")
-            drift = (
-                cfg_max_turns is not None
-                and env_ghost is not None
-                and str(cfg_max_turns).strip() != str(env_ghost).strip()
-            )
-            if drift:
-                check_warn(
-                    f"HERMES_MAX_ITERATIONS={env_ghost} in .env shadows "
-                    f"agent.max_turns={cfg_max_turns} in config.yaml",
-                    "(stale ghost from an earlier `hermes setup` run)",
-                )
-                if should_fix:
-                    if remove_env_value("HERMES_MAX_ITERATIONS"):
-                        check_ok(
-                            "Removed stale HERMES_MAX_ITERATIONS from .env "
-                            f"(config.yaml agent.max_turns={cfg_max_turns} is now authoritative)"
-                        )
-                        fixed_count += 1
-                    else:
-                        check_warn("Could not remove HERMES_MAX_ITERATIONS from .env")
-                        manual_issues.append(
-                            "Manually delete the HERMES_MAX_ITERATIONS line from "
-                            f"{_DHH}/.env — config.yaml agent.max_turns is authoritative."
-                        )
-                else:
-                    issues.append(
-                        "Stale HERMES_MAX_ITERATIONS in .env shadows config.yaml — "
-                        "run 'hermes doctor --fix'"
-                    )
         except Exception:
             pass
 

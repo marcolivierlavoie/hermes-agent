@@ -98,7 +98,7 @@ _TIER_MINIMAL = {
 
 _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Tier 1 — full edit support, personal/team use
-    # Telegram is usually a mobile inbox: keep tool_progress quiet and skip
+# Telegram is usually a mobile inbox: keep tool_progress quiet and skip
     # the verbose busy-ack iteration counter, but DO surface real mid-turn
     # assistant commentary (interim_assistant_messages) and DO send periodic
     # heartbeats (long_running_notifications) so the user has signal between
@@ -110,7 +110,11 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
         "tool_progress": "off",
         "busy_ack_detail": False,
     },
-    "discord":     _TIER_HIGH,
+    # Discord supports message editing, but raw per-tool progress streams make
+    # operator command rooms noisy. Prefer typing/final answers by default and
+    # sparse checklist milestone updates for longer work. Keep tool_progress off
+    # unless explicitly overridden via display.platforms.discord.tool_progress.
+    "discord":     {**_TIER_HIGH, "tool_progress": "off"},
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;
@@ -182,6 +186,15 @@ def resolve_display_setting(
             val = legacy.get(platform_key)
             if val is not None:
                 return _normalise(setting, val)
+
+    # Discord deliberately stays quiet unless it has a Discord-specific
+    # override. A global ``display.tool_progress: all`` is common in existing
+    # CLI/Telegram configs and should not re-enable raw per-tool streams in
+    # Discord command rooms by accident.
+    if setting == "tool_progress" and platform_key == "discord":
+        plat_defaults = _PLATFORM_DEFAULTS.get(platform_key)
+        if plat_defaults and plat_defaults.get(setting) is not None:
+            return plat_defaults[setting]
 
     # 2. Global user setting (display.<key>).  Skip display.streaming because
     # that key controls only CLI terminal streaming; gateway token streaming is

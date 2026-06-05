@@ -1,0 +1,41 @@
+signals:
+  - id: ha_doors_windows
+    source: Home Assistant
+    category: home_security
+    examples: [doors, windows, garage]
+    sensitivity: low; state only, no personal content
+    freshness_minutes: 15
+    surface_when: open/unlocked during sleep/away/rain/wind windows or unexpectedly open in morning/evening digest
+    default_digest: true
+  - id: car_sunroof_windows
+    source: Car integration or manual snapshot
+    category: vehicle_weather_exposure
+    examples: [sunroof, windows, lock_state]
+    sensitivity: medium; location/status metadata, no trip history in digest
+    freshness_minutes: 60
+    surface_when: open/unlocked with rain risk, overnight, or away from home
+    default_digest: true
+  - id: car_fuel_service
+    source: Car integration or manual snapshot
+    category: vehicle_readiness
+    examples: [fuel_range, battery, tire_pressure, service_due]
+    sensitivity: medium; vehicle status only
+    freshness_minutes: 1440
+    surface_when: low fuel/range, service due, tire warning, or stale data
+    default_digest: true
+  - id: patio_cover_rain_risk
+    source: Home Assistant weather + patio/vision classifier
+    category: weather_exposure
+    examples: [rain_probability, patio_cover_state, protected_items]
+    sensitivity: low; outside object/status only
+    freshness_minutes: 60
+    surface_when: rain risk and exposed patio furniture/cover state is unsafe or unknown
+    default_digest: true
+  - id: critical_automation_outcomes
+    source: n8n/Home Assistant automation logs or Biff snapshots
+    category: automation_reliability
+    examples: [rain warning sent, lock reminder sent, safety check skipped]
+    sensitivity: low; outcome/evidence only, not message contents
+    freshness_minutes: 1440
+    surface_when: critical automation did not run, gate failed, evidence stale, or notification failed
+    default_digest: true

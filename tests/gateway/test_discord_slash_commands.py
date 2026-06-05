@@ -97,7 +97,15 @@ class FakeTree:
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    for env_name in (
+        "DISCORD_ALLOWED_CHANNELS",
+        "DISCORD_IGNORED_CHANNELS",
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_NO_THREAD_CHANNELS",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
     config = PlatformConfig(enabled=True, token="***")
     adapter = DiscordAdapter(config)
     adapter._client = SimpleNamespace(

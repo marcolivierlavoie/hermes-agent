@@ -17,6 +17,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import hashlib
 import json
 import logging
 
@@ -28,6 +29,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
@@ -39,6 +41,78 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+def _hash_telemetry_value(prefix: str, value: Any) -> str:
+    text = "" if value is None else str(value)
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{prefix}_{digest}"
+
+
+def _default_biff_delegation_telemetry_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        root = Path(get_hermes_home())
+    except Exception:
+        root = Path(os.path.expanduser("~/.hermes"))
+    return root / "runtime" / "biff" / "delegation_telemetry.jsonl"
+
+
+def _record_biff_delegation_telemetry(
+    *,
+    path: Path | str | None = None,
+    parent_session_id: Any = None,
+    task_count: int,
+    results: List[Dict[str, Any]],
+    task_goals: List[str],
+    total_duration_seconds: float,
+) -> bool:
+    """Append local-only Biff delegation telemetry as JSONL.
+
+    Profile-safe by construction: no raw goals, summaries, errors, paths,
+    prompts, or session IDs are persisted. The record is intentionally small
+    and best-effort; telemetry failures must never affect delegation results.
+    """
+
+    telemetry_path = Path(path) if path is not None else _default_biff_delegation_telemetry_path()
+    try:
+        completed = sum(1 for r in results if r.get("status") == "completed")
+        errored = sum(1 for r in results if r.get("status") in {"error", "failed"})
+        interrupted = sum(1 for r in results if r.get("status") == "interrupted")
+        api_calls = 0
+        for r in results:
+            try:
+                api_calls += int(r.get("api_calls") or 0)
+            except (TypeError, ValueError):
+                pass
+        durations: list[float] = []
+        for r in results:
+            try:
+                durations.append(float(r.get("duration_seconds") or 0.0))
+            except (TypeError, ValueError):
+                pass
+        row = {
+            "schema_version": 1,
+            "event": "biff.delegation.completed",
+            "ts": time.time(),
+            "parent_session_hash": _hash_telemetry_value("session", parent_session_id),
+            "task_count": int(task_count),
+            "completed_count": completed,
+            "error_count": errored,
+            "interrupted_count": interrupted,
+            "api_calls": api_calls,
+            "total_duration_seconds": round(float(total_duration_seconds or 0.0), 3),
+            "child_duration_seconds": [round(v, 3) for v in durations],
+            "task_goal_hashes": [_hash_telemetry_value("goal", g) for g in task_goals],
+        }
+        telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+        with telemetry_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        return True
+    except Exception:
+        logger.debug("Biff delegation telemetry write failed", exc_info=True)
+        return False
 
 
 # Tools that children must never have access to
@@ -1386,11 +1460,15 @@ def _run_single_child(
     _stale_count = [0]
 
     def _heartbeat_loop():
-        while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+        while not _heartbeat_stop.is_set():
             if parent_agent is None:
+                if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                    break
                 continue
             touch = getattr(parent_agent, "_touch_activity", None)
             if not touch:
+                if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                    break
                 continue
             # Pull detail from the child's own activity tracker
             desc = f"delegate_task: subagent {task_index} working"
@@ -1453,6 +1531,8 @@ def _run_single_child(
                 touch(desc)
             except Exception:
                 pass
+            if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                break
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
 
@@ -1486,6 +1566,12 @@ def _run_single_child(
 
     try:
         _heartbeat_thread.start()
+        try:
+            touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
+            if touch:
+                touch(f"delegate_task: subagent {task_index} starting")
+        except Exception:
+            pass
         if child_progress_cb:
             try:
                 child_progress_cb("subagent.start", preview=goal)
@@ -1530,7 +1616,19 @@ def _run_single_child(
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
+            touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
+            if touch:
+                touch(f"delegate_task: subagent {task_index} running")
+        except Exception:
+            pass
+        try:
             result = _child_future.result(timeout=child_timeout)
+            try:
+                touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
+                if touch:
+                    touch(f"delegate_task: subagent {task_index} completed")
+            except Exception:
+                pass
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -2327,6 +2425,14 @@ def delegate_task(
             logger.debug("Subagent cost rollup failed", exc_info=True)
 
     total_duration = round(time.monotonic() - overall_start, 2)
+
+    _record_biff_delegation_telemetry(
+        parent_session_id=getattr(parent_agent, "session_id", None),
+        task_count=n_tasks,
+        results=results,
+        task_goals=[str(t.get("goal", "")) for t in task_list if isinstance(t, dict)],
+        total_duration_seconds=total_duration,
+    )
 
     return json.dumps(
         {

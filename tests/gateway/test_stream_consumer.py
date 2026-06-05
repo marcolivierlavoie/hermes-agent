@@ -85,6 +85,179 @@ class TestCleanForDisplay:
         assert result == text
 
 
+# ── Discord metadata gating in streaming sends ──────────────────────────
+
+
+class TestDiscordNewSessionButtonStreamingMetadata:
+    """Streaming can fan out one reply; Discord button metadata stays one-shot."""
+
+    @pytest.mark.asyncio
+    async def test_split_stream_forwards_new_session_button_metadata_once(self):
+        send_calls = []
+        ids = iter(["m1", "m2", "m3"])
+
+        async def fake_send(**kwargs):
+            send_calls.append(kwargs)
+            return SimpleNamespace(success=True, message_id=next(ids))
+
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 650
+        adapter.send = AsyncMock(side_effect=fake_send)
+        adapter.truncate_message = lambda text, limit, len_fn=len: [
+            text[:548],
+            text[548:1096],
+            text[1096:],
+        ]
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"discord_new_session_button": True},
+        )
+        consumer.on_delta("x" * 1100)
+        consumer.finish()
+
+        await consumer.run()
+
+        assert len(send_calls) == 3
+        eligible = [
+            call["metadata"].get("discord_new_session_button")
+            for call in send_calls
+        ]
+        assert eligible == [True, None, None]
+
+    @pytest.mark.asyncio
+    async def test_commentary_strips_new_session_button_metadata(self):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"discord_new_session_button": True},
+        )
+        consumer.on_commentary("interim commentary")
+        consumer.finish()
+
+        await consumer.run()
+
+        adapter.send.assert_called_once()
+        metadata = adapter.send.call_args.kwargs["metadata"]
+        assert "discord_new_session_button" not in metadata
+
+    @pytest.mark.asyncio
+    async def test_segment_break_does_not_consume_new_session_button_before_final(self):
+        send_calls = []
+        ids = iter(["m1", "m2"])
+
+        async def fake_send(**kwargs):
+            send_calls.append(kwargs)
+            return SimpleNamespace(success=True, message_id=next(ids))
+
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(side_effect=fake_send)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"discord_new_session_button": True},
+        )
+        consumer.on_delta("Let me search...")
+        consumer.on_segment_break()
+        consumer.on_delta("Final answer")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert [call["content"] for call in send_calls] == [
+            "Let me search...",
+            "Final answer",
+        ]
+        assert "discord_new_session_button" not in send_calls[0]["metadata"]
+        assert send_calls[1]["metadata"].get("discord_new_session_button") is True
+
+    @pytest.mark.asyncio
+    async def test_final_edit_receives_new_session_button_metadata_after_preview(self):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.SUPPORTS_DISCORD_NEW_SESSION_BUTTON = True
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(buffer_threshold=5, cursor="▉"),
+            metadata={"discord_new_session_button": True},
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("hello")
+        await asyncio.sleep(0.1)
+        consumer.on_delta(" world")
+        consumer.finish()
+
+        await task
+
+        preview_metadata = adapter.send.await_args.kwargs["metadata"]
+        assert "discord_new_session_button" not in preview_metadata
+        final_edit_metadata = adapter.edit_message.await_args.kwargs["metadata"]
+        assert final_edit_metadata.get("discord_new_session_button") is True
+        assert adapter.edit_message.await_args.kwargs["finalize"] is True
+
+    @pytest.mark.asyncio
+    async def test_identical_final_edit_still_gets_new_session_button(self):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.SUPPORTS_DISCORD_NEW_SESSION_BUTTON = True
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(buffer_threshold=5, cursor=""),
+            metadata={"discord_new_session_button": True},
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("hello")
+        await asyncio.sleep(0.1)
+        consumer.finish()
+
+        await task
+
+        adapter.edit_message.assert_awaited_once()
+        final_edit_metadata = adapter.edit_message.await_args.kwargs["metadata"]
+        assert final_edit_metadata.get("discord_new_session_button") is True
+        assert adapter.edit_message.await_args.kwargs["finalize"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_discord_final_edit_does_not_receive_discord_metadata(self):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.SUPPORTS_DISCORD_NEW_SESSION_BUTTON = False
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(buffer_threshold=5, cursor="▉"),
+            metadata={"discord_new_session_button": True},
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("hello")
+        await asyncio.sleep(0.1)
+        consumer.on_delta(" world")
+        consumer.finish()
+
+        await task
+
+        assert "metadata" not in adapter.edit_message.await_args.kwargs
+
+
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
 
 

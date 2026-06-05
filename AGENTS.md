@@ -877,8 +877,8 @@ kanban task.
   task also get `kanban_list` and `kanban_unblock` for board routing.
 - **Dispatcher:** long-lived loop that (default every 60s) reclaims
   stale claims, promotes ready tasks, atomically claims, and spawns
-  assigned profiles. Runs **inside the gateway** by default via
-  `kanban.dispatch_in_gateway: true`.
+  assigned profiles. It can run inside the gateway when explicitly
+  enabled via `kanban.dispatch_in_gateway: true`; the default is false.
 - **Plugin assets:** `plugins/kanban/dashboard/` (web UI) +
   `plugins/kanban/systemd/` (`hermes-kanban-dispatcher.service` for
   standalone dispatcher deployment).
@@ -921,10 +921,14 @@ detects process completion and triggers a new agent turn. Control verbosity of b
 messages with `display.background_process_notifications`
 in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 
-- `all` — running-output updates + final message (default)
+- `all` — running-output updates + final message
 - `result` — only the final completion message
-- `error` — only the final message when exit code != 0
+- `error` — only the final message when exit code != 0 (default)
 - `off` — no watcher messages at all
+
+Successful completions are quiet by default to avoid raw test/build payloads
+being auto-delivered into chat platforms such as Discord. Agents should inspect
+routine background work with the `process` tool and send concise summaries.
 
 ---
 

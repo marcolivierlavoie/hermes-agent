@@ -151,7 +151,35 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
     load_soul_md,
 )
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
-from agent.message_sanitization import (  # noqa: F401
+from agent.display import (
+    KawaiiSpinner, build_tool_preview as _build_tool_preview,
+    get_cute_tool_message as _get_cute_tool_message_impl,
+    _detect_tool_failure,
+    get_tool_emoji as _get_tool_emoji,
+)
+from agent.tool_guardrails import (
+    ToolCallGuardrailConfig,
+    ToolCallGuardrailController,
+    ToolGuardrailDecision,
+    append_toolguard_guidance,
+    toolguard_synthetic_result,
+)
+from agent.long_turn_governor import (
+    LongTurnGovernor,
+    LongTurnState,
+    LongTurnThresholds,
+    load_latest_resume_packet,
+    render_resume_reanchor,
+)
+from agent.tool_result_classification import (
+    FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
+    file_mutation_result_landed,
+)
+from agent.trajectory import (
+    convert_scratchpad_to_think,
+    save_trajectory as _save_trajectory_to_file,
+)
+from agent.message_sanitization import (
     _SURROGATE_RE,
     _sanitize_surrogates,
     _sanitize_structure_surrogates,
@@ -3830,7 +3858,7 @@ class AIAgent:
         if cb is None or not isinstance(assistant_msg, dict):
             return
         content = assistant_msg.get("content")
-        visible = self._strip_think_blocks(content or "").strip()
+        visible = sanitize_context(self._strip_think_blocks(content or "")).strip()
         if not visible or visible == "(empty)":
             return
         already_streamed = self._interim_content_was_streamed(visible)
@@ -4734,6 +4762,108 @@ class AIAgent:
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
             self._tool_guardrail_halt_decision = decision
 
+    def _long_turn_persist_dir(self) -> Path:
+        return Path(get_hermes_home()) / "runtime" / "long_turns"
+
+    def _should_long_turn_reanchor(self, user_message: str) -> bool:
+        if not isinstance(user_message, str):
+            return False
+        lowered = user_message.strip().lower()
+        if not lowered:
+            return False
+        exact_commands = {"go", "go man", "continue", "resume", "finish"}
+        if lowered in exact_commands:
+            return True
+        continuation_patterns = (
+            r"\bcontinue\b",
+            r"\bresume\b",
+            r"\bfinish\b",
+            r"\bcarry on\b",
+            r"\bwhere were we\b",
+            r"\bpick back up\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in continuation_patterns)
+
+    def _long_turn_resume_reanchor_text(self) -> str | None:
+        try:
+            packet = load_latest_resume_packet(self._long_turn_persist_dir(), self.session_id or "")
+            rendered = render_resume_reanchor(packet)
+            return rendered or None
+        except Exception:
+            logger.debug("long-turn resume reanchor failed", exc_info=True)
+            return None
+
+    def _long_turn_thresholds(self) -> LongTurnThresholds:
+        try:
+            from hermes_cli.config import load_config as _load_ltg_config
+            cfg = _load_ltg_config() or {}
+            section = cfg.get("long_turn_governor", {}) or {}
+            if isinstance(section, dict):
+                thresholds = section.get("thresholds", section)
+                return LongTurnThresholds.from_mapping(thresholds)
+        except Exception:
+            pass
+        return LongTurnThresholds()
+
+    def _start_long_turn_governor(self, effective_task_id: str) -> None:
+        turn_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        state = LongTurnState(
+            session_id=self.session_id or "",
+            task_id=effective_task_id or "",
+            turn_id=turn_id,
+        )
+        self._long_turn_governor = LongTurnGovernor(
+            state=state,
+            thresholds=self._long_turn_thresholds(),
+            persist_dir=self._long_turn_persist_dir(),
+        )
+        self._last_long_turn_signal = state.runtime_signal()
+
+    def _record_long_turn_api_call(self, api_call_count: int) -> None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return
+        self._last_long_turn_signal = governor.mark_api_call(api_call_count)
+
+    def _record_long_turn_tool_call(self, tool_name: str, *, failed: bool = False) -> None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return
+        self._last_long_turn_signal = governor.mark_tool_call(tool_name, failed=failed)
+
+    def _record_long_turn_tool_failure_signature(self, tool_name: str, args: dict, result: Any) -> dict[str, Any] | None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return None
+        self._last_long_turn_signal = governor.observe_tool_failure(tool_name, args, result)
+        return self._last_long_turn_signal
+
+    def _record_long_turn_guardrail(self, decision: ToolGuardrailDecision) -> None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return
+        before_path = governor.state.resume_packet_path
+        self._last_long_turn_signal = governor.observe_guardrail(decision)
+        if governor.state.resume_packet_path and governor.state.resume_packet_path != before_path:
+            checkpoint = governor.add_checkpoint("tool guardrail threshold")
+            logger.info("long-turn checkpoint: %s", governor.quiet_checkpoint_text(checkpoint["label"]))
+
+    def _long_turn_summary_metrics(self, *, exit_reason: str | None = None) -> dict[str, Any] | None:
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return None
+        return governor.summary_metrics(exit_reason=exit_reason)
+
+    def _persist_long_turn_resume_packet(self, reason: str) -> None:
+        """Best-effort resume packet persistence for non-normal turn exits."""
+        governor = getattr(self, "_long_turn_governor", None)
+        if governor is None:
+            return
+        path = governor.persist_resume_packet(reason)
+        self._last_long_turn_signal = governor.state.runtime_signal()
+        if path:
+            logger.info("long-turn resume packet persisted: reason=%s path=%s", reason, path)
+
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         tool = decision.tool_name or "a tool"
         return (
@@ -4757,13 +4887,31 @@ class AIAgent:
             function_result,
             failed=failed,
         )
+        if failed and not decision.should_halt:
+            signal = self._record_long_turn_tool_failure_signature(tool_name, function_args, function_result)
+            fallback_decision = (signal or {}).get("fallback_decision") if isinstance(signal, dict) else None
+            if isinstance(fallback_decision, dict):
+                halt = ToolGuardrailDecision(
+                    action="halt",
+                    code="long_turn_repeated_failure_fallback",
+                    message=(
+                        f"Stopped {tool_name}: repeated the same tool/test/error without enough new hypothesis. "
+                        "Pause or switch fallback strategy instead of retrying the same failure loop."
+                    ),
+                    tool_name=tool_name,
+                    count=int(fallback_decision.get("count") or 0),
+                    signature=decision.signature,
+                )
+                self._set_tool_guardrail_halt(halt)
         if decision.action in {"warn", "halt"}:
+            self._record_long_turn_guardrail(decision)
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
+        self._record_long_turn_guardrail(decision)
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 

@@ -50,6 +50,10 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 import re
 
+from gateway.discord_operator_checklist import (
+    DiscordChecklistItem,
+    format_discord_operator_checklist,
+)
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
 from utils import atomic_json_write
 from gateway.platforms.base import (
@@ -574,6 +578,11 @@ class DiscordAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
 
+    # Keep reply-attached controls useful without retaining one persistent
+    # discord.py View forever for every bot message.
+    NEW_SESSION_BUTTON_TIMEOUT_SECONDS = 24 * 60 * 60
+    SUPPORTS_DISCORD_NEW_SESSION_BUTTON = True
+
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
 
@@ -587,9 +596,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
-        # Text batching: merge rapid successive messages (Telegram-style)
-        self._text_batch_delay_seconds = float(os.getenv("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", "0.6"))
-        self._text_batch_split_delay_seconds = float(os.getenv("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
+        # Text batching: merge rapid successive messages (Telegram-style).
+        # Keep the delay short for Discord: transport batching should smooth
+        # rapid split replies, not add noticeable latency to every tiny message.
+        self._text_batch_delay_seconds = float(os.getenv("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", "0.2"))
+        self._text_batch_split_delay_seconds = float(os.getenv("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", "1.0"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
@@ -755,6 +766,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 adapter_self._post_connect_task = asyncio.create_task(
                     adapter_self._run_post_connect_initialization()
                 )
+
+            @self._client.event
+            async def on_disconnect():
+                logger.warning(
+                    "[%s] Discord WebSocket disconnected — "
+                    "library will attempt automatic reconnection",
+                    adapter_self.name,
+                )
+
+            @self._client.event
+            async def on_resumed():
+                logger.info("[%s] Discord WebSocket reconnected via RESUME", adapter_self.name)
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -1449,7 +1472,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                return await self._send_to_forum(channel, content)
+                return await self._send_to_forum(channel, content, metadata=metadata)
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -1457,6 +1480,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             message_ids = []
             reference = None
+            new_session_view = self._build_new_session_view(metadata)
 
             if reply_to and self._reply_to_mode != "off":
                 try:
@@ -1473,11 +1497,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                chunk_view = new_session_view if i == 0 else None
+                send_kwargs = {
+                    "content": chunk,
+                    "reference": chunk_reference,
+                }
+                if chunk_view is not None:
+                    send_kwargs["view"] = chunk_view
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -1496,10 +1524,10 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs = {"content": chunk, "reference": None}
+                        if chunk_view is not None:
+                            retry_kwargs["view"] = chunk_view
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -1520,7 +1548,59 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    def _build_new_session_view(self, metadata: Optional[Dict[str, Any]] = None):
+        """Build the low-noise New session button view for normal replies.
+
+        The view is attached by ``send()`` once per logical adapter send (the
+        first Discord chunk only).  Callers may opt out with
+        ``metadata={"suppress_new_session_button": True}`` for operational
+        notices or other non-conversation deliveries.
+        """
+        if not metadata or not metadata.get("discord_new_session_button"):
+            return None
+        if metadata.get("suppress_new_session_button"):
+            return None
+        if not DISCORD_AVAILABLE:
+            return None
+        view_cls = globals().get("NewSessionView")
+        if view_cls is None:
+            return None
+        try:
+            return view_cls(self, timeout=self.NEW_SESSION_BUTTON_TIMEOUT_SECONDS)
+        except Exception as e:
+            logger.debug("[%s] Could not build Discord New session button view: %s", self.name, e)
+            return None
+
+    async def _handle_new_session_button(self, interaction: "discord.Interaction") -> None:
+        """Dispatch the New session button with the same semantics as /new.
+
+        Authorization is evaluated via the same slash-command gates, then the
+        interaction is turned into the same ``/reset`` MessageEvent used by the
+        existing ``/new`` slash command for the current channel/thread context.
+        """
+        command_text = "/reset"
+        if not await self._check_slash_authorization(interaction, command_text):
+            return
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception as e:
+            logger.debug("Discord New session button defer failed: %s", e)
+
+        event = self._build_slash_event(interaction, command_text)
+        await self.handle_message(event)
+
+        try:
+            await interaction.edit_original_response(content="New conversation started~")
+        except Exception as e:
+            logger.debug("Discord New session button success response failed: %s", e)
+
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -1534,16 +1614,17 @@ class DiscordAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        new_session_view = self._build_new_session_view(metadata)
 
         thread_name = _derive_forum_thread_name(content)
 
         starter_content = chunks[0] if chunks else thread_name
 
         try:
-            thread = await forum_channel.create_thread(
-                name=thread_name,
-                content=starter_content,
-            )
+            thread_kwargs = {"name": thread_name, "content": starter_content}
+            if new_session_view is not None:
+                thread_kwargs["view"] = new_session_view
+            thread = await forum_channel.create_thread(**thread_kwargs)
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
             return SendResult(success=False, error=f"Forum thread creation failed: {e}")
@@ -1643,6 +1724,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Discord message."""
         if not self._client:
@@ -1655,7 +1737,11 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
-            await msg.edit(content=formatted)
+            edit_kwargs = {"content": formatted}
+            new_session_view = self._build_new_session_view(metadata) if finalize else None
+            if new_session_view is not None:
+                edit_kwargs["view"] = new_session_view
+            await msg.edit(**edit_kwargs)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
@@ -3122,6 +3208,32 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         # Discord markdown is fairly standard, no special escaping needed
         return content
+
+    def format_operator_checklist(
+        self,
+        *,
+        title: str,
+        items: List[DiscordChecklistItem | tuple],
+        issue_id: str | None = None,
+        summary: str | None = None,
+        footer: str | None = None,
+        max_items: int = 6,
+    ) -> str:
+        """Format a compact operator checklist without sending it.
+
+        This is a lightweight formatting hook for Discord-facing operator
+        updates.  It deliberately does not post or edit messages; callers must
+        still decide whether the update is a meaningful milestone to avoid
+        gateway/chat spam.
+        """
+        return format_discord_operator_checklist(
+            title=title,
+            items=items,
+            issue_id=issue_id,
+            summary=summary,
+            footer=footer,
+            max_items=max_items,
+        )
 
     async def _run_simple_slash(
         self,
@@ -5257,6 +5369,23 @@ def _define_discord_view_classes() -> None:
     undefined, causing NameError on the first button interaction.
     """
     global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView
+
+    class NewSessionView(discord.ui.View):
+        """Compact view attached to normal Discord replies for session reset."""
+
+        def __init__(self, adapter: DiscordAdapter, timeout: float | None = None):
+            super().__init__(timeout=timeout)
+            self.adapter = adapter
+
+        @discord.ui.button(
+            label="New session",
+            style=discord.ButtonStyle.secondary,
+            custom_id="hermes:new_session",
+        )
+        async def new_session(
+            self, interaction: discord.Interaction, button: discord.ui.Button,
+        ):
+            await self.adapter._handle_new_session_button(interaction)
 
     class ExecApprovalView(discord.ui.View):
         """

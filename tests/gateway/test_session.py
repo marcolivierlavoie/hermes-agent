@@ -13,6 +13,7 @@ from gateway.session import (
     build_session_key,
     canonical_whatsapp_identifier,
 )
+from hermes_state import SessionDB
 
 # Legacy name preserved for these tests; product renamed the function to
 # canonical_whatsapp_identifier.  Keep the tests referencing the old name
@@ -97,6 +98,19 @@ class TestSessionSourceRoundtrip:
         """
         with pytest.raises(ValueError):
             SessionSource.from_dict({"platform": "nonexistent", "chat_id": "1"})
+
+
+def test_session_db_defaults_to_state_home(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "profile"
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_STATE_HOME", str(state_home))
+
+    db = SessionDB()
+
+    assert db.db_path == state_home / "state.db"
+    assert db.db_path.exists()
+    assert not (hermes_home / "state.db").exists()
 
 
 class TestSessionSourceDescription:

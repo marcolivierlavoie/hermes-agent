@@ -88,8 +88,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    _soul_content = ""
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md()
+        _soul_content = _r.load_soul_md() or ""
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -97,6 +98,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Marco/Biff operating-partner overlay. This is conditional on the loaded
+    # identity/SOUL content (or explicit env/profile override), so generic Hermes
+    # sessions remain unchanged while Biff gains structural Radar/Spark/Care and
+    # Dreaming/Idea-Shelf behavior.
+    try:
+        from agent.biff_operating_partner import build_biff_operating_partner_guidance
+
+        _biff_guidance = build_biff_operating_partner_guidance(
+            _soul_content if _soul_loaded else DEFAULT_AGENT_IDENTITY
+        )
+        if _biff_guidance:
+            stable_parts.append(_biff_guidance)
+    except Exception:
+        pass
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
@@ -118,16 +134,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
-    # Kanban worker/orchestrator lifecycle — only present when the
-    # dispatcher spawned this process (kanban_show check_fn gates on
-    # HERMES_KANBAN_TASK env var). Normal chat sessions never see
-    # this block. Resolved once at __init__ (see _kanban_worker_guidance).
+    # Kanban worker/orchestrator guidance. Resolved once at __init__ so
+    # worker sessions get the task-scoped lifecycle protocol, while direct
+    # specialists/orchestrators get a smaller explicit-task-id warning.
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
     if _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 

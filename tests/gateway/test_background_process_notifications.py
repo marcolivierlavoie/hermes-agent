@@ -2,7 +2,7 @@
 
 The gateway process watcher pushes status updates to users' chats when
 background terminal commands run.  ``display.background_process_notifications``
-controls verbosity: off | result | error | all (default).
+controls verbosity: off | result | error (default) | all.
 
 Contributed by @PeterFile (PR #593), reimplemented on current main.
 """
@@ -71,11 +71,11 @@ def _watcher_dict(session_id="proc_test", thread_id=""):
 
 class TestLoadBackgroundNotificationsMode:
 
-    def test_defaults_to_all(self, monkeypatch, tmp_path):
+    def test_defaults_to_error(self, monkeypatch, tmp_path):
         import gateway.run as gw
         monkeypatch.setattr(gw, "_hermes_home", tmp_path)
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
-        assert GatewayRunner._load_background_notifications_mode() == "all"
+        assert GatewayRunner._load_background_notifications_mode() == "error"
 
     def test_reads_config_yaml(self, monkeypatch, tmp_path):
         (tmp_path / "config.yaml").write_text(
@@ -104,14 +104,14 @@ class TestLoadBackgroundNotificationsMode:
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
         assert GatewayRunner._load_background_notifications_mode() == "off"
 
-    def test_invalid_value_defaults_to_all(self, monkeypatch, tmp_path):
+    def test_invalid_value_defaults_to_error(self, monkeypatch, tmp_path):
         (tmp_path / "config.yaml").write_text(
             "display:\n  background_process_notifications: banana\n"
         )
         import gateway.run as gw
         monkeypatch.setattr(gw, "_hermes_home", tmp_path)
         monkeypatch.delenv("HERMES_BACKGROUND_NOTIFICATIONS", raising=False)
-        assert GatewayRunner._load_background_notifications_mode() == "all"
+        assert GatewayRunner._load_background_notifications_mode() == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ class TestLoadBackgroundNotificationsMode:
             "result",
             [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)],
             1,
-            "finished with exit code 0",
+            "completed (exit code 0",
         ),
         # error mode: exit 0 → no notification
         (
@@ -168,14 +168,14 @@ class TestLoadBackgroundNotificationsMode:
             "error",
             [SimpleNamespace(output_buffer="traceback\n", exited=True, exit_code=1)],
             1,
-            "finished with exit code 1",
+            "failed (exit code 1",
         ),
         # all mode: exited → notifies
         (
             "all",
             [SimpleNamespace(output_buffer="ok\n", exited=True, exit_code=0)],
             1,
-            "finished with exit code 0",
+            "completed (exit code 0",
         ),
     ],
 )
@@ -321,6 +321,183 @@ async def test_agent_notification_carries_message_id_reply_anchor(monkeypatch, t
     assert synth_event.internal is True
     assert synth_event.message_id == "555"
     assert synth_event.source.thread_id == "24296"
+
+
+@pytest.mark.asyncio
+async def test_agent_notification_success_is_quiet_in_default_error_mode(monkeypatch, tmp_path):
+    """Successful notify_on_complete events do not inject raw completion payloads
+    when the gateway is in the default/error notification mode."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="lots of noisy build output\n", exited=True, exit_code=0, command="make build",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "error")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    watcher = {
+        "session_id": "proc_success_quiet",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123:24296",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "notify_on_complete": True,
+    }
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_notification_failure_still_injects_in_default_error_mode(monkeypatch, tmp_path):
+    """Failed notify_on_complete events still surface in the default/error mode."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="traceback\n", exited=True, exit_code=1, command="make build",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "error")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    watcher = {
+        "session_id": "proc_failure_visible",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123:24296",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "notify_on_complete": True,
+    }
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert "proc_failure_visible" in synth_event.text
+    assert "traceback" in synth_event.text
+
+
+@pytest.mark.asyncio
+async def test_agent_notification_success_all_mode_summarizes_noisy_output(monkeypatch, tmp_path):
+    """notify_on_complete success payloads should not inject raw diffs/code into the agent."""
+    import tools.process_registry as pr_module
+
+    noisy_diff = """
+review diff a/tests/tools/test_approval.py b/tests/tools/test_approval.py
+@@ -1,5 +1,9 @@
+-def old():
+-    return 'old'
++def new():
++    return 'new'
+AST snippet: Module(body=[FunctionDef(name='new')])
+""".strip()
+    sessions = [SimpleNamespace(
+        output_buffer=noisy_diff, exited=True, exit_code=0, command="python -m pytest tests/tools/test_approval.py",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    watcher = {
+        "session_id": "proc_noisy_success",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123:24296",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "notify_on_complete": True,
+    }
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert "proc_noisy_success" in synth_event.text
+    assert "Output captured" in synth_event.text
+    assert "review diff a/" not in synth_event.text
+    assert "AST snippet" not in synth_event.text
+    assert "def new" not in synth_event.text
+
+
+@pytest.mark.asyncio
+async def test_text_notification_success_summarizes_noisy_output(monkeypatch, tmp_path):
+    """Text-only result notifications should also stay concise on successful noisy output."""
+    import tools.process_registry as pr_module
+
+    noisy_diff = "review diff a/tests/tools/test_approval.py b/tests/tools/test_approval.py\n" + "@@ raw diff\n" * 100
+    sessions = [SimpleNamespace(
+        output_buffer=noisy_diff, exited=True, exit_code=0, command="python -m pytest tests/tools/test_approval.py",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "result")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(_watcher_dict(session_id="proc_text_noisy"))
+
+    adapter.send.assert_awaited_once()
+    sent_message = adapter.send.await_args.args[1]
+    assert "proc_text_noisy" in sent_message
+    assert "Output captured" in sent_message
+    assert "review diff a/" not in sent_message
+    assert "@@ raw diff" not in sent_message
+
+
+@pytest.mark.asyncio
+async def test_agent_notification_failure_keeps_bounded_failure_tail(monkeypatch, tmp_path):
+    """Failures remain actionable, but long output is bounded and line-aligned."""
+    import tools.process_registry as pr_module
+
+    output = "first line that should be truncated\n" + ("noise\n" * 500) + "Traceback: boom\n"
+    sessions = [SimpleNamespace(
+        output_buffer=output, exited=True, exit_code=1, command="make build",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "error")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    watcher = {
+        "session_id": "proc_failure_bounded",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123:24296",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "notify_on_complete": True,
+    }
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert "proc_failure_bounded" in synth_event.text
+    assert "Traceback: boom" in synth_event.text
+    assert "first line that should be truncated" not in synth_event.text
+    assert len(synth_event.text) < 1600
 
 
 @pytest.mark.asyncio
