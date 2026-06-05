@@ -6548,6 +6548,12 @@ def _default_spawn(
     # start in the same managed workspace that completion/GC may later clean.
     env["TERMINAL_CWD"] = workspace
     env["HERMES_STATE_HOME"] = str(Path(workspace) / ".hermes-sandbox")
+    # Kanban workers are unattended: there is no interactive user available to
+    # approve terminal/execute_code prompts. Scope YOLO to this child process
+    # instead of setting profile/global approvals.off, so manual `-p forge`
+    # sessions keep normal approval behavior.
+    env["HERMES_KANBAN_WORKER"] = "1"
+    env["HERMES_YOLO_MODE"] = "1"
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
